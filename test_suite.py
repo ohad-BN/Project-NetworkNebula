@@ -1067,6 +1067,266 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Enterprise navigation & router manifest", str(e))
 
+    # =========================================================================
+    # Phase 5 (Enterprise): End-to-End Enterprise B2B Simulation & Handover
+    # =========================================================================
+    print_header("Phase 5 (Enterprise): End-to-End Enterprise B2B Simulation & Handover")
+
+    e5_bearer_token = None
+    e5_token_id = None
+    e5_auth_headers = {}
+    e5_dataset_url = None
+    e5_job_id = None
+    e5_final_adapter_url = None
+    e5_endpoint_id = None
+    e5_endpoint_name = f"llama3-finetuned-{uuid.uuid4().hex[:6]}"
+
+    # E5.1 Enterprise Onboarding & Scoped Bearer API Token Provisioning
+    try:
+        tok_body = {
+            "name": f"Enterprise-Client-Key-{uuid.uuid4().hex[:6]}",
+            "scopes": "training,inference",
+            "rate_limit_rpm": 300
+        }
+        tok_res = requests.post(f"{BASE_URL}/api/v1/tokens", json=tok_body)
+        if tok_res.status_code == 201 and "token" in tok_res.json():
+            e5_token_id = tok_res.json()["id"]
+            e5_bearer_token = tok_res.json()["token"]
+            e5_auth_headers = {"Authorization": f"Bearer {e5_bearer_token}"}
+
+            # Verify authentication against OpenAI models registry
+            auth_check = requests.get(f"{BASE_URL}/v1/models", headers=e5_auth_headers)
+            is_authenticated = auth_check.status_code == 200
+            suite.record(is_authenticated, f"Enterprise scoped token provisioned & authenticated ({e5_bearer_token[:18]}...)")
+        else:
+            suite.record(False, "Enterprise scoped token provisioning", f"Status {tok_res.status_code}: {tok_res.text}")
+    except Exception as e:
+        suite.record(False, "Enterprise scoped token provisioning", str(e))
+
+    # E5.2 MinIO S3 Enterprise Dataset Pipeline & Streaming Ingestion
+    try:
+        up_res = requests.post(
+            f"{BASE_URL}/api/v1/training/datasets/upload-url",
+            json={"filename": "enterprise_customer_v1.jsonl"}
+        )
+        if up_res.status_code == 200:
+            up_data = up_res.json()
+            e5_dataset_url = up_data["s3_url"]
+            upload_url = up_data["upload_url"]
+
+            # Generate synthetic instruction-tuning dataset records
+            dataset_rows = []
+            for idx in range(15):
+                dataset_rows.append(json.dumps({
+                    "instruction": f"Enterprise inquiry #{idx}: Optimize decentralized GPU latency.",
+                    "response": f"Cluster node #{idx} routes traffic via Zero-Trust high-throughput pipelining."
+                }))
+            raw_dataset_bytes = "\n".join(dataset_rows).encode("utf-8")
+
+            # Stream upload directly to MinIO S3 bucket via presigned PUT URL
+            put_res = requests.put(
+                upload_url,
+                data=raw_dataset_bytes,
+                headers={"Content-Type": "application/jsonlines"}
+            )
+            put_ok = put_res.status_code in (200, 201)
+
+            # Direct S3 verification
+            dl_ds = requests.get(e5_dataset_url)
+            bytes_ok = dl_ds.status_code == 200 and len(dl_ds.content) == len(raw_dataset_bytes)
+
+            suite.record(put_ok and bytes_ok, f"Enterprise dataset streamed to MinIO S3 ({len(raw_dataset_bytes)} bytes, 15 records)")
+        else:
+            suite.record(False, "Enterprise dataset upload pipeline", f"Status {up_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Enterprise dataset upload pipeline", str(e))
+
+    # E5.3 Distributed LoRA Fine-Tuning Execution & Mathematical Loss Descent
+    try:
+        if not e5_dataset_url:
+            suite.record(False, "Distributed LoRA fine-tuning run", "No dataset URL available")
+        else:
+            job_payload = {
+                "name": f"Enterprise-LoRA-Run-{uuid.uuid4().hex[:6]}",
+                "base_model": "meta-llama/Llama-3-8B",
+                "train_type": "lora",
+                "parallelism": "data_parallel",
+                "num_gpus": 1,
+                "dataset_s3_url": e5_dataset_url,
+                "total_epochs": 3,
+                "hyperparameters": {
+                    "epochs": 3,
+                    "lr": 0.0003,
+                    "lora_r": 32,
+                    "lora_alpha": 64,
+                    "target_modules": ["q_proj", "v_proj"]
+                }
+            }
+            sub_res = requests.post(f"{BASE_URL}/api/v1/training/jobs", json=job_payload)
+            if sub_res.status_code in (200, 201) and "id" in sub_res.json():
+                e5_job_id = sub_res.json()["id"]
+                
+                # Poll worker until job completion
+                job_finished = False
+                job_data = None
+                for _ in range(30):
+                    poll_res = requests.get(f"{BASE_URL}/api/v1/training/jobs/{e5_job_id}")
+                    if poll_res.status_code == 200:
+                        job_data = poll_res.json()
+                        if job_data["status"] == "completed":
+                            job_finished = True
+                            e5_final_adapter_url = job_data.get("final_adapter_url")
+                            break
+                        elif job_data["status"] == "failed":
+                            break
+                    time.sleep(0.5)
+
+                loss_hist = job_data.get("loss_history", []) if job_data else []
+                has_loss = len(loss_hist) >= 2
+                loss_descends = has_loss and (loss_hist[1]["loss"] < loss_hist[0]["loss"])
+
+                suite.record(
+                    job_finished and loss_descends,
+                    f"Distributed LoRA training completed with verified loss decay ({loss_hist[0]['loss'] if has_loss else '?'} -> {loss_hist[-1]['loss'] if has_loss else '?'})"
+                )
+            else:
+                suite.record(False, "Distributed LoRA fine-tuning run", f"Status {sub_res.status_code}: {sub_res.text}")
+    except Exception as e:
+        suite.record(False, "Distributed LoRA fine-tuning run", str(e))
+
+    # E5.4 S3 Checkpoint Serialization & Safetensors Header Audit
+    try:
+        if not e5_job_id:
+            suite.record(False, "S3 checkpoint serialization audit", "No job_id available")
+        else:
+            ckpts_res = requests.get(f"{BASE_URL}/api/v1/training/jobs/{e5_job_id}/checkpoints")
+            if ckpts_res.status_code == 200 and len(ckpts_res.json()) > 0:
+                ckpt_list = ckpts_res.json()
+                latest_ckpt_url = ckpt_list[-1]["s3_url"]
+
+                # Download .safetensors binary artifact from S3
+                import safetensors.torch
+                dl_ckpt = requests.get(latest_ckpt_url)
+                if dl_ckpt.status_code == 200:
+                    tensors = safetensors.torch.load(dl_ckpt.content)
+                    valid_tensors = len(tensors.keys()) > 0
+                    suite.record(valid_tensors, f"Safetensors adapter verified in S3 ({len(dl_ckpt.content)} bytes, {len(tensors.keys())} PEFT matrices)")
+                else:
+                    suite.record(False, "S3 checkpoint serialization audit", f"Download status {dl_ckpt.status_code}")
+            else:
+                suite.record(False, "S3 checkpoint serialization audit", f"Status {ckpts_res.status_code}")
+    except Exception as e:
+        suite.record(False, "S3 checkpoint serialization audit", str(e))
+
+    # E5.5 Dynamic Dedicated Endpoint Deployment with Fine-Tuned Adapter
+    try:
+        ep_payload = {
+            "name": e5_endpoint_name,
+            "model_id": "meta-llama/Llama-3-8B",
+            "adapter_url": e5_final_adapter_url,
+            "min_replicas": 1,
+            "max_replicas": 4
+        }
+        dep_res = requests.post(f"{BASE_URL}/api/v1/inference/endpoints", json=ep_payload)
+        if dep_res.status_code in (200, 201) and "id" in dep_res.json():
+            e5_endpoint_id = dep_res.json()["id"]
+
+            # Verify endpoint appears in OpenAI /v1/models registry
+            models_check = requests.get(f"{BASE_URL}/v1/models", headers=e5_auth_headers)
+            has_endpoint_in_catalog = False
+            if models_check.status_code == 200:
+                catalog = [m["id"] for m in models_check.json().get("data", [])]
+                has_endpoint_in_catalog = e5_endpoint_name in catalog
+
+            suite.record(has_endpoint_in_catalog, f"Dedicated endpoint deployed & cataloged in OpenAI registry ({e5_endpoint_name})")
+        else:
+            suite.record(False, "Dedicated endpoint deployment", f"Status {dep_res.status_code}: {dep_res.text}")
+    except Exception as e:
+        suite.record(False, "Dedicated endpoint deployment", str(e))
+
+    # E5.6 OpenAI Gateway Inference (Drop-in Standard Chat Completion)
+    try:
+        chat_payload = {
+            "model": e5_endpoint_name,
+            "messages": [
+                {"role": "system", "content": "You are an Enterprise AI assistant operating on NetworkNebula compute nodes."},
+                {"role": "user", "content": "Confirm end-to-end inference execution status."}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 128,
+            "stream": False
+        }
+        comp_res = requests.post(f"{BASE_URL}/v1/chat/completions", headers=e5_auth_headers, json=chat_payload)
+        if comp_res.status_code == 200 and "choices" in comp_res.json():
+            resp_body = comp_res.json()
+            content = resp_body["choices"][0]["message"]["content"]
+            usage = resp_body.get("usage", {})
+            has_tokens = usage.get("total_tokens", 0) > 0
+            has_text = len(content.strip()) > 0
+            suite.record(has_tokens and has_text, f"OpenAI /v1/chat/completions drop-in inference verified ({usage.get('total_tokens')} tokens, {content[:40]}...)")
+        else:
+            suite.record(False, "OpenAI chat completion drop-in", f"Status {comp_res.status_code}: {comp_res.text}")
+    except Exception as e:
+        suite.record(False, "OpenAI chat completion drop-in", str(e))
+
+    # E5.7 OpenAI Gateway Real-time SSE Streaming Inference
+    try:
+        stream_payload = {
+            "model": e5_endpoint_name,
+            "messages": [
+                {"role": "user", "content": "Stream response test across decentralized GPU clusters."}
+            ],
+            "stream": True
+        }
+        stream_res = requests.post(f"{BASE_URL}/v1/chat/completions", headers=e5_auth_headers, json=stream_payload, stream=True)
+        if stream_res.status_code == 200:
+            stream_chunks = []
+            for raw_line in stream_res.iter_lines():
+                if raw_line:
+                    line_str = raw_line.decode("utf-8")
+                    if line_str.startswith("data: "):
+                        stream_chunks.append(line_str)
+            stream_ok = len(stream_chunks) >= 2 and stream_chunks[-1] == "data: [DONE]"
+            suite.record(stream_ok, f"OpenAI SSE streaming verified ({len(stream_chunks)} events received, clean [DONE] termination)")
+        else:
+            suite.record(False, "OpenAI SSE streaming verification", f"Status {stream_res.status_code}")
+    except Exception as e:
+        suite.record(False, "OpenAI SSE streaming verification", str(e))
+
+    # E5.8 Enterprise SLA Telemetry & Latency Accounting
+    try:
+        if not e5_endpoint_id:
+            suite.record(False, "Enterprise SLA telemetry tracking", "No endpoint_id available")
+        else:
+            ep_status_res = requests.get(f"{BASE_URL}/api/v1/inference/endpoints/{e5_endpoint_id}", headers=e5_auth_headers)
+            if ep_status_res.status_code == 200:
+                ep_stat = ep_status_res.json()
+                req_served = ep_stat.get("total_requests", 0) >= 2
+                has_avg_lat = ep_stat.get("avg_latency_ms", 0.0) >= 0.0
+                suite.record(req_served and has_avg_lat, f"Enterprise endpoint SLA tracked ({ep_stat.get('total_requests')} queries served, latency: {ep_stat.get('avg_latency_ms')}ms)")
+            else:
+                suite.record(False, "Enterprise SLA telemetry tracking", f"Status {ep_status_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Enterprise SLA telemetry tracking", str(e))
+
+    # E5.9 Zero-Trust Lifecycle Teardown & Revocation Verification
+    try:
+        # Undeploy dedicated endpoint
+        del_ep_res = requests.delete(f"{BASE_URL}/api/v1/inference/endpoints/{e5_endpoint_id}")
+        ep_deleted = del_ep_res.status_code == 200 and del_ep_res.json().get("status") == "deleted"
+
+        # Revoke customer API token
+        del_tok_res = requests.delete(f"{BASE_URL}/api/v1/tokens/{e5_token_id}", headers=e5_auth_headers)
+        tok_revoked = del_tok_res.status_code == 200 and del_tok_res.json().get("status") == "revoked"
+
+        # Assert zero-trust 401 enforcement
+        probe_res = requests.get(f"{BASE_URL}/v1/models", headers={"Authorization": f"Bearer {e5_bearer_token}"})
+        unauth_enforced = probe_res.status_code == 401
+
+        suite.record(ep_deleted and tok_revoked and unauth_enforced, "Zero-Trust lifecycle teardown & token revocation confirmed (401 enforced)")
+    except Exception as e:
+        suite.record(False, "Zero-Trust lifecycle teardown", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
