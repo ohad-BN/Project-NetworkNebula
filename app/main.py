@@ -21,6 +21,7 @@ from app.auth import (
     get_user_by_email,
     hash_password,
     verify_api_auth,
+    verify_enterprise_auth,
     verify_password,
 )
 from app.config import settings
@@ -228,7 +229,7 @@ def get_me(user=Depends(verify_api_auth)):
 
 
 @app.get("/wallet")
-def get_wallet(user=Depends(verify_api_auth), db=Depends(get_db)):
+def get_wallet(user=Depends(verify_enterprise_auth), db=Depends(get_db)):
     return {
         "user_id": user.id,
         "balance": user.balance,
