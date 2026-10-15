@@ -154,7 +154,10 @@ def get_storage() -> StorageClient:
     return _storage
 
 
+# Global singleton access
+storage = get_storage()
+
+
 def upload_image_to_minio(image: Image.Image, object_name: str) -> str:
     """Convenience function to upload PIL Image to MinIO."""
-    storage = get_storage()
     return storage.upload_image(image, object_name)

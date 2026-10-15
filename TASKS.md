@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 1: Phase 1.3 Complete (Real Neural Inference Engine & Live Token Streaming Active)  
+> **Project Phase:** Alpha Milestone 1: Phase 1.4 Complete (Real PyTorch PEFT / LoRA Training Engine Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**92/92 Passed — 100%**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**95/95 Passed — 100%**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -17,7 +17,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | Celery + Redis (6379) | Host workers processing training jobs and inference calls |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **92/92 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **95/95 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -99,12 +99,14 @@
 - [x] Connected live SSE stream to `/v1/chat/completions` with exact tokenizer token usage counters (`prompt_tokens`, `completion_tokens`, `total_tokens`)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.3 assertions (M1.7 real GPU chat, M1.8 live token streaming, M1.9 tokenizer alignment) (**92/92 passed — 100%**)
 
-### 📋 Phase 1.4: Real PyTorch PEFT / LoRA Training Engine
-- [ ] Build `app/training_engine.py` for real forward/backward backpropagation passes
-- [ ] Pull dataset JSONL from MinIO S3 (`nebula-datasets`) and tokenize conversation pairs
-- [ ] Attach trainable LoRA matrices via `peft.LoraConfig(r=16, lora_alpha=32)`
-- [ ] Run PyTorch AdamW optimization steps, emitting real-time loss metrics to `TrainingJob.loss_history`
-- [ ] Export real `.safetensors` adapter weights and serialize directly to S3 `nebula-checkpoints`
+### ✅ Phase 1.4: Real PyTorch PEFT / LoRA Training Engine (COMPLETED)
+- [x] Built `app/training_engine.py` singleton (`PeftTrainingEngine`) orchestrating real PyTorch forward/backward backpropagation on RTX 4070 (`cuda:0`)
+- [x] Ingested instruction datasets from MinIO S3 (`nebula-datasets`) and tokenized conversation pairs
+- [x] Attached trainable LoRA matrices via `peft.LoraConfig(r=16, lora_alpha=32)` (1,081,344 trainable parameters, 0.22% parameter footprint)
+- [x] Executed PyTorch AdamW gradient descent optimization steps emitting verified loss decay metrics to `TrainingJob.loss_history`
+- [x] Exported genuine `.safetensors` adapter checkpoints (96 LoRA weight matrices, 4.3 MB) and serialized directly to MinIO S3 (`nebula-checkpoints`)
+- [x] Wired `execute_training_job` in `app/worker.py` to route through the real PEFT training engine
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.4 assertions (M1.10 backward pass & gradients, M1.11 loss decay, M1.12 authentic S3 safetensors) (**95/95 passed — 100%**)
 
 ### 📋 Phase 1.5: Dynamic S3 LoRA Adapter Hot-Swapping
 - [ ] Implement dynamic PEFT adapter mounting in worker when serving custom endpoints

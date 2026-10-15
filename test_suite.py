@@ -1506,6 +1506,88 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Inference engine tokenizer alignment", str(e))
 
+    # =========================================================================
+    # Phase 1.4 (Alpha): Real PyTorch PEFT / LoRA Training Engine
+    # =========================================================================
+    print_header("Phase 1.4 (Alpha): Real PyTorch PEFT / LoRA Training Engine")
+
+    # M1.10 Real PyTorch LoRA Backward Pass & Trainable Parameter Injection
+    try:
+        from app.model_cache import model_cache, DEFAULT_FOUNDATION_MODEL
+        import peft
+        import torch
+
+        m_base, m_tok = model_cache.load_model(DEFAULT_FOUNDATION_MODEL)
+        cfg = peft.LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        peft_m = peft.get_peft_model(m_base, cfg)
+        peft_m.train()
+        trainable_p, total_p = peft_m.get_nb_trainable_parameters()
+
+        # Run one quick real backpropagation step
+        sample_text = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi<|im_end|>"
+        in_ids = m_tok(sample_text, return_tensors="pt")["input_ids"].to(peft_m.device)
+        out = peft_m(input_ids=in_ids, labels=in_ids)
+        l_val = out.loss
+        l_val.backward()
+
+        # Verify non-zero gradient exists on at least one LoRA parameter
+        has_grads = any(
+            p.grad is not None and torch.count_nonzero(p.grad).item() > 0
+            for name, p in peft_m.named_parameters() if "lora_" in name
+        )
+        peft_m.zero_grad()
+        del peft_m
+        torch.cuda.empty_cache()
+
+        suite.record(trainable_p > 0 and has_grads, f"Real PyTorch LoRA backward pass verified on RTX 4070 ({trainable_p:,} params, non-zero gradients)")
+    except Exception as e:
+        suite.record(False, "Real PyTorch LoRA backward pass", str(e))
+
+    # M1.11 End-to-End Real Training Run with Mathematical Loss Descent
+    t_summary = {}
+    try:
+        from app.training_engine import training_engine
+        train_run_id = f"test-alpha-lora-{uuid.uuid4().hex[:6]}"
+        t_summary = training_engine.train_job(
+            job_id=train_run_id,
+            base_model_id="Qwen/Qwen2.5-0.5B-Instruct",
+            dataset_s3_url=None,
+            total_epochs=2,
+            lr=2e-4
+        )
+        hist = t_summary.get("loss_history", [])
+        has_history = len(hist) == 2
+        first_loss = hist[0]["loss"] if has_history else 0.0
+        final_loss = hist[-1]["loss"] if has_history else 0.0
+        loss_decayed = has_history and final_loss < first_loss
+
+        suite.record(has_history and loss_decayed, f"Real LoRA training loss descent confirmed ({first_loss:.4f} -> {final_loss:.4f})")
+    except Exception as e:
+        suite.record(False, "Real LoRA training loss descent", str(e))
+
+    # M1.12 Authentic PEFT .safetensors Checkpoint Extraction from MinIO S3
+    try:
+        import safetensors.torch
+        s3_ckpt_url = t_summary.get("final_adapter_url", "")
+        if s3_ckpt_url:
+            ckpt_dl = requests.get(s3_ckpt_url)
+            if ckpt_dl.status_code == 200:
+                loaded_tensors = safetensors.torch.load(ckpt_dl.content)
+                has_lora_keys = any("lora_A" in k or "lora_B" in k for k in loaded_tensors.keys())
+                suite.record(has_lora_keys and len(loaded_tensors) > 0, f"Authentic PEFT .safetensors validated from S3 ({len(loaded_tensors)} LoRA tensor matrices, {len(ckpt_dl.content):,} bytes)")
+            else:
+                suite.record(False, "PEFT .safetensors S3 validation", f"Download status {ckpt_dl.status_code}")
+        else:
+            suite.record(False, "PEFT .safetensors S3 validation", "No checkpoint URL in summary")
+    except Exception as e:
+        suite.record(False, "PEFT .safetensors S3 validation", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
