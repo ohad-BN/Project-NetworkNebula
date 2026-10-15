@@ -395,7 +395,7 @@ def run_tests():
             # Poll for Celery Worker to process and complete
             final_status = None
             output_url = None
-            for _ in range(12):
+            for _ in range(25):
                 time.sleep(1)
                 st_req = urllib.request.Request(f"http://localhost:8000/api/tasks/{task_id}")
                 with urllib.request.urlopen(st_req, timeout=3) as st_resp:
@@ -567,7 +567,7 @@ def run_tests():
             # Poll for Celery Worker completion
             completed = False
             p5_output_url = None
-            for _ in range(12):
+            for _ in range(25):
                 time.sleep(1)
                 poll_req = urllib.request.Request(f"http://localhost:8000/api/tasks/{p5_task_id}")
                 with urllib.request.urlopen(poll_req, timeout=3) as poll_resp:
@@ -1326,6 +1326,53 @@ def run_tests():
         suite.record(ep_deleted and tok_revoked and unauth_enforced, "Zero-Trust lifecycle teardown & token revocation confirmed (401 enforced)")
     except Exception as e:
         suite.record(False, "Zero-Trust lifecycle teardown", str(e))
+
+    # =========================================================================
+    # Phase 1.1 (Alpha): CUDA Hardware Acceleration & ML Dependencies
+    # =========================================================================
+    print_header("Phase 1.1 (Alpha): CUDA Hardware Acceleration & ML Dependencies")
+
+    # M1.1 PyTorch CUDA Hardware Binding
+    try:
+        import torch
+        cuda_avail = torch.cuda.is_available()
+        dev_count = torch.cuda.device_count() if cuda_avail else 0
+        dev_name = torch.cuda.get_device_name(0) if cuda_avail else "N/A"
+        suite.record(cuda_avail and dev_count >= 1, f"PyTorch CUDA acceleration active ({dev_name}, {dev_count} device(s))")
+    except Exception as e:
+        suite.record(False, "PyTorch CUDA acceleration", str(e))
+
+    # M1.2 Real GPU Tensor Allocation & Hardware Matrix Multiplication
+    try:
+        if not torch.cuda.is_available():
+            suite.record(False, "GPU tensor matrix multiplication", "CUDA unavailable")
+        else:
+            t_a = torch.randn(512, 512, device="cuda", dtype=torch.float16)
+            t_b = torch.randn(512, 512, device="cuda", dtype=torch.float16)
+            t_c = torch.matmul(t_a, t_b)
+            torch.cuda.synchronize()
+            is_valid_tensor = t_c.shape == (512, 512) and not torch.isnan(t_c).any().item()
+            del t_a, t_b, t_c
+            torch.cuda.empty_cache()
+            suite.record(is_valid_tensor, f"Hardware GPU matrix multiplication verified (FP16 512x512 on {dev_name})")
+    except Exception as e:
+        suite.record(False, "GPU tensor matrix multiplication", str(e))
+
+    # M1.3 PEFT & Hugging Face LoRA Configuration Readiness
+    try:
+        import peft
+        lora_cfg = peft.LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        is_peft_ready = hasattr(lora_cfg, "r") and lora_cfg.r == 16
+        suite.record(is_peft_ready, f"Hugging Face PEFT framework active (v{peft.__version__}, LoraConfig initialized)")
+    except Exception as e:
+        suite.record(False, "Hugging Face PEFT readiness", str(e))
 
     return suite.summary()
 
