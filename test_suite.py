@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 import json
+from pathlib import Path
 import urllib.request
 import urllib.error
 import requests
@@ -1004,6 +1005,67 @@ def run_tests():
                          f"Endpoint undeployment & cleanup confirmed (endpoint_id: {endpoint_id[:12]}...)")
     except Exception as e:
         suite.record(False, "Endpoint undeployment", str(e))
+
+    # =========================================================================
+    # Phase 4 (Enterprise): React 19 Enterprise Cloud Console UI
+    # =========================================================================
+    print_header("Phase 4 (Enterprise): React 19 Enterprise Cloud Console UI")
+
+    # E4.1 Enterprise Console Route: /training
+    try:
+        t_route_resp = requests.get("http://localhost:5173/training", timeout=3)
+        t_route_ok = t_route_resp.status_code == 200 and "<html" in t_route_resp.text.lower()
+        suite.record(t_route_ok, f"Enterprise Console /training route verified (HTTP {t_route_resp.status_code})")
+    except Exception as e:
+        suite.record(False, "Enterprise Console /training route", str(e))
+
+    # E4.2 Enterprise Console Route: /inference
+    try:
+        i_route_resp = requests.get("http://localhost:5173/inference", timeout=3)
+        i_route_ok = i_route_resp.status_code == 200 and "<html" in i_route_resp.text.lower()
+        suite.record(i_route_ok, f"Enterprise Console /inference route verified (HTTP {i_route_resp.status_code})")
+    except Exception as e:
+        suite.record(False, "Enterprise Console /inference route", str(e))
+
+    # E4.3 Enterprise Console Route: /api-tokens
+    try:
+        tok_route_resp = requests.get("http://localhost:5173/api-tokens", timeout=3)
+        tok_route_ok = tok_route_resp.status_code == 200 and "<html" in tok_route_resp.text.lower()
+        suite.record(tok_route_ok, f"Enterprise Console /api-tokens route verified (HTTP {tok_route_resp.status_code})")
+    except Exception as e:
+        suite.record(False, "Enterprise Console /api-tokens route", str(e))
+
+    # E4.4 Enterprise Console Route: /cluster
+    try:
+        c_route_resp = requests.get("http://localhost:5173/cluster", timeout=3)
+        c_route_ok = c_route_resp.status_code == 200 and "<html" in c_route_resp.text.lower()
+        suite.record(c_route_ok, f"Enterprise Console /cluster route verified (HTTP {c_route_resp.status_code})")
+    except Exception as e:
+        suite.record(False, "Enterprise Console /cluster route", str(e))
+
+    # E4.5 Production Static Build Verification
+    try:
+        dist_index = Path("network-nebula/dist/index.html")
+        build_exists = dist_index.exists() and dist_index.stat().st_size > 200
+        suite.record(build_exists, f"Production static build verified ({dist_index.name}, {dist_index.stat().st_size if build_exists else 0} bytes)")
+    except Exception as e:
+        suite.record(False, "Production static build verification", str(e))
+
+    # E4.6 Enterprise Navigation & Router Manifest
+    try:
+        nav_file = Path("network-nebula/src/components/layout/navbar.tsx")
+        app_file = Path("network-nebula/src/routes/index.tsx")
+        has_nav = False
+        has_routes = False
+        if nav_file.exists():
+            nav_content = nav_file.read_text(encoding="utf-8")
+            has_nav = all(k in nav_content for k in ["/training", "/inference", "/api-tokens", "/cluster"])
+        if app_file.exists():
+            routes_content = app_file.read_text(encoding="utf-8")
+            has_routes = all(k in routes_content for k in ["/training", "/inference", "/api-tokens", "/cluster"])
+        suite.record(has_nav and has_routes, "Enterprise navigation & router manifest verified (4 routes wired)")
+    except Exception as e:
+        suite.record(False, "Enterprise navigation & router manifest", str(e))
 
     return suite.summary()
 

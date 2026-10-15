@@ -32,8 +32,11 @@ export function Navbar({ user, onLogout }: NavbarProps) {
   const location = useLocation();
 
   const navLinks = [
-    { href: "/", label: "Dashboard" },
-    { href: "/jobs", label: "Jobs" },
+    { href: "/training", label: "Training Studio" },
+    { href: "/inference", label: "Model Serving" },
+    { href: "/api-tokens", label: "API Tokens" },
+    { href: "/cluster", label: "GPU Fleet" },
+    { href: "/jobs", label: "History" },
     ...(user?.role === "worker" ? [{ href: "/worker", label: "Worker" }] : []),
   ];
 

@@ -1,7 +1,6 @@
 import { createBrowserRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { ProtectedRoute } from "@/components/common/protected-route";
-import { HomePage } from "@/pages/home";
 import { LoginPage } from "@/pages/login";
 import { RegisterPage } from "@/pages/register";
 import { CreateJobPage } from "@/pages/create-job";
@@ -12,6 +11,10 @@ import { WorkerDashboardPage } from "@/pages/worker";
 import { WorkerEarningsPage } from "@/pages/worker-earnings";
 import { WalletPage } from "@/pages/wallet";
 import { NotFoundPage } from "@/pages/not-found";
+import { TrainingStudioPage } from "@/pages/training-studio";
+import { InferenceHubPage } from "@/pages/inference-hub";
+import { ApiTokensPage } from "@/pages/api-tokens";
+import { ClusterStatusPage } from "@/pages/cluster-status";
 
 // Wrapper component for protected routes
 function ProtectedRouteWrapper({
@@ -32,7 +35,23 @@ function ProtectedRouteWrapper({
 export const routes = [
   {
     path: "/",
-    element: <HomePage />,
+    element: <TrainingStudioPage />,
+  },
+  {
+    path: "/training",
+    element: <TrainingStudioPage />,
+  },
+  {
+    path: "/inference",
+    element: <InferenceHubPage />,
+  },
+  {
+    path: "/api-tokens",
+    element: <ApiTokensPage />,
+  },
+  {
+    path: "/cluster",
+    element: <ClusterStatusPage />,
   },
   {
     path: "/login",

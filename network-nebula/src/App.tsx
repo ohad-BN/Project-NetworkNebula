@@ -3,7 +3,6 @@ import { Toaster } from "@/components/ui/sonner";
 import { Navbar } from "@/components/layout/navbar";
 import { useAuthStore } from "@/stores/auth-store";
 import { ProtectedRoute } from "@/components/common/protected-route";
-import { HomePage } from "@/pages/home";
 import { LoginPage } from "@/pages/login";
 import { RegisterPage } from "@/pages/register";
 import { CreateJobPage } from "@/pages/create-job";
@@ -14,6 +13,10 @@ import { WorkerDashboardPage } from "@/pages/worker";
 import { WorkerEarningsPage } from "@/pages/worker-earnings";
 import { WalletPage } from "@/pages/wallet";
 import { NotFoundPage } from "@/pages/not-found";
+import { TrainingStudioPage } from "@/pages/training-studio";
+import { InferenceHubPage } from "@/pages/inference-hub";
+import { ApiTokensPage } from "@/pages/api-tokens";
+import { ClusterStatusPage } from "@/pages/cluster-status";
 import type { ReactNode } from "react";
 
 function ProtectedRouteWrapper({
@@ -37,7 +40,11 @@ function App() {
       <Navbar user={user} onLogout={logout} />
       <main>
         <Routes>
-          <Route path="/" element={<HomePage />} />
+          <Route path="/" element={<TrainingStudioPage />} />
+          <Route path="/training" element={<TrainingStudioPage />} />
+          <Route path="/inference" element={<InferenceHubPage />} />
+          <Route path="/api-tokens" element={<ApiTokensPage />} />
+          <Route path="/cluster" element={<ClusterStatusPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/register/worker" element={<RegisterWorkerPage />} />
