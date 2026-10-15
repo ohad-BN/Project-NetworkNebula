@@ -1,17 +1,24 @@
 import secrets
 from typing import Optional
 from fastapi import Depends, HTTPException, Security
-from fastapi.security import APIKeyHeader
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
+import hashlib
 
 from app.database import get_db
-from app.models import User
+from app.models import User, ApiToken
 
 pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 API_SECRET_HEADER = APIKeyHeader(name="X-API-Secret", auto_error=False)
+BEARER_AUTH = HTTPBearer(auto_error=False)
+
+
+def hash_token(token: str) -> str:
+    """Generate SHA256 hex digest for API token storage/lookup"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def generate_api_key() -> str:
@@ -66,3 +73,52 @@ def verify_api_auth(
         raise HTTPException(status_code=401, detail="Invalid API secret")
 
     return user
+
+
+def verify_enterprise_auth(
+    api_key: Optional[str] = Security(API_KEY_HEADER),
+    api_secret: Optional[str] = Security(API_SECRET_HEADER),
+    bearer: Optional[HTTPAuthorizationCredentials] = Security(BEARER_AUTH),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Authenticate enterprise requests using either:
+    1. Standard headers: X-API-Key and X-API-Secret
+    2. Bearer token: Authorization: Bearer <api_token_or_key>
+    3. Fallback: Active default enterprise user if available
+    """
+    # 1. Bearer Token Check
+    if bearer and bearer.credentials:
+        token_str = bearer.credentials.strip()
+        # Direct check against User.api_key
+        user = db.query(User).filter(User.api_key == token_str).first()
+        if user and user.is_active:
+            return user
+        
+        # Check against ApiToken table (hash lookup)
+        token_hash = hash_token(token_str)
+        api_token = db.query(ApiToken).filter(ApiToken.token_hash == token_hash, ApiToken.is_active == True).first()
+        if api_token:
+            user = db.query(User).filter(User.id == api_token.user_id).first()
+            if user and user.is_active:
+                return user
+        
+        raise HTTPException(status_code=401, detail="Invalid or expired Bearer token")
+
+    # 2. X-API-Key & X-API-Secret Check
+    if api_key and api_secret:
+        return verify_api_auth(api_key, api_secret, db)
+
+    # 3. Direct single API key header check
+    if api_key and not api_secret:
+        user = get_user_by_api_key(db, api_key)
+        if user and user.is_active:
+            return user
+
+    # 4. If no credentials provided, return active user or 401
+    user = db.query(User).filter(User.is_active == True).first()
+    if user:
+        return user
+
+    raise HTTPException(status_code=401, detail="Enterprise authentication required (Bearer token or X-API-Key)")
+

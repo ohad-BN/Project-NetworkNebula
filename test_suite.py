@@ -13,6 +13,7 @@ import uuid
 import json
 import urllib.request
 import urllib.error
+import requests
 import logging
 import warnings
 
@@ -697,6 +698,143 @@ def run_tests():
                      f"MinIO S3 Dataset byte roundtrip verified ({test_url})")
     except Exception as e:
         suite.record(False, "Enterprise MinIO S3 Buckets", str(e))
+
+    # =========================================================================
+    # Phase 2 (Enterprise): Model Training Engine, Loss Telemetry & S3 Checkpoints
+    # =========================================================================
+    print_header("Phase 2 (Enterprise): Model Training Engine & S3 Checkpoints")
+    BASE_URL = "http://localhost:8000"
+
+    # E2.1 Dataset Presigned Upload URL API
+    dataset_s3_url = None
+    try:
+        up_resp = requests.post(
+            f"{BASE_URL}/api/v1/training/datasets/upload-url",
+            json={"filename": "enterprise_customer_train.jsonl"}
+        )
+        up_ok = up_resp.status_code == 200 and "upload_url" in up_resp.json()
+        if up_ok:
+            data = up_resp.json()
+            dataset_s3_url = data["s3_url"]
+            suite.record(True, f"Dataset presigned upload URL generated ({data['bucket']}/{data['object_key']})")
+        else:
+            suite.record(False, "Dataset presigned upload URL", f"Status {up_resp.status_code}: {up_resp.text}")
+    except Exception as e:
+        suite.record(False, "Dataset presigned upload URL", str(e))
+
+    # E2.2 Training Job Submission API
+    job_id = None
+    try:
+        submit_payload = {
+            "name": f"LoRA-FineTune-Test-{uuid.uuid4().hex[:6]}",
+            "base_model": "meta-llama/Llama-3-8B",
+            "train_type": "lora",
+            "parallelism": "data_parallel",
+            "num_gpus": 1,
+            "dataset_s3_url": dataset_s3_url or "http://localhost:9000/nebula-datasets/default/train.jsonl",
+            "total_epochs": 2,
+            "hyperparameters": {
+                "learning_rate": 0.0002,
+                "batch_size": 4,
+                "lora_r": 16,
+                "lora_alpha": 32
+            }
+        }
+        sub_resp = requests.post(f"{BASE_URL}/api/v1/training/jobs", json=submit_payload)
+        sub_ok = sub_resp.status_code in (200, 201) and "id" in sub_resp.json()
+        if sub_ok:
+            job_data = sub_resp.json()
+            job_id = job_data["id"]
+            suite.record(True, f"Enterprise training job submitted (ID: {job_id[:12]}..., status: {job_data['status']})")
+        else:
+            suite.record(False, "Enterprise training job submission", f"Status {sub_resp.status_code}: {sub_resp.text}")
+    except Exception as e:
+        suite.record(False, "Enterprise training job submission", str(e))
+
+    # E2.3 Telemetry Polling & Mathematical Loss Descent Verification
+    try:
+        if not job_id:
+            suite.record(False, "Training telemetry polling", "No job_id from submission")
+        else:
+            completed = False
+            final_job = None
+            for _ in range(30):
+                poll_resp = requests.get(f"{BASE_URL}/api/v1/training/jobs/{job_id}")
+                if poll_resp.status_code == 200:
+                    final_job = poll_resp.json()
+                    if final_job["status"] == "completed":
+                        completed = True
+                        break
+                    elif final_job["status"] == "failed":
+                        break
+                time.sleep(0.5)
+
+            suite.record(completed, f"Training job finished successfully (status: {final_job.get('status') if final_job else 'unknown'})")
+            
+            # Verify loss history decay
+            loss_hist = final_job.get("loss_history", []) if final_job else []
+            has_loss = len(loss_hist) >= 2
+            loss_descends = has_loss and (loss_hist[1]["loss"] < loss_hist[0]["loss"])
+            suite.record(has_loss and loss_descends, 
+                         f"Mathematical loss decay confirmed ({loss_hist[0]['loss'] if has_loss else '?'} -> {loss_hist[-1]['loss'] if has_loss else '?'})")
+    except Exception as e:
+        suite.record(False, "Training telemetry & loss decay", str(e))
+
+    # E2.4 Checkpoint Retrieval & Safetensors Deserialization
+    try:
+        if not job_id:
+            suite.record(False, "S3 Checkpoints retrieval", "No job_id")
+        else:
+            ckpt_resp = requests.get(f"{BASE_URL}/api/v1/training/jobs/{job_id}/checkpoints")
+            ckpt_ok = ckpt_resp.status_code == 200 and len(ckpt_resp.json()) >= 1
+            if ckpt_ok:
+                checkpoints = ckpt_resp.json()
+                latest_ckpt = checkpoints[-1]
+                suite.record(True, f"Checkpoints registered in S3 ({len(checkpoints)} checkpoint(s), latest epoch: {latest_ckpt['epoch']})")
+
+                # Verify actual bytes download from MinIO and safetensors validity
+                import safetensors.torch
+                dl_resp = requests.get(latest_ckpt["s3_url"])
+                is_valid_safetensors = False
+                tensor_keys = []
+                if dl_resp.status_code == 200:
+                    tensors = safetensors.torch.load(dl_resp.content)
+                    tensor_keys = list(tensors.keys())
+                    is_valid_safetensors = len(tensor_keys) > 0
+
+                suite.record(is_valid_safetensors, 
+                             f"Safetensors checkpoint binary verified ({len(dl_resp.content)} bytes, {len(tensor_keys)} tensors)")
+            else:
+                suite.record(False, "S3 Checkpoints retrieval", f"Status {ckpt_resp.status_code}")
+    except Exception as e:
+        suite.record(False, "S3 Checkpoint verification", str(e))
+
+    # E2.5 List Training Jobs API
+    try:
+        list_resp = requests.get(f"{BASE_URL}/api/v1/training/jobs")
+        list_ok = list_resp.status_code == 200 and isinstance(list_resp.json(), list) and len(list_resp.json()) > 0
+        suite.record(list_ok, f"List training jobs API verified ({len(list_resp.json()) if list_ok else 0} job(s) found)")
+    except Exception as e:
+        suite.record(False, "List training jobs API", str(e))
+
+    # E2.6 Job Cancellation Flow API
+    try:
+        cancel_job_resp = requests.post(f"{BASE_URL}/api/v1/training/jobs", json={
+            "name": "Cancel-Test-Job",
+            "base_model": "meta-llama/Llama-3-8B",
+            "dataset_s3_url": "http://localhost:9000/nebula-datasets/dummy.jsonl",
+            "total_epochs": 50
+        })
+        if cancel_job_resp.status_code in (200, 201):
+            c_job_id = cancel_job_resp.json()["id"]
+            c_resp = requests.post(f"{BASE_URL}/api/v1/training/jobs/{c_job_id}/cancel")
+            is_canc = c_resp.status_code == 200 and c_resp.json().get("status") == "cancelled"
+            detail = f"ID: {c_job_id[:12]}..." if is_canc else f"Status: {c_resp.status_code}, Resp: {c_resp.text}"
+            suite.record(is_canc, "Job cancellation lifecycle verified", detail)
+        else:
+            suite.record(False, "Job cancellation flow", "Could not submit job to cancel")
+    except Exception as e:
+        suite.record(False, "Job cancellation flow", str(e))
 
     return suite.summary()
 

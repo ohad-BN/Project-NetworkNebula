@@ -89,6 +89,18 @@ class StorageClient:
             logger.error(f"Failed to upload bytes to {bucket}/{object_name}: {e}")
             raise
 
+    def upload_image(self, image: Image.Image, object_name: str, format: str = "PNG") -> str:
+        """Upload a PIL Image directly to MinIO"""
+        buffer = BytesIO()
+        image.save(buffer, format=format)
+        buffer.seek(0)
+        return self.upload_bytes(
+            bucket=self.bucket,
+            object_name=object_name,
+            data=buffer.getvalue(),
+            content_type=f"image/{format.lower()}"
+        )
+
     def download_bytes(self, bucket: str, object_name: str) -> bytes:
         """Download raw bytes from a specific bucket"""
         try:
@@ -109,6 +121,20 @@ class StorageClient:
             return url
         except ClientError as e:
             logger.error(f"Presigned URL generation failed: {e}")
+            raise
+
+    def get_presigned_upload_url(self, object_name: str, bucket_name: Optional[str] = None, expires_in: int = 3600) -> str:
+        """Generate presigned PUT URL for customer uploads"""
+        target_bucket = bucket_name or "nebula-datasets"
+        try:
+            url = self.s3.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": target_bucket, "Key": object_name},
+                ExpiresIn=expires_in
+            )
+            return url
+        except ClientError as e:
+            logger.error(f"Presigned upload URL generation failed: {e}")
             raise
 
 

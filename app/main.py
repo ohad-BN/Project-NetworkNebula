@@ -966,3 +966,9 @@ app.include_router(grpc_router)
 from app.api_router import api_router
 
 app.include_router(api_router)
+
+# Include Enterprise Model Training Engine Router (Phase 2)
+from app.enterprise_training_router import router as enterprise_training_router
+
+app.include_router(enterprise_training_router)
+
