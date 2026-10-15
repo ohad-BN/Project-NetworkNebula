@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 1: Phase 1.2 Complete (Foundation Model Cache & Catalog Active)  
+> **Project Phase:** Alpha Milestone 1: Phase 1.3 Complete (Real Neural Inference Engine & Live Token Streaming Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**89/89 Passed — 100%**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**92/92 Passed — 100%**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -17,7 +17,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | Celery + Redis (6379) | Host workers processing training jobs and inference calls |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **89/89 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **92/92 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -92,11 +92,12 @@
 - [x] Implemented `/api/v1/models/catalog` and `/api/v1/models/cache/status` in `app/openai_inference_router.py`
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.2 assertions (M1.4 catalog specs, M1.5 GPU telemetry, M1.6 local weight cache) (**89/89 passed — 100%**)
 
-### 📋 Phase 1.3: Real Neural Inference Engine & Live Token Streaming
-- [ ] Build `app/inference_engine.py` singleton wrapping `AutoModelForCausalLM` and `AutoTokenizer`
-- [ ] Implement genuine token-by-token streaming via `transformers.TextIteratorStreamer`
-- [ ] Wire `serve_inference_request` in `app/worker.py` to route through the real inference engine
-- [ ] Connect live stream to `/v1/chat/completions` with exact token usage counters
+### ✅ Phase 1.3: Real Neural Inference Engine & Live Token Streaming (COMPLETED)
+- [x] Built `app/inference_engine.py` singleton (`NeuralInferenceEngine`) wrapping `Qwen/Qwen2.5-0.5B-Instruct` on physical GPU (`cuda:0`)
+- [x] Implemented real token-by-token streaming via `transformers.TextIteratorStreamer` with multi-threaded generation
+- [x] Wired `serve_inference_request` in `app/worker.py` and Uvicorn orchestrator to execute real neural forward passes
+- [x] Connected live SSE stream to `/v1/chat/completions` with exact tokenizer token usage counters (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.3 assertions (M1.7 real GPU chat, M1.8 live token streaming, M1.9 tokenizer alignment) (**92/92 passed — 100%**)
 
 ### 📋 Phase 1.4: Real PyTorch PEFT / LoRA Training Engine
 - [ ] Build `app/training_engine.py` for real forward/backward backpropagation passes

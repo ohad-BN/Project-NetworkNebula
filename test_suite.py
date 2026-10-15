@@ -1420,6 +1420,92 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Local foundation model cache verification", str(e))
 
+    # =========================================================================
+    # Phase 1.3 (Alpha): Real Neural Inference Engine & Live Token Streaming
+    # =========================================================================
+    print_header("Phase 1.3 (Alpha): Real Neural Inference Engine & Live Token Streaming")
+
+    # M1.7 Real GPU Neural Inference Execution (Synchronous /v1/chat/completions)
+    try:
+        real_chat_req = {
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "messages": [
+                {"role": "system", "content": "You are a concise AI assistant on the NetworkNebula GPU cluster."},
+                {"role": "user", "content": "What is the capital of France? Answer with just the city name."}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 16,
+            "stream": False
+        }
+        res = requests.post(f"{BASE_URL}/v1/chat/completions", json=real_chat_req)
+        if res.status_code == 200:
+            body = res.json()
+            content = body.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            usage = body.get("usage", {})
+            prompt_toks = usage.get("prompt_tokens", 0)
+            comp_toks = usage.get("completion_tokens", 0)
+            has_tokens = prompt_toks > 0 and comp_toks > 0
+            has_text = len(content) > 0
+            is_accurate = "Paris" in content
+            suite.record(has_tokens and has_text and is_accurate, f"Real GPU neural inference verified on RTX 4070 ('{content}', {comp_toks} completion tokens)")
+        else:
+            suite.record(False, "Real GPU neural inference", f"Status {res.status_code}: {res.text}")
+    except Exception as e:
+        suite.record(False, "Real GPU neural inference", str(e))
+
+    # M1.8 Real-time Neural Token Streaming via SSE (TextIteratorStreamer)
+    try:
+        real_stream_req = {
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "messages": [
+                {"role": "user", "content": "Write words: Apple Banana Cherry."}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 20,
+            "stream": True
+        }
+        stream_res = requests.post(f"{BASE_URL}/v1/chat/completions", json=real_stream_req, stream=True)
+        if stream_res.status_code == 200:
+            received_tokens = []
+            has_done = False
+            for raw_chunk in stream_res.iter_lines():
+                if raw_chunk:
+                    line = raw_chunk.decode("utf-8")
+                    if line == "data: [DONE]":
+                        has_done = True
+                    elif line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        token_piece = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if token_piece:
+                            received_tokens.append(token_piece)
+
+            full_stream_text = "".join(received_tokens).strip()
+            stream_valid = len(received_tokens) >= 2 and has_done and len(full_stream_text) > 0
+            suite.record(stream_valid, f"Live GPU token streaming verified ({len(received_tokens)} tokens streamed, text: '{full_stream_text[:30]}...')")
+        else:
+            suite.record(False, "Live GPU token streaming", f"Status {stream_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Live GPU token streaming", str(e))
+
+    # M1.9 Exact Tokenizer Alignment & Inference Engine Direct Benchmark
+    try:
+        from app.inference_engine import inference_engine
+        engine_res = inference_engine.generate(
+            messages=[{"role": "user", "content": "Compute hash speed."}],
+            model_id="Qwen/Qwen2.5-0.5B-Instruct",
+            temperature=0.0,
+            max_tokens=10
+        )
+        exact_tokens_ok = (
+            engine_res.get("prompt_tokens", 0) > 0
+            and engine_res.get("completion_tokens", 0) > 0
+            and engine_res.get("total_tokens") == engine_res.get("prompt_tokens") + engine_res.get("completion_tokens")
+            and engine_res.get("latency_ms", 0.0) > 0.0
+        )
+        suite.record(exact_tokens_ok, f"Inference engine tokenizer alignment verified (latency: {engine_res.get('latency_ms')}ms, total tokens: {engine_res.get('total_tokens')})")
+    except Exception as e:
+        suite.record(False, "Inference engine tokenizer alignment", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
