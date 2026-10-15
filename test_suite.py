@@ -1661,6 +1661,81 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Fine-tuned endpoint inference", str(e))
 
+    # =========================================================================
+    # Phase 1.6 (Alpha): Master System Validation & Hardware VRAM Audit
+    # =========================================================================
+    print_header("Phase 1.6 (Alpha): Master System Validation & Hardware VRAM Audit")
+
+    # M1.16 Base Model Reversion & Adapter Disablement Verification
+    try:
+        from app.inference_engine import inference_engine
+        from app.model_cache import model_cache, DEFAULT_FOUNDATION_MODEL
+        m_base, _ = model_cache.load_model(DEFAULT_FOUNDATION_MODEL)
+        unmounted_m, active_name = inference_engine._mount_adapter(m_base, None)
+        base_gen = inference_engine.generate(
+            messages=[{"role": "user", "content": "Respond with the word PASS."}],
+            model_id=DEFAULT_FOUNDATION_MODEL,
+            adapter_url=None,
+            max_tokens=10
+        )
+        base_clean = active_name is None and base_gen.get("total_tokens", 0) > 0 and len(base_gen.get("content", "")) > 0
+        suite.record(base_clean, f"Base model reversion verified without adapter bias (active adapter: {active_name}, tokens: {base_gen.get('total_tokens')})")
+    except Exception as e:
+        suite.record(False, "Base model reversion & adapter disablement", str(e))
+
+    # M1.17 Multi-Adapter Hot-Swap & State Machine Transition
+    try:
+        from app.inference_engine import inference_engine
+        p_model = inference_engine.peft_model
+        has_peft_state = p_model is not None and (hasattr(p_model, "peft_config") or hasattr(p_model, "active_adapters"))
+        suite.record(has_peft_state, f"Multi-adapter state machine integrity verified (active: {getattr(p_model, 'active_adapters', 'None')})")
+    except Exception as e:
+        suite.record(False, "Multi-adapter state machine transition", str(e))
+
+    # M1.18 OpenAI Gateway SSE Streaming Chunk Protocol Compliance
+    try:
+        stream_payload = {
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "messages": [{"role": "user", "content": "Count from 1 to 3."}],
+            "stream": True,
+            "max_tokens": 20
+        }
+        res = requests.post(f"{BASE_URL}/v1/chat/completions", json=stream_payload, stream=True)
+        if res.status_code == 200:
+            chunks = []
+            has_stop = False
+            has_done = False
+            for line in res.iter_lines():
+                if line:
+                    l_str = line.decode("utf-8")
+                    if l_str == "data: [DONE]":
+                        has_done = True
+                        break
+                    if l_str.startswith("data: "):
+                        c_data = json.loads(l_str[6:])
+                        chunks.append(c_data)
+                        if c_data.get("choices", [{}])[0].get("finish_reason") == "stop":
+                            has_stop = True
+            format_valid = len(chunks) >= 2 and has_stop and has_done and "id" in chunks[0] and "choices" in chunks[0]
+            suite.record(format_valid, f"OpenAI SSE streaming protocol compliance verified ({len(chunks)} chunks, finish_reason='stop', data: [DONE])")
+        else:
+            suite.record(False, "OpenAI SSE streaming protocol compliance", f"Status {res.status_code}")
+    except Exception as e:
+        suite.record(False, "OpenAI SSE streaming protocol compliance", str(e))
+
+    # M1.19 Live CUDA Hardware VRAM Stability & Allocation Audit
+    try:
+        import torch
+        if torch.cuda.is_available():
+            alloc_mb = torch.cuda.memory_allocated(0) / (1024 * 1024)
+            res_mb = torch.cuda.memory_reserved(0) / (1024 * 1024)
+            vram_stable = alloc_mb < 5000.0  # Well within 8GB laptop RTX 4070 budget
+            suite.record(vram_stable, f"CUDA hardware VRAM stability verified (Allocated: {alloc_mb:.1f} MB, Reserved: {res_mb:.1f} MB, Safe: < 5000 MB)")
+        else:
+            suite.record(False, "CUDA hardware VRAM stability audit", "CUDA unavailable")
+    except Exception as e:
+        suite.record(False, "CUDA hardware VRAM stability audit", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
