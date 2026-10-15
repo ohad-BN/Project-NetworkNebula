@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+    --color-primary: #aa3bff;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #1f2028;
+    --color-secondary-foreground: #ffffff;
+    --color-accent: #c084fc;
+    --color-accent-foreground: #ffffff;
+    --color-background: #16171d;
+    --color-foreground: #ffffff;
+    --color-card: #1f2028;
+    --color-card-foreground: #ffffff;
+    --color-popover: #1f2028;
+    --color-popover-foreground: #ffffff;
+    --color-border: #2e303a;
+    --color-input: #2e303a;
+    --color-ring: #aa3bff;
+    --color-destructive: #ef4444;
+    --color-destructive-foreground: #ffffff;
+    --color-muted: #2e303a;
+    --color-muted-foreground: #9ca3af;
+    --color-success: #22c55e;
+    --color-success-foreground: #ffffff;
+    --color-warning: #f59e0b;
+    --color-warning-foreground: #000000;
+    --font-sans: system-ui, "Segoe UI", Roboto, sans-serif;
+    --font-heading: system-ui, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, Consolas, monospace;
+}
+
+:root {
+    font-family: var(--font-sans);
+    line-height: 145%;
+    letter-spacing: 0.18px;
+    color-scheme: dark;
+    color: var(--color-foreground);
+    background-color: var(--color-background);
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    font-weight: 500;
+    color: var(--color-foreground);
+}
+
+#root {
+    width: 100%;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+* {
+    border-color: var(--color-border);
+}

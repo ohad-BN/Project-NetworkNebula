@@ -1,0 +1,87 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://nebula:nebula123@db:5432/nebula_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=nebula
+      - MINIO_SECRET_KEY=nebula123
+      - MINIO_BUCKET=nebula-renders
+      - MODEL_CACHE_DIR=/models/cache
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./app:/app/app
+
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://nebula:nebula123@db:5432/nebula_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=nebula
+      - MINIO_SECRET_KEY=nebula123
+      - MINIO_BUCKET=nebula-renders
+      - MODEL_CACHE_DIR=/models/cache
+      - CUDA_VISIBLE_DEVICES=0
+    depends_on:
+      - db
+      - redis
+      - minio
+    volumes:
+      - ./app:/app/app
+      - model_cache:/models/cache
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=nebula
+      - POSTGRES_PASSWORD=nebula123
+      - POSTGRES_DB=nebula_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=nebula
+      - MINIO_ROOT_PASSWORD=nebula123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  model_cache:
