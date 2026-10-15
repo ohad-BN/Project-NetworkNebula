@@ -972,3 +972,14 @@ from app.enterprise_training_router import router as enterprise_training_router
 
 app.include_router(enterprise_training_router)
 
+# Include Enterprise API Token Management Router (Phase 3)
+from app.enterprise_token_router import router as enterprise_token_router
+
+app.include_router(enterprise_token_router)
+
+# Include OpenAI API Gateway & Inference Serving Router (Phase 3)
+from app.openai_inference_router import router as openai_inference_router
+
+app.include_router(openai_inference_router)
+
+

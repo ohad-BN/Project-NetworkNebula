@@ -836,6 +836,175 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Job cancellation flow", str(e))
 
+    # =========================================================================
+    # Phase 3 (Enterprise): Model Serving & OpenAI API Gateway
+    # =========================================================================
+    print_header("Phase 3 (Enterprise): Model Serving & OpenAI API Gateway")
+
+    # E3.1 Scoped Bearer API Token Provisioning
+    bearer_token = None
+    token_id = None
+    auth_headers = {}
+    try:
+        t_resp = requests.post(
+            f"{BASE_URL}/api/v1/tokens",
+            json={
+                "name": f"Enterprise-Gateway-Key-{uuid.uuid4().hex[:6]}",
+                "scopes": "training,inference",
+                "rate_limit_rpm": 200
+            }
+        )
+        t_ok = t_resp.status_code == 201 and "token" in t_resp.json()
+        if t_ok:
+            t_data = t_resp.json()
+            bearer_token = t_data["token"]
+            token_id = t_data["id"]
+            auth_headers = {"Authorization": f"Bearer {bearer_token}"}
+            suite.record(True, f"Scoped Bearer API token provisioned ({t_data['token_prefix']}, scopes: {t_data['scopes']})")
+        else:
+            suite.record(False, "Scoped Bearer token provisioning", f"Status {t_resp.status_code}: {t_resp.text}")
+    except Exception as e:
+        suite.record(False, "Scoped Bearer token provisioning", str(e))
+
+    # E3.2 Dedicated Model Endpoint Deployment
+    endpoint_id = None
+    ep_name = f"llama3-finetuned-{uuid.uuid4().hex[:6]}"
+    try:
+        ep_payload = {
+            "name": ep_name,
+            "model_id": "meta-llama/Llama-3-8B",
+            "adapter_url": "http://localhost:9000/nebula-checkpoints/demo/epoch_2/adapter_model.safetensors",
+            "min_replicas": 1,
+            "max_replicas": 4
+        }
+        ep_resp = requests.post(f"{BASE_URL}/api/v1/inference/endpoints", headers=auth_headers, json=ep_payload)
+        ep_ok = ep_resp.status_code == 201 and "id" in ep_resp.json()
+        if ep_ok:
+            ep_data = ep_resp.json()
+            endpoint_id = ep_data["id"]
+            suite.record(True, f"Dedicated inference endpoint deployed ({ep_data['name']} -> {ep_data['model_id']}, status: {ep_data['status']})")
+        else:
+            suite.record(False, "Dedicated inference endpoint deployment", f"Status {ep_resp.status_code}: {ep_resp.text}")
+    except Exception as e:
+        suite.record(False, "Dedicated inference endpoint deployment", str(e))
+
+    # E3.3 OpenAI /v1/models Compatibility Registry
+    try:
+        models_resp = requests.get(f"{BASE_URL}/v1/models", headers=auth_headers)
+        m_ok = models_resp.status_code == 200 and "data" in models_resp.json()
+        if m_ok:
+            model_items = models_resp.json()["data"]
+            model_ids = [m["id"] for m in model_items]
+            has_base = any("Llama-3" in m_id for m_id in model_ids)
+            has_ep = ep_name in model_ids
+            suite.record(has_base and has_ep, f"OpenAI /v1/models registry verified ({len(model_items)} models active)")
+        else:
+            suite.record(False, "OpenAI /v1/models registry", f"Status {models_resp.status_code}")
+    except Exception as e:
+        suite.record(False, "OpenAI /v1/models registry", str(e))
+
+    # E3.4 OpenAI /v1/chat/completions (Standard Non-Streaming)
+    try:
+        chat_req = {
+            "model": ep_name,
+            "messages": [
+                {"role": "system", "content": "You are a professional Enterprise AI assistant."},
+                {"role": "user", "content": "Explain Project NetworkNebula decentralized compute architecture in one sentence."}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 128,
+            "stream": False
+        }
+        chat_resp = requests.post(f"{BASE_URL}/v1/chat/completions", headers=auth_headers, json=chat_req)
+        c_ok = chat_resp.status_code == 200 and "choices" in chat_resp.json()
+        if c_ok:
+            res_data = chat_resp.json()
+            choice = res_data["choices"][0]
+            content = choice["message"]["content"]
+            usage = res_data.get("usage", {})
+            has_content = len(content.strip()) > 0
+            has_usage = usage.get("total_tokens", 0) > 0
+            suite.record(has_content and has_usage, 
+                         f"OpenAI /v1/chat/completions verified ({usage.get('total_tokens')} tokens, {content[:45]}...)")
+        else:
+            suite.record(False, "OpenAI /v1/chat/completions", f"Status {chat_resp.status_code}: {chat_resp.text}")
+    except Exception as e:
+        suite.record(False, "OpenAI /v1/chat/completions", str(e))
+
+    # E3.5 OpenAI /v1/chat/completions (Server-Sent Events SSE Streaming)
+    try:
+        stream_req = {
+            "model": "meta-llama/Llama-3-8B",
+            "messages": [
+                {"role": "user", "content": "Count from 1 to 5."}
+            ],
+            "stream": True
+        }
+        stream_resp = requests.post(f"{BASE_URL}/v1/chat/completions", headers=auth_headers, json=stream_req, stream=True)
+        s_ok = stream_resp.status_code == 200
+        if s_ok:
+            chunks = []
+            for line in stream_resp.iter_lines():
+                if line:
+                    decoded = line.decode("utf-8")
+                    if decoded.startswith("data: "):
+                        chunks.append(decoded)
+            has_chunks = len(chunks) >= 2
+            ends_with_done = chunks[-1] == "data: [DONE]" if chunks else False
+            suite.record(has_chunks and ends_with_done, 
+                         f"OpenAI SSE streaming verified ({len(chunks)} chunks, terminated with [DONE])")
+        else:
+            suite.record(False, "OpenAI SSE streaming", f"Status {stream_resp.status_code}")
+    except Exception as e:
+        suite.record(False, "OpenAI SSE streaming", str(e))
+
+    # E3.6 Endpoint Serving Telemetry Tracking
+    try:
+        if not endpoint_id:
+            suite.record(False, "Endpoint telemetry tracking", "No endpoint_id")
+        else:
+            ep_get = requests.get(f"{BASE_URL}/api/v1/inference/endpoints/{endpoint_id}", headers=auth_headers)
+            if ep_get.status_code == 200:
+                ep_stat = ep_get.json()
+                req_counted = ep_stat["total_requests"] >= 1
+                has_lat = ep_stat["avg_latency_ms"] >= 0.0
+                suite.record(req_counted and has_lat, 
+                             f"Endpoint telemetry verified ({ep_stat['total_requests']} requests served, avg latency: {ep_stat['avg_latency_ms']}ms)")
+            else:
+                suite.record(False, "Endpoint telemetry tracking", f"Status {ep_get.status_code}")
+    except Exception as e:
+        suite.record(False, "Endpoint telemetry tracking", str(e))
+
+    # E3.7 Token Revocation & Security Enforcement
+    try:
+        if not token_id:
+            suite.record(False, "Token revocation security", "No token_id")
+        else:
+            del_resp = requests.delete(f"{BASE_URL}/api/v1/tokens/{token_id}", headers=auth_headers)
+            revoked_ok = del_resp.status_code == 200 and del_resp.json().get("status") == "revoked"
+
+            # Verify that calling /v1/models with revoked token fails with 401
+            probe_resp = requests.get(f"{BASE_URL}/v1/models", headers={"Authorization": f"Bearer {bearer_token}"})
+            unauth_enforced = probe_resp.status_code == 401
+            suite.record(revoked_ok and unauth_enforced, 
+                         f"Token revocation & 401 enforcement confirmed (token_id: {token_id[:12]}...)")
+    except Exception as e:
+        suite.record(False, "Token revocation security", str(e))
+
+    # E3.8 Endpoint Undeployment Lifecycle
+    try:
+        if not endpoint_id:
+            suite.record(False, "Endpoint undeployment", "No endpoint_id")
+        else:
+            del_ep = requests.delete(f"{BASE_URL}/api/v1/inference/endpoints/{endpoint_id}")
+            del_ok = del_ep.status_code == 200 and del_ep.json().get("status") == "deleted"
+            chk_ep = requests.get(f"{BASE_URL}/api/v1/inference/endpoints/{endpoint_id}")
+            not_found_enforced = chk_ep.status_code == 404
+            suite.record(del_ok and not_found_enforced, 
+                         f"Endpoint undeployment & cleanup confirmed (endpoint_id: {endpoint_id[:12]}...)")
+    except Exception as e:
+        suite.record(False, "Endpoint undeployment", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
