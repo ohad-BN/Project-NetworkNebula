@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 1: Phase 1.1 Complete (CUDA Acceleration & PEFT Stack Active)  
+> **Project Phase:** Alpha Milestone 1: Phase 1.2 Complete (Foundation Model Cache & Catalog Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**86/86 Passed — 100%**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**89/89 Passed — 100%**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -17,7 +17,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | Celery + Redis (6379) | Host workers processing training jobs and inference calls |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **86/86 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **89/89 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -85,10 +85,12 @@
 - [x] Verified PyTorch detects NVIDIA GeForce RTX 4070 Laptop GPU (`torch.cuda.is_available() == True`, 8.0 GB VRAM)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.1 hardware tensor & PEFT assertions (**86/86 passed — 100%**)
 
-### 📋 Phase 1.2: Foundation Model Integration & Local Weight Cache
-- [ ] Select un-gated open foundation model (`Qwen/Qwen2.5-1.5B-Instruct` or `SmolLM2-1.7B-Instruct`)
-- [ ] Implement local model cache manager with automatic weights downloading & FP16 loading
-- [ ] Support optional user-provided HuggingFace models if `HF_TOKEN` is present
+### ✅ Phase 1.2: Foundation Model Integration & Local Weight Cache (COMPLETED)
+- [x] Selected high-efficiency un-gated open foundation model (`Qwen/Qwen2.5-0.5B-Instruct`, Apache 2.0, 942 MB FP16 VRAM)
+- [x] Built `app/model_cache.py` singleton manager (`ModelCacheManager`) handling local weight caching, FP16 GPU binding, VRAM usage tracking, and safe garbage collection
+- [x] Supported model catalog with verified specs (`Qwen2.5-0.5B`, `Qwen2.5-1.5B`, `SmolLM2-1.7B`, `Llama-3.2-1B`, `Llama-3-8B`)
+- [x] Implemented `/api/v1/models/catalog` and `/api/v1/models/cache/status` in `app/openai_inference_router.py`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.2 assertions (M1.4 catalog specs, M1.5 GPU telemetry, M1.6 local weight cache) (**89/89 passed — 100%**)
 
 ### 📋 Phase 1.3: Real Neural Inference Engine & Live Token Streaming
 - [ ] Build `app/inference_engine.py` singleton wrapping `AutoModelForCausalLM` and `AutoTokenizer`

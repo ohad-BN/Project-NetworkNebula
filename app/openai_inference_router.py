@@ -20,11 +20,30 @@ from app.database import get_db
 from app.models import InferenceEndpoint, User, TrainingJob
 from app.auth import verify_enterprise_auth
 from app.worker import serve_inference_request
+from app.model_cache import model_cache
 
 router = APIRouter(tags=["OpenAI API Gateway & Serving"])
 
 # Foundation models supported out-of-the-box on the decentralized GPU network
 DEFAULT_MODELS = [
+    {
+        "id": "Qwen/Qwen2.5-0.5B-Instruct",
+        "object": "model",
+        "created": 1726000000,
+        "owned_by": "nebula-cluster",
+        "permission": [],
+        "root": "Qwen/Qwen2.5-0.5B-Instruct",
+        "parent": None,
+    },
+    {
+        "id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "object": "model",
+        "created": 1726000000,
+        "owned_by": "nebula-cluster",
+        "permission": [],
+        "root": "Qwen/Qwen2.5-1.5B-Instruct",
+        "parent": None,
+    },
     {
         "id": "meta-llama/Llama-3-8B",
         "object": "model",
@@ -139,6 +158,30 @@ def list_models(
         })
 
     return {"object": "list", "data": models_list}
+
+
+@router.get("/api/v1/models/catalog")
+@router.get("/v1/models/catalog")
+def get_model_catalog(
+    current_user: User = Depends(verify_enterprise_auth),
+):
+    """
+    Retrieve catalog of verified foundation models with hardware specifications,
+    parameter counts, VRAM allocations, and local caching status.
+    """
+    return {"object": "list", "data": model_cache.get_catalog()}
+
+
+@router.get("/api/v1/models/cache/status")
+@router.get("/v1/models/cache/status")
+def get_model_cache_status(
+    current_user: User = Depends(verify_enterprise_auth),
+):
+    """
+    Retrieve live hardware specifications, active model bindings,
+    and allocated CUDA VRAM memory usage.
+    """
+    return model_cache.get_status()
 
 
 @router.post("/v1/chat/completions")

@@ -1374,6 +1374,52 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Hugging Face PEFT readiness", str(e))
 
+    # =========================================================================
+    # Phase 1.2 (Alpha): Foundation Model Integration & Local Weight Cache
+    # =========================================================================
+    print_header("Phase 1.2 (Alpha): Foundation Model Integration & Local Weight Cache")
+
+    # M1.4 Foundation Model Catalog Telemetry & Specs
+    try:
+        catalog_res = requests.get(f"{BASE_URL}/api/v1/models/catalog")
+        if catalog_res.status_code == 200:
+            catalog_data = catalog_res.json().get("data", [])
+            model_ids = [m.get("model_id") for m in catalog_data]
+            has_qwen = "Qwen/Qwen2.5-0.5B-Instruct" in model_ids
+            has_specs = any(m.get("vram_fp16_mb") and m.get("parameters") for m in catalog_data)
+            suite.record(has_qwen and has_specs and len(catalog_data) >= 4, f"Foundation model catalog verified ({len(catalog_data)} models, Qwen2.5-0.5B listed)")
+        else:
+            suite.record(False, "Foundation model catalog telemetry", f"Status {catalog_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Foundation model catalog telemetry", str(e))
+
+    # M1.5 Live GPU Hardware Memory & Cache Telemetry
+    try:
+        status_res = requests.get(f"{BASE_URL}/api/v1/models/cache/status")
+        if status_res.status_code == 200:
+            st = status_res.json()
+            is_cuda = st.get("cuda_available") is True
+            gpu_name = st.get("device_name", "")
+            has_device = st.get("device") in ["cuda", "cpu"]
+            suite.record(is_cuda and ("RTX" in gpu_name or "GeForce" in gpu_name or len(gpu_name) > 0), f"Model cache GPU hardware telemetry verified ({gpu_name}, device: {st.get('device')})")
+        else:
+            suite.record(False, "Model cache hardware telemetry", f"Status {status_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Model cache hardware telemetry", str(e))
+
+    # M1.6 Local Foundation Model Weight & Tokenizer Cache Verification
+    try:
+        from app.model_cache import model_cache, DEFAULT_FOUNDATION_MODEL
+        is_cached = model_cache.is_cached_locally(DEFAULT_FOUNDATION_MODEL)
+        tok = model_cache.tokenizer
+        if tok is None:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(DEFAULT_FOUNDATION_MODEL)
+        has_vocab = hasattr(tok, "vocab_size") and tok.vocab_size > 10000
+        suite.record(is_cached and has_vocab, f"Local weight cache verified ({DEFAULT_FOUNDATION_MODEL}, vocab: {tok.vocab_size:,})")
+    except Exception as e:
+        suite.record(False, "Local foundation model cache verification", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
