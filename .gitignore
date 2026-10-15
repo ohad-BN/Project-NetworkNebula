@@ -59,6 +59,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # AI weights, model checkpoints, and datasets
+data/
 models/cache/
 *.safetensors
 *.pt

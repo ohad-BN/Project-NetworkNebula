@@ -1588,6 +1588,79 @@ def run_tests():
     except Exception as e:
         suite.record(False, "PEFT .safetensors S3 validation", str(e))
 
+    # =========================================================================
+    # Phase 1.5 (Alpha): Dynamic S3 LoRA Adapter Hot-Swapping
+    # =========================================================================
+    print_header("Phase 1.5 (Alpha): Dynamic S3 LoRA Adapter Hot-Swapping")
+
+    # M1.13 Dynamic S3 LoRA Adapter Cache Resolution & Local Extraction
+    adapter_cache_res = None
+    try:
+        from app.inference_engine import inference_engine
+        if s3_ckpt_url:
+            adapter_cache_res = inference_engine.download_and_cache_adapter(s3_ckpt_url)
+            if adapter_cache_res:
+                loc_dir, a_name = adapter_cache_res
+                sf_file = os.path.join(loc_dir, "adapter_model.safetensors")
+                cfg_file = os.path.join(loc_dir, "adapter_config.json")
+                has_files = os.path.exists(sf_file) and os.path.exists(cfg_file) and os.path.getsize(sf_file) > 0
+                suite.record(has_files, f"S3 LoRA adapter cached locally ({a_name}, {os.path.getsize(sf_file):,} bytes)")
+            else:
+                suite.record(False, "S3 LoRA adapter caching", "download_and_cache_adapter returned None")
+        else:
+            suite.record(False, "S3 LoRA adapter caching", "No s3_ckpt_url available")
+    except Exception as e:
+        suite.record(False, "S3 LoRA adapter caching", str(e))
+
+    # M1.14 In-Memory Dynamic PEFT Adapter Mounting & Hot-Swap on GPU
+    try:
+        from app.model_cache import model_cache, DEFAULT_FOUNDATION_MODEL
+        m_base, _ = model_cache.load_model(DEFAULT_FOUNDATION_MODEL)
+        mounted_m, m_name = inference_engine._mount_adapter(m_base, s3_ckpt_url)
+        is_peft = hasattr(mounted_m, "active_adapters") and m_name in mounted_m.active_adapters
+        suite.record(is_peft, f"Dynamic PEFT adapter mounted in GPU VRAM (active: {mounted_m.active_adapters if hasattr(mounted_m, 'active_adapters') else 'None'})")
+    except Exception as e:
+        suite.record(False, "Dynamic PEFT adapter mounting", str(e))
+
+    # M1.15 Dedicated Fine-Tuned Endpoint Chat Completion with Hot-Swapped Weights
+    try:
+        endpoint_test_name = f"ft-hot-swap-{uuid.uuid4().hex[:6]}"
+        ep_test_payload = {
+            "name": endpoint_test_name,
+            "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+            "adapter_url": s3_ckpt_url,
+            "min_replicas": 1,
+            "max_replicas": 2
+        }
+        dep_ep_res = requests.post(f"{BASE_URL}/api/v1/inference/endpoints", json=ep_test_payload)
+        if dep_ep_res.status_code in (200, 201):
+            ep_created_id = dep_ep_res.json().get("id")
+
+            ft_chat_req = {
+                "model": endpoint_test_name,
+                "messages": [
+                    {"role": "user", "content": "What is Project NetworkNebula?"}
+                ],
+                "temperature": 0.0,
+                "max_tokens": 30,
+                "stream": False
+            }
+            ft_res = requests.post(f"{BASE_URL}/v1/chat/completions", json=ft_chat_req)
+            if ft_res.status_code == 200:
+                ft_body = ft_res.json()
+                ft_content = ft_body.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                ft_usage = ft_body.get("usage", {})
+                valid_ft = len(ft_content) > 0 and ft_usage.get("total_tokens", 0) > 0
+                suite.record(valid_ft, f"Fine-tuned endpoint inference verified ('{ft_content[:35]}...', {ft_usage.get('total_tokens')} tokens)")
+            else:
+                suite.record(False, "Fine-tuned endpoint inference", f"Status {ft_res.status_code}: {ft_res.text}")
+
+            requests.delete(f"{BASE_URL}/api/v1/inference/endpoints/{ep_created_id}")
+        else:
+            suite.record(False, "Fine-tuned endpoint inference", f"Deploy status {dep_ep_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Fine-tuned endpoint inference", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

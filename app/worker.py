@@ -758,12 +758,13 @@ def serve_inference_request(
     messages: list,
     temperature: float = 0.7,
     max_tokens: int = 512,
-    endpoint_id: str = None
+    endpoint_id: str = None,
+    adapter_url: str = None
 ):
     """
     Execute enterprise model inference on decentralized GPU worker.
     Processes messages prompt, executes LLM generation, computes token telemetry,
-    and updates endpoint serving metrics.
+    supports dynamic PEFT adapter hot-swapping from S3, and updates endpoint serving metrics.
     """
     from datetime import datetime
     import time
@@ -771,11 +772,26 @@ def serve_inference_request(
     from app.models import InferenceEndpoint
 
     start_time = time.time()
+    resolved_adapter_url = adapter_url
+
+    # Lookup adapter_url from endpoint if not passed directly
+    if endpoint_id and not resolved_adapter_url:
+        db_ep = SessionLocal()
+        try:
+            ep_obj = db_ep.query(InferenceEndpoint).filter(InferenceEndpoint.id == endpoint_id).first()
+            if ep_obj and ep_obj.adapter_url:
+                resolved_adapter_url = ep_obj.adapter_url
+        except Exception:
+            pass
+        finally:
+            db_ep.close()
+
     try:
         from app.inference_engine import inference_engine
         engine_res = inference_engine.generate(
             messages=messages,
             model_id=model,
+            adapter_url=resolved_adapter_url,
             temperature=temperature,
             max_tokens=max_tokens
         )

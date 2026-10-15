@@ -205,6 +205,7 @@ def create_chat_completion(
     ).first()
     endpoint_id = endpoint.id if endpoint else None
     actual_model = endpoint.model_id if endpoint else payload.model
+    adapter_url = endpoint.adapter_url if endpoint else None
 
     # Dispatch inference to worker
     raw_messages = [{"role": m.role, "content": m.content} for m in payload.messages]
@@ -216,7 +217,8 @@ def create_chat_completion(
             messages=raw_messages,
             temperature=payload.temperature or 0.7,
             max_tokens=payload.max_tokens or 512,
-            endpoint_id=endpoint_id
+            endpoint_id=endpoint_id,
+            adapter_url=adapter_url
         )
     except Exception as e:
         print(f"[GATEWAY] Worker inference execution error: {e}")
@@ -248,6 +250,7 @@ def create_chat_completion(
                 for token_chunk in inference_engine.generate_stream(
                     messages=raw_messages,
                     model_id=actual_model,
+                    adapter_url=adapter_url,
                     temperature=payload.temperature or 0.7,
                     max_tokens=payload.max_tokens or 512
                 ):

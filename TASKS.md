@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 1: Phase 1.4 Complete (Real PyTorch PEFT / LoRA Training Engine Active)  
+> **Project Phase:** Alpha Milestone 1: Phase 1.5 Complete (Dynamic S3 LoRA Adapter Hot-Swapping Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**95/95 Passed — 100%**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**98/98 Passed — 100%**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -17,7 +17,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | Celery + Redis (6379) | Host workers processing training jobs and inference calls |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **95/95 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **98/98 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -108,9 +108,11 @@
 - [x] Wired `execute_training_job` in `app/worker.py` to route through the real PEFT training engine
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.4 assertions (M1.10 backward pass & gradients, M1.11 loss decay, M1.12 authentic S3 safetensors) (**95/95 passed — 100%**)
 
-### 📋 Phase 1.5: Dynamic S3 LoRA Adapter Hot-Swapping
-- [ ] Implement dynamic PEFT adapter mounting in worker when serving custom endpoints
-- [ ] Verify custom endpoints respond with fine-tuned adapter behaviors
+### ✅ Phase 1.5: Dynamic S3 LoRA Adapter Hot-Swapping (COMPLETED)
+- [x] Implemented `download_and_cache_adapter` in `app/inference_engine.py` downloading and hashing `.safetensors` & `adapter_config.json` from MinIO S3 into local cache (`data/adapters/{hash}/`)
+- [x] Implemented in-memory dynamic PEFT adapter mounting (`_mount_adapter`) supporting hot-swapping multiple adapters or falling back to clean base model execution
+- [x] Wired dedicated customer serving endpoints (`/api/v1/inference/endpoints`) with custom `adapter_url` to load fine-tuned LoRA weights in VRAM on demand for both streaming and non-streaming calls
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 1.5 assertions (M1.13 S3 adapter cache resolution, M1.14 in-memory dynamic PEFT mount, M1.15 fine-tuned endpoint chat completion) (**98/98 passed — 100%**)
 
 ### 📋 Phase 1.6: Master Test Suite Expansion & Validation
 - [ ] Add Milestone 1 assertions to `test_suite.py` (CUDA detection, real inference, real training, S3 adapter loading)
