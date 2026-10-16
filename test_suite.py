@@ -2440,6 +2440,119 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Ring All-Reduce tensor bucket aggregation & S3 safetensors", str(e))
 
+    # =========================================================================
+    # Phase 3.2 (Alpha Milestone 3): Intelligent Capacity-Aware Job Scheduler & Dynamic Task Dispatcher
+    # =========================================================================
+    print_header("Phase 3.2 (Alpha Milestone 3): Capacity-Aware Job Scheduler & Automatic Failover")
+
+    high_cap_node_id = f"sched-h100-node-{uuid.uuid4().hex[:6]}"
+    low_cap_node_id = f"sched-lowvram-node-{uuid.uuid4().hex[:6]}"
+
+    # M3.3 Capacity-Aware Node Matching & VRAM Contribution Ceiling Enforcement
+    try:
+        # 1. Register a constrained node (8GB * 20% = 1.6GB allocated ceiling)
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": low_cap_node_id,
+                "name": "Constrained-20Pct-Worker",
+                "gpu_info": "NVIDIA RTX 4060",
+                "gpu_memory_gb": 8.0,
+                "vram_used_gb": 1.0,
+                "vram_allocation_pct": 20,
+                "gpu_utilization_pct": 65.0,
+                "hourly_rate_usd": 0.40,
+            },
+            timeout=5,
+        )
+        # 2. Register a high-capacity H100 node (80GB * 90% = 72.0GB allocated ceiling)
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": high_cap_node_id,
+                "name": "High-Headroom-H100-80GB-Worker",
+                "gpu_info": "NVIDIA H100 80GB HBM3",
+                "gpu_memory_gb": 80.0,
+                "vram_used_gb": 2.0,
+                "vram_allocation_pct": 90,
+                "gpu_utilization_pct": 5.0,
+                "hourly_rate_usd": 0.30,
+            },
+            timeout=5,
+        )
+
+        # 3. Simulate dispatch requiring 64.0 GB VRAM (exceeds 8GB-24GB nodes & 20% constrained node, fits 80GB*90% = 72.0GB H100 node)
+        sim_resp = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/simulate-dispatch",
+            json={
+                "required_vram_gb": 64.0,
+                "num_gpus": 1,
+                "task_type": "training",
+            },
+            timeout=5,
+        )
+        sim_data = sim_resp.json() if sim_resp.status_code == 200 else {}
+        selected_ids = sim_data.get("selected_worker_ids", [])
+        disqualified_ids = [d.get("worker_id") for d in sim_data.get("disqualified_nodes", [])]
+        top_cand = sim_data.get("top_candidate") or {}
+
+        m3_3_ok = (
+            sim_resp.status_code == 200
+            and high_cap_node_id in selected_ids
+            and low_cap_node_id in disqualified_ids
+            and top_cand.get("worker_id") == high_cap_node_id
+            and float(top_cand.get("score", 0.0)) > 50.0
+        )
+        suite.record(
+            m3_3_ok,
+            f"Capacity-aware node matching verified (selected: {high_cap_node_id[:18]} [score={top_cand.get('score')}], disqualified low-VRAM ceiling node: {low_cap_node_id[:18]})"
+        )
+    except Exception as e:
+        suite.record(False, "Capacity-aware node matching & VRAM ceiling enforcement", str(e))
+
+    # M3.4 Fault-Tolerant Mid-Task Failover Re-Routing & Standby Promotion
+    try:
+        failover_task_id = dist_job_id or f"failover-job-{uuid.uuid4().hex[:6]}"
+        fo_resp = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/failover",
+            json={
+                "task_id": failover_task_id,
+                "failed_worker_id": high_cap_node_id,
+                "required_vram_gb": 2.0,
+                "task_type": "training",
+                "reason": "worker_heartbeat_timeout",
+            },
+            timeout=5,
+        )
+        fo_data = fo_resp.json() if fo_resp.status_code == 200 else {}
+        replacement_id = fo_data.get("replacement_worker_id")
+
+        # Verify scheduler status reflects failover telemetry
+        sched_stat_resp = requests.get(f"{BASE_URL}/api/v1/cluster/scheduler/status", timeout=5)
+        sched_stat = sched_stat_resp.json() if sched_stat_resp.status_code == 200 else {}
+
+        # Verify failed worker was marked offline
+        failed_node_stat = requests.get(f"{BASE_URL}/api/v1/workers/{high_cap_node_id}/status", timeout=5).json()
+
+        # Clean up temporary test nodes
+        requests.post(f"{BASE_URL}/api/v1/workers/{low_cap_node_id}/deregister", timeout=5)
+        requests.post(f"{BASE_URL}/api/v1/workers/{high_cap_node_id}/deregister", timeout=5)
+
+        m3_4_ok = (
+            fo_resp.status_code == 200
+            and fo_data.get("status") == "rerouted"
+            and bool(replacement_id)
+            and replacement_id != high_cap_node_id
+            and failed_node_stat.get("status") == "offline"
+            and int(sched_stat.get("total_failovers_handled", 0)) >= 1
+        )
+        suite.record(
+            m3_4_ok,
+            f"Fault-tolerant mid-task failover re-routing verified ({high_cap_node_id[:16]} [offline] -> {replacement_id}, failovers handled: {sched_stat.get('total_failovers_handled')})"
+        )
+    except Exception as e:
+        suite.record(False, "Fault-tolerant mid-task failover re-routing", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

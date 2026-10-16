@@ -785,3 +785,99 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
         except Exception:
             pass
 
+
+# ==============================================================================
+# Capacity-Aware Job Scheduler & Automatic Failover Endpoints (Phase 3.2)
+# ==============================================================================
+
+
+class SchedulerSimulateDispatchPayload(BaseModel):
+    required_vram_gb: float = Field(default=2.0, ge=0.5, le=512.0, description="Required GPU VRAM in GB")
+    num_gpus: int = Field(default=1, ge=1, le=64, description="Number of GPU worker nodes required")
+    task_type: str = Field(default="training", description="Workload type: training, inference, batch_inference")
+    exclude_worker_ids: Optional[List[str]] = Field(default=None, description="Worker IDs to exclude")
+    simulate_failover_from_worker_id: Optional[str] = Field(
+        default=None,
+        description="Optional worker ID to simulate mid-task disconnection and failover re-routing",
+    )
+    task_id: Optional[str] = Field(default=None, description="Optional task/job ID for failover binding")
+
+
+class SchedulerFailoverPayload(BaseModel):
+    task_id: str = Field(..., description="Active task or training job ID")
+    failed_worker_id: str = Field(..., description="Worker ID that disconnected or timed out")
+    required_vram_gb: float = Field(default=2.0, ge=0.5, le=512.0)
+    task_type: str = Field(default="training")
+    reason: str = Field(default="worker_heartbeat_timeout")
+
+
+@router.get("/api/v1/cluster/scheduler/status")
+def get_cluster_scheduler_status(
+    db: Session = Depends(get_db),
+):
+    """
+    Return live capacity-aware scheduler status, candidate ranking, dispatch metrics,
+    and automatic failover history.
+    """
+    from app.scheduler import cluster_scheduler
+
+    return cluster_scheduler.get_scheduler_status(db)
+
+
+@router.post("/api/v1/cluster/scheduler/simulate-dispatch")
+def simulate_cluster_scheduler_dispatch(
+    payload: SchedulerSimulateDispatchPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Evaluate all registered worker nodes against `required_vram_gb` and user-configured
+    `vram_allocation_pct` contribution ceilings, returning the optimal node match(es),
+    full candidate score breakdown, disqualified nodes, and optional failover re-routing.
+    """
+    from app.scheduler import cluster_scheduler
+
+    result = cluster_scheduler.select_optimal_workers(
+        db=db,
+        required_vram_gb=payload.required_vram_gb,
+        num_gpus=payload.num_gpus,
+        task_type=payload.task_type,
+        exclude_worker_ids=payload.exclude_worker_ids,
+        record_dispatch=True,
+    )
+
+    if payload.simulate_failover_from_worker_id:
+        target_task_id = payload.task_id or f"sim-task-{uuid.uuid4().hex[:8]}"
+        failover_event = cluster_scheduler.trigger_task_failover(
+            db=db,
+            task_id=target_task_id,
+            failed_worker_id=payload.simulate_failover_from_worker_id,
+            required_vram_gb=payload.required_vram_gb,
+            task_type=payload.task_type,
+            reason="simulated_node_timeout",
+        )
+        result["failover_event"] = failover_event
+
+    return result
+
+
+@router.post("/api/v1/cluster/scheduler/failover")
+def trigger_cluster_scheduler_failover(
+    payload: SchedulerFailoverPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Explicitly trigger mid-task failover re-routing from a disconnected or timed-out
+    worker node to the highest-scoring healthy standby node.
+    """
+    from app.scheduler import cluster_scheduler
+
+    return cluster_scheduler.trigger_task_failover(
+        db=db,
+        task_id=payload.task_id,
+        failed_worker_id=payload.failed_worker_id,
+        required_vram_gb=payload.required_vram_gb,
+        task_type=payload.task_type,
+        reason=payload.reason,
+    )
+
+

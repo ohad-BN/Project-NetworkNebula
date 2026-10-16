@@ -59,29 +59,32 @@ class DistributedTrainingEngine:
             cls._instance = DistributedTrainingEngine()
         return cls._instance
 
-    def resolve_worker_fleet(self, db, num_gpus: int) -> List[str]:
+    def resolve_worker_fleet(self, db, num_gpus: int, required_vram_gb: float = 2.0) -> List[str]:
         """
-        Select `num_gpus` active GPU worker nodes from PostgreSQL.
-        If fewer than `num_gpus` physical workers are currently registered on a single-GPU
+        Select `num_gpus` optimal GPU worker nodes from PostgreSQL using `ClusterScheduler`.
+        If fewer than `num_gpus` eligible physical workers are currently registered on a single-GPU
         development host, automatically provisions peer shard worker records so multi-node
         sharding, Ring All-Reduce, and proportional multi-worker SLA payouts execute seamlessly.
         """
         from app.models import Worker, User
+        from app.scheduler import cluster_scheduler
+
         try:
             from app.cluster_worker_router import sync_primary_local_worker
             sync_primary_local_worker(db)
         except Exception:
             pass
 
-        available_workers = (
-            db.query(Worker)
-            .filter(Worker.status.in_(["online", "active", "idle", "busy"]))
-            .order_by(Worker.created_at.asc())
-            .all()
+        sched_res = cluster_scheduler.select_optimal_workers(
+            db=db,
+            required_vram_gb=required_vram_gb,
+            num_gpus=num_gpus,
+            task_type="training",
+            record_dispatch=True,
         )
-        worker_ids = [w.id for w in available_workers]
+        worker_ids = list(sched_res.get("selected_worker_ids", []))
 
-        # Provision virtual peer shard nodes if cluster has fewer than num_gpus workers
+        # Provision virtual peer shard nodes if cluster has fewer than num_gpus eligible workers
         if len(worker_ids) < num_gpus:
             owner = db.query(User).filter(User.is_worker == True).first() or db.query(User).first()
             owner_id = owner.id if owner else None
@@ -94,20 +97,20 @@ class DistributedTrainingEngine:
                         id=peer_id,
                         user_id=owner_id,
                         name=f"Nebula-Peer-Shard-{idx:02d}",
-                        hostname=f"nebula-shard-{idx:02d}.local",
-                        ip_address=f"10.240.0.{10 + idx}",
-                        gpu_model="NVIDIA GeForce RTX 4070 Laptop GPU (Shard)",
-                        gpu_count=1,
-                        vram_gb=8.0,
-                        vram_total_gb=8.0,
+                        gpu_info="NVIDIA GeForce RTX 4070 Laptop GPU (Shard)",
+                        status="online",
+                        cpu_cores=8,
+                        memory_gb=16.0,
+                        gpu_memory_gb=8.0,
                         vram_used_gb=1.2,
                         vram_allocation_pct=80,
-                        cuda_version="12.1",
-                        compute_capability="8.9",
-                        status="online",
+                        gpu_utilization_pct=15.0,
+                        cuda_version="12.8",
+                        role="Distributed Training Shard",
+                        hourly_rate_usd=0.45,
+                        total_earnings_usd=0.0,
                         is_available=True,
                         total_tasks_completed=0,
-                        total_earnings_usd=0.0,
                     )
                     db.add(peer_worker)
                     db.commit()

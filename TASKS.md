@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 3 — Phase 3.1 Active (Multi-Node Distributed Training & Ring All-Reduce Protocol)  
+> **Project Phase:** Alpha Milestone 3 — Phase 3.2 Active (Capacity-Aware Job Scheduler & Automatic Failover)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**122/122 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**124/124 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -14,10 +14,10 @@
 | **Backend API** | FastAPI Orchestrator | ✅ | `http://localhost:8000` | Orchestration, Auth, Training APIs, and OpenAI Gateway |
 | **OpenAI Gateway**| Compatible Serving API | ✅ | `/v1/chat/completions` | Drop-in inference endpoint for enterprise Python/cURL SDKs |
 | **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/distributed_training_engine.py` | Multi-GPU LoRA/QLoRA fine-tuning, Ring All-Reduce, S3 checkpoints |
-| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI & WebSocket tunnel (`/ws/worker/{id}`) with 10%–100% GPU limit |
+| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI, WebSocket tunnel (`/ws/worker/{id}`) & Capacity Scheduler |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **122/122 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **124/124 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -173,11 +173,11 @@
 - [x] Implemented `GradientAggregator` float32 tensor bucket serialization, mean tensor reduction across worker nodes, and unified `.safetensors` adapter checkpoint export to MinIO S3 (`nebula-checkpoints`)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.1 assertions (`M3.1` multi-node job dispatch, dataset sharding & multi-worker SLA credit, `M3.2` ring all-reduce gradient tensor bucket aggregation & unified S3 safetensors export) (**122/122 passed — 100%**)
 
-### 📋 Phase 3.2: Intelligent Capacity-Aware Job Scheduler & Dynamic Task Dispatcher
-- [ ] Build `app/scheduler.py` (`ClusterScheduler` singleton) scoring candidate worker nodes by VRAM headroom, latency, contribution limit, and SLA tier
-- [ ] Implement automatic worker heartbeat timeout detection and transparent mid-task failover re-routing to healthy standby nodes
-- [ ] Expose `GET /api/v1/cluster/scheduler/status` and `POST /api/v1/cluster/scheduler/simulate-dispatch`
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.2 assertions (`M3.3` capacity-aware node matching, `M3.4` fault-tolerant failover re-routing)
+### ✅ Phase 3.2: Intelligent Capacity-Aware Job Scheduler & Dynamic Task Dispatcher (COMPLETED)
+- [x] Built [`app/scheduler.py`](app/scheduler.py) (`ClusterScheduler` singleton) scoring candidate worker nodes by VRAM headroom, utilization, contribution limit (`vram_allocation_pct`), cost efficiency, and SLA reputation
+- [x] Implemented automatic worker heartbeat timeout detection and transparent mid-task failover re-routing to healthy standby nodes (`trigger_task_failover` & `detect_and_failover_stale_workers`)
+- [x] Exposed `GET /api/v1/cluster/scheduler/status`, `POST /api/v1/cluster/scheduler/simulate-dispatch`, and `POST /api/v1/cluster/scheduler/failover` in [`app/cluster_worker_router.py`](app/cluster_worker_router.py)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.2 assertions (`M3.3` capacity-aware node matching & VRAM ceiling enforcement, `M3.4` fault-tolerant failover re-routing) (**124/124 passed — 100%**)
 
 ### 📋 Phase 3.3: Autonomous CLI Worker Task Execution (`nebula_worker.py --work`)
 - [ ] Extend [`nebula_worker.py`](nebula_worker.py) with `work` subcommand (`python nebula_worker.py work --worker-id <id>`) to pull/receive tasks over WebSocket tunnel
