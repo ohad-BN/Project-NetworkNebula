@@ -135,17 +135,15 @@ def attribute_worker_earnings(
     else:
         resolved_worker_id = target_worker_id
 
-    # 2. Resolve Host User Wallet
-    worker_user = None
-    if worker and worker.user_id:
+    # 2. Resolve Host User Wallet (prioritize canonical User.is_worker == True)
+    worker_user = db.query(User).filter(User.is_worker == True).first()
+    if not worker_user and worker and worker.user_id:
         worker_user = db.query(User).filter(User.id == worker.user_id).first()
-    if not worker_user:
-        worker_user = db.query(User).filter(User.is_worker == True).first()
     if not worker_user:
         worker_user = db.query(User).first()
 
-    # Link worker to user if user was unlinked
-    if worker and worker_user and not worker.user_id:
+    # Keep worker linked to canonical host user
+    if worker and worker_user and worker.user_id != worker_user.id:
         worker.user_id = worker_user.id
 
     trans = None
@@ -682,7 +680,12 @@ def execute_training_job(self, job_id: str):
 
         # Parse hyperparameters & settings
         total_epochs = max(1, job.total_epochs or 3)
+        num_gpus = max(1, int(job.num_gpus or 1))
         fast_mode = os.getenv("FAST_POC_MODE", "true").lower() in ("true", "1", "yes")
+        try:
+            hyperparams = json.loads(job.hyperparameters) if job.hyperparameters else {}
+        except Exception:
+            hyperparams = {}
 
         storage = get_storage()
         storage.ensure_all_enterprise_buckets_exist()
@@ -690,8 +693,12 @@ def execute_training_job(self, job_id: str):
         loss_history = []
         checkpoints_list = []
         final_adapter_url = None
+        participating_workers = ["node-gpu-local-01"]
 
-        print(f"[WORKER] Training config: base_model={job.base_model}, epochs={total_epochs}, fast_mode={fast_mode}")
+        print(
+            f"[WORKER] Training config: base_model={job.base_model}, epochs={total_epochs}, "
+            f"num_gpus={num_gpus}, parallelism={job.parallelism}, fast_mode={fast_mode}"
+        )
 
         def is_cancelled() -> bool:
             try:
@@ -703,7 +710,14 @@ def execute_training_job(self, job_id: str):
             except Exception:
                 return False
 
-        def on_epoch(epoch: int, avg_loss: float, val_loss: float, ckpt_url: str, ckpt_size: int):
+        def on_epoch(
+            epoch: int,
+            avg_loss: float,
+            val_loss: float,
+            ckpt_url: str,
+            ckpt_size: int,
+            extra_step_meta: dict = None,
+        ):
             db.refresh(job)
             step_data = {
                 "epoch": epoch,
@@ -712,6 +726,10 @@ def execute_training_job(self, job_id: str):
                 "val_loss": val_loss,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
+            if extra_step_meta:
+                for k in ("worker_losses", "allreduce_buckets", "allreduce_bytes", "synchronization_time_ms"):
+                    if k in extra_step_meta:
+                        step_data[k] = extra_step_meta[k]
             loss_history.append(step_data)
 
             ckpt_meta = {
@@ -720,6 +738,9 @@ def execute_training_job(self, job_id: str):
                 "size_bytes": ckpt_size,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
+            if extra_step_meta and "allreduce_buckets" in extra_step_meta:
+                ckpt_meta["allreduce_buckets"] = extra_step_meta["allreduce_buckets"]
+                ckpt_meta["allreduce_bytes"] = extra_step_meta.get("allreduce_bytes", 0)
             checkpoints_list.append(ckpt_meta)
 
             job.current_epoch = epoch
@@ -729,18 +750,45 @@ def execute_training_job(self, job_id: str):
             db.commit()
 
         try:
-            from app.training_engine import training_engine
-            train_res = training_engine.train_job(
-                job_id=job_id,
-                base_model_id=job.base_model,
-                dataset_s3_url=job.dataset_s3_url,
-                total_epochs=total_epochs,
-                check_cancelled_fn=is_cancelled,
-                on_epoch_complete=on_epoch
-            )
-            if train_res.get("status") == "cancelled":
-                return {"status": "cancelled", "job_id": job_id}
-            final_adapter_url = train_res.get("final_adapter_url")
+            if num_gpus >= 2 or hyperparams.get("distributed_mode"):
+                from app.distributed_training_engine import distributed_training_engine
+                target_workers = hyperparams.get("worker_ids") or distributed_training_engine.resolve_worker_fleet(
+                    db, num_gpus=max(2, num_gpus)
+                )
+                participating_workers = list(target_workers)
+                train_res = distributed_training_engine.train_distributed_job(
+                    job_id=job_id,
+                    base_model_id=job.base_model,
+                    worker_ids=participating_workers,
+                    dataset_s3_url=job.dataset_s3_url,
+                    total_epochs=total_epochs,
+                    lr=float(hyperparams.get("learning_rate", 1e-4)),
+                    lora_r=int(hyperparams.get("lora_r", 16)),
+                    lora_alpha=int(hyperparams.get("lora_alpha", 32)),
+                    parallelism=job.parallelism or "data_parallel",
+                    check_cancelled_fn=is_cancelled,
+                    on_epoch_complete=on_epoch,
+                )
+                if train_res.get("status") == "cancelled":
+                    return {"status": "cancelled", "job_id": job_id}
+                final_adapter_url = train_res.get("final_adapter_url")
+                if "shard_telemetry" in train_res:
+                    hyperparams["distributed_telemetry"] = train_res["shard_telemetry"]
+                    job.hyperparameters = json.dumps(hyperparams)
+                    db.commit()
+            else:
+                from app.training_engine import training_engine
+                train_res = training_engine.train_job(
+                    job_id=job_id,
+                    base_model_id=job.base_model,
+                    dataset_s3_url=job.dataset_s3_url,
+                    total_epochs=total_epochs,
+                    check_cancelled_fn=is_cancelled,
+                    on_epoch_complete=on_epoch
+                )
+                if train_res.get("status") == "cancelled":
+                    return {"status": "cancelled", "job_id": job_id}
+                final_adapter_url = train_res.get("final_adapter_url")
         except Exception as e:
             print(f"[WORKER] Real training engine fallback triggered: {e}")
             for epoch in range(1, total_epochs + 1):
@@ -819,20 +867,25 @@ def execute_training_job(self, job_id: str):
         # Mark job complete
         job.status = "completed"
         job.final_adapter_url = final_adapter_url
-        job.cost = round(total_epochs * 0.125, 4)
+        job.cost = round(total_epochs * 0.125 * max(1, len(participating_workers)), 4)
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
 
-        # Phase 2.4: SLA Accounting & Automated Worker Earnings (70% share)
+        # Phase 2.4 & Phase 3.1: Proportional SLA Accounting & Automated Worker Earnings (70% share)
         try:
-            earning_res = attribute_worker_earnings(
-                db=db,
-                task_id=job_id,
-                gross_cost=job.cost,
-                description=f"Host 70% share for enterprise LoRA training job {job_id[:8]} ({total_epochs} epochs)",
-                worker_id="node-gpu-local-01",
-            )
-            print(f"[WORKER] Credited training job earnings: {earning_res}")
+            per_worker_gross = round(job.cost / max(1, len(participating_workers)), 4)
+            for wid in participating_workers:
+                earning_res = attribute_worker_earnings(
+                    db=db,
+                    task_id=job_id,
+                    gross_cost=per_worker_gross,
+                    description=(
+                        f"Host 70% share for LoRA training job {job_id[:8]} "
+                        f"({total_epochs} epochs, shard worker {wid})"
+                    ),
+                    worker_id=wid,
+                )
+                print(f"[WORKER] Credited training job earnings to {wid}: {earning_res}")
         except Exception as earn_err:
             print(f"[WORKER] Error recording training job earnings: {earn_err}")
 
@@ -841,6 +894,8 @@ def execute_training_job(self, job_id: str):
             "status": "completed",
             "job_id": job_id,
             "total_epochs": total_epochs,
+            "num_workers": len(participating_workers),
+            "worker_ids": participating_workers,
             "final_loss": loss_history[-1]["loss"] if loss_history else 0.0,
             "final_adapter_url": final_adapter_url,
             "checkpoints_count": len(checkpoints_list)

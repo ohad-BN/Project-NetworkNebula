@@ -2307,6 +2307,139 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Alpha Milestone 2 Master System Integrity Signoff", str(e))
 
+    # =========================================================================
+    # Phase 3.1 (Alpha Milestone 3): Multi-Node Distributed Training Orchestrator & Ring All-Reduce Protocol
+    # =========================================================================
+    print_header("Phase 3.1 (Alpha Milestone 3): Multi-Node Distributed Training & Ring All-Reduce")
+
+    dist_job_id = None
+    dist_final_ckpt_url = None
+    # M3.1 Multi-Node Distributed Training Job Dispatch, Dataset Batch Sharding & Proportional Worker SLA Credit
+    try:
+        peer_shard_id = "node-gpu-shard-02"
+        # Register or ensure second worker node is online
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": peer_shard_id,
+                "name": "Nebula-Peer-Shard-02",
+                "gpu_info": "NVIDIA GeForce RTX 4070 Laptop GPU (Shard)",
+                "vram_allocation_pct": 80,
+                "role": "Distributed Training Shard",
+                "hourly_rate_usd": 0.45,
+            },
+            timeout=5,
+        )
+
+        # Capture pre-job tasks completed for both workers
+        w1_pre = requests.get(f"{BASE_URL}/api/v1/workers/node-gpu-local-01/status", timeout=5).json()
+        w2_pre = requests.get(f"{BASE_URL}/api/v1/workers/{peer_shard_id}/status", timeout=5).json()
+        w1_tasks_before = int(w1_pre.get("total_tasks_completed", 0))
+        w2_tasks_before = int(w2_pre.get("total_tasks_completed", 0))
+
+        # Submit multi-node distributed training job (num_gpus=2)
+        dist_resp = requests.post(
+            f"{BASE_URL}/api/v1/training/distributed/jobs",
+            json={
+                "name": "Qwen2.5-MultiNode-RingAllReduce",
+                "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "train_type": "lora",
+                "parallelism": "data_parallel",
+                "num_gpus": 2,
+                "worker_ids": ["node-gpu-local-01", peer_shard_id],
+                "total_epochs": 2,
+                "sync_execution": True,
+            },
+            timeout=120,
+        )
+        dist_data = dist_resp.json() if dist_resp.status_code == 201 else {}
+        dist_job_id = dist_data.get("id")
+        dist_final_ckpt_url = dist_data.get("final_adapter_url")
+
+        # Poll if still running
+        for _ in range(30):
+            if dist_data.get("status") in ("completed", "failed"):
+                break
+            time.sleep(1.0)
+            poll_r = requests.get(f"{BASE_URL}/api/v1/training/jobs/{dist_job_id}", timeout=5)
+            if poll_r.status_code == 200:
+                dist_data = poll_r.json()
+                dist_final_ckpt_url = dist_data.get("final_adapter_url")
+
+        # Verify shard telemetry endpoint
+        shard_resp = requests.get(
+            f"{BASE_URL}/api/v1/training/distributed/jobs/{dist_job_id}/shards",
+            timeout=10,
+        )
+        shard_info = shard_resp.json() if shard_resp.status_code == 200 else {}
+        shards_map = shard_info.get("shards", {})
+
+        # Verify post-job tasks completed incremented for BOTH workers
+        w1_post = requests.get(f"{BASE_URL}/api/v1/workers/node-gpu-local-01/status", timeout=5).json()
+        w2_post = requests.get(f"{BASE_URL}/api/v1/workers/{peer_shard_id}/status", timeout=5).json()
+        w1_tasks_after = int(w1_post.get("total_tasks_completed", 0))
+        w2_tasks_after = int(w2_post.get("total_tasks_completed", 0))
+
+        m3_1_ok = (
+            dist_resp.status_code == 201
+            and dist_data.get("status") == "completed"
+            and dist_data.get("num_gpus") == 2
+            and len(shards_map) == 2
+            and "node-gpu-local-01" in shards_map
+            and peer_shard_id in shards_map
+            and w1_tasks_after > w1_tasks_before
+            and w2_tasks_after > w2_tasks_before
+        )
+        suite.record(
+            m3_1_ok,
+            f"Multi-node distributed training job & batch sharding verified (job: {str(dist_job_id)[:8]}..., workers: {list(shards_map.keys())}, SLA tasks credited to both nodes)"
+        )
+    except Exception as e:
+        suite.record(False, "Multi-node distributed training job & batch sharding", str(e))
+
+    # M3.2 Ring All-Reduce Gradient Tensor Bucket Aggregation & Unified S3 Safetensors Verification
+    try:
+        import torch
+        import safetensors.torch
+        from app.distributed_training_engine import distributed_training_engine
+
+        # 1. Mathematical verification of Ring All-Reduce float32 tensor bucket averaging
+        t_worker_1 = {
+            "lora_A.weight": torch.full((16, 64), 2.0, dtype=torch.float32),
+            "lora_B.weight": torch.full((64, 16), 4.0, dtype=torch.float32),
+        }
+        t_worker_2 = {
+            "lora_A.weight": torch.full((16, 64), 6.0, dtype=torch.float32),
+            "lora_B.weight": torch.full((64, 16), 8.0, dtype=torch.float32),
+        }
+        unified_dict, ar_metrics = distributed_training_engine.aggregate_lora_state_dicts_ring_allreduce(
+            {
+                "node-gpu-local-01": t_worker_1,
+                "node-gpu-shard-02": t_worker_2,
+            }
+        )
+        mean_a_ok = torch.allclose(unified_dict["lora_A.weight"], torch.full((16, 64), 4.0))
+        mean_b_ok = torch.allclose(unified_dict["lora_B.weight"], torch.full((64, 16), 6.0))
+        buckets_ok = ar_metrics.get("buckets_aggregated") == 2 and ar_metrics.get("total_bytes_reduced", 0) > 0
+
+        # 2. Verify unified .safetensors checkpoint uploaded to MinIO S3 during M3.1
+        s3_ckpt_ok = False
+        tensor_count = 0
+        if dist_final_ckpt_url:
+            dl_r = requests.get(dist_final_ckpt_url, timeout=10)
+            if dl_r.status_code == 200 and len(dl_r.content) > 100:
+                loaded_tensors = safetensors.torch.load(dl_r.content)
+                tensor_count = len(loaded_tensors)
+                s3_ckpt_ok = tensor_count > 0
+
+        m3_2_ok = mean_a_ok and mean_b_ok and buckets_ok and s3_ckpt_ok
+        suite.record(
+            m3_2_ok,
+            f"Ring All-Reduce float32 tensor bucket aggregation & S3 safetensors verified (buckets: {ar_metrics.get('buckets_aggregated')}, bytes reduced: {ar_metrics.get('total_bytes_reduced')}, S3 LoRA tensors: {tensor_count})"
+        )
+    except Exception as e:
+        suite.record(False, "Ring All-Reduce tensor bucket aggregation & S3 safetensors", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

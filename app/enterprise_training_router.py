@@ -48,6 +48,19 @@ class CreateTrainingJobRequest(BaseModel):
     total_epochs: Optional[int] = Field(default=3, ge=1, le=100, description="Total training epochs")
 
 
+class CreateDistributedTrainingJobRequest(BaseModel):
+    name: Optional[str] = Field(default=None, description="Human-readable distributed job label")
+    base_model: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct", description="Foundation model ID")
+    train_type: str = Field(default="lora", description="Fine-tuning technique: lora, qlora")
+    parallelism: str = Field(default="data_parallel", description="Parallelism strategy: data_parallel, model_parallel, fsdp")
+    num_gpus: int = Field(default=2, ge=2, le=128, description="Number of GPU worker nodes to coordinate (>= 2)")
+    worker_ids: Optional[List[str]] = Field(default=None, description="Explicit list of target worker IDs (auto-resolved if omitted)")
+    dataset_s3_url: Optional[str] = Field(default="s3://nebula-datasets/default_distributed.jsonl", description="Dataset URI")
+    hyperparameters: Optional[Dict[str, Any]] = Field(default=None, description="Custom hyperparameter overrides")
+    total_epochs: Optional[int] = Field(default=2, ge=1, le=100, description="Total distributed training epochs")
+    sync_execution: bool = Field(default=False, description="Execute distributed training synchronously in-request if true")
+
+
 class DatasetUploadUrlRequest(BaseModel):
     filename: str = Field(..., description="Target dataset filename (e.g., medical_records.jsonl)")
     content_type: Optional[str] = Field(default="application/jsonlines", description="MIME content type")
@@ -128,6 +141,8 @@ def format_job_response(job: TrainingJob) -> Dict[str, Any]:
         "train_type": job.train_type,
         "parallelism": job.parallelism,
         "num_gpus": job.num_gpus,
+        "worker_ids": parsed_hyperparams.get("worker_ids", []),
+        "distributed_telemetry": parsed_hyperparams.get("distributed_telemetry"),
         "dataset_s3_url": job.dataset_s3_url,
         "hyperparameters": parsed_hyperparams,
         "status": job.status,
@@ -193,6 +208,12 @@ def submit_training_job(
     hyperparams = payload.hyperparameters or {}
     epochs = payload.total_epochs or hyperparams.get("epochs", 3)
 
+    if payload.num_gpus >= 2:
+        from app.distributed_training_engine import distributed_training_engine
+        worker_ids = distributed_training_engine.resolve_worker_fleet(db, num_gpus=payload.num_gpus)
+        hyperparams["distributed_mode"] = True
+        hyperparams["worker_ids"] = worker_ids
+
     new_job = TrainingJob(
         id=job_id,
         user_id=current_user.id,
@@ -224,6 +245,129 @@ def submit_training_job(
         db.refresh(new_job)
 
     return format_job_response(new_job)
+
+
+@router.post("/distributed/jobs", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+def submit_distributed_training_job(
+    payload: CreateDistributedTrainingJobRequest,
+    current_user: User = Depends(verify_enterprise_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Submit a multi-node distributed training job (num_gpus >= 2) using Ring All-Reduce
+    gradient aggregation and dataset batch sharding across registered GPU workers.
+    """
+    from app.distributed_training_engine import distributed_training_engine
+
+    job_id = str(uuid.uuid4())
+    job_name = payload.name or f"Dist-{payload.base_model.split('/')[-1]}-{payload.num_gpus}GPU-{job_id[:6]}"
+
+    worker_ids = payload.worker_ids
+    if not worker_ids or len(worker_ids) < payload.num_gpus:
+        resolved = distributed_training_engine.resolve_worker_fleet(db, num_gpus=payload.num_gpus)
+        if worker_ids:
+            for r_id in resolved:
+                if r_id not in worker_ids and len(worker_ids) < payload.num_gpus:
+                    worker_ids.append(r_id)
+        else:
+            worker_ids = resolved
+
+    worker_ids = worker_ids[:payload.num_gpus]
+
+    hyperparams = dict(payload.hyperparameters or {})
+    epochs = payload.total_epochs or hyperparams.get("epochs", 2)
+    hyperparams["distributed_mode"] = True
+    hyperparams["worker_ids"] = worker_ids
+    hyperparams["allreduce_protocol"] = "ring_allreduce_float32"
+
+    new_job = TrainingJob(
+        id=job_id,
+        user_id=current_user.id,
+        name=job_name,
+        base_model=payload.base_model,
+        train_type=payload.train_type,
+        parallelism=payload.parallelism,
+        num_gpus=len(worker_ids),
+        dataset_s3_url=payload.dataset_s3_url or "s3://nebula-datasets/default_distributed.jsonl",
+        hyperparameters=json.dumps(hyperparams),
+        status="queued",
+        current_epoch=0,
+        total_epochs=epochs,
+        loss_history="[]",
+        checkpoints="[]",
+        final_adapter_url=None,
+        cost=0.0,
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    if payload.sync_execution:
+        execute_training_job(job_id)
+        db.refresh(new_job)
+    else:
+        try:
+            execute_training_job.delay(job_id)
+        except Exception as e:
+            print(f"[API] Celery dispatch fallback for distributed job {job_id}: {e}")
+            execute_training_job(job_id)
+            db.refresh(new_job)
+
+    return format_job_response(new_job)
+
+
+@router.get("/distributed/jobs/{job_id}/shards", response_model=Dict[str, Any])
+def get_distributed_job_shards(
+    job_id: str,
+    current_user: User = Depends(verify_enterprise_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Retrieve per-worker dataset shard assignments, Ring All-Reduce bucket statistics,
+    and per-shard loss telemetry for a multi-node distributed training job.
+    """
+    from app.distributed_training_engine import distributed_training_engine
+
+    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Distributed training job {job_id} not found")
+
+    try:
+        hyperparams = json.loads(job.hyperparameters) if job.hyperparameters else {}
+    except Exception:
+        hyperparams = {}
+
+    try:
+        loss_history = json.loads(job.loss_history) if job.loss_history else []
+    except Exception:
+        loss_history = []
+
+    telemetry = (
+        hyperparams.get("distributed_telemetry")
+        or distributed_training_engine.job_shard_telemetry.get(job_id)
+    )
+
+    worker_ids = hyperparams.get("worker_ids", [])
+    if telemetry:
+        return {
+            **telemetry,
+            "status": job.status,
+            "current_epoch": job.current_epoch,
+            "loss_history": loss_history,
+        }
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "parallelism": job.parallelism,
+        "num_workers": job.num_gpus,
+        "worker_ids": worker_ids,
+        "allreduce_protocol": hyperparams.get("allreduce_protocol", "ring_allreduce_float32"),
+        "current_epoch": job.current_epoch,
+        "total_epochs": job.total_epochs,
+        "loss_history": loss_history,
+        "final_adapter_url": job.final_adapter_url,
+    }
 
 
 @router.get("/jobs", response_model=List[Dict[str, Any]])
@@ -294,3 +438,4 @@ def cancel_training_job(
     job.completed_at = datetime.now(timezone.utc)
     db.commit()
     return {"status": "cancelled", "job_id": job_id}
+

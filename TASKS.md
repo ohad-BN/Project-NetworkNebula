@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 2: Fully Signed Off (Distributed Multi-Node Worker Network & Fleet Registry Active)  
+> **Project Phase:** Alpha Milestone 3 — Phase 3.1 Active (Multi-Node Distributed Training & Ring All-Reduce Protocol)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**120/120 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**122/122 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -13,11 +13,11 @@
 | **Frontend UI** | React 19 Enterprise Cloud Console | ✅ | `http://localhost:5173` | Training Studio, Model Serving Hub, API Tokens, Cluster Fleet |
 | **Backend API** | FastAPI Orchestrator | ✅ | `http://localhost:8000` | Orchestration, Auth, Training APIs, and OpenAI Gateway |
 | **OpenAI Gateway**| Compatible Serving API | ✅ | `/v1/chat/completions` | Drop-in inference endpoint for enterprise Python/cURL SDKs |
-| **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/enterprise_training_router.py` | Multi-GPU LoRA/QLoRA fine-tuning, loss telemetry, S3 checkpoints |
+| **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/distributed_training_engine.py` | Multi-GPU LoRA/QLoRA fine-tuning, Ring All-Reduce, S3 checkpoints |
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI & WebSocket tunnel (`/ws/worker/{id}`) with 10%–100% GPU limit |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **120/120 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **122/122 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -167,11 +167,11 @@
 
 ## 🚀 Alpha Milestone 3: Multi-Node Distributed Training, Intelligent Scheduling & Model Benchmarking
 
-### 📋 Phase 3.1: Multi-Node Distributed Training Orchestrator & Ring All-Reduce Protocol
-- [ ] Build `app/distributed_training_engine.py` coordinating data-parallel training across 2+ registered worker nodes
-- [ ] Add `POST /api/v1/training/distributed/jobs` in `app/enterprise_training_router.py` supporting `num_gpus >= 2`, batch sharding, and multi-node coordination
-- [ ] Implement gradient tensor bucket serialization, mean tensor reduction across worker nodes, and unified `.safetensors` adapter checkpoint export to MinIO S3 (`nebula-checkpoints`)
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.1 assertions (`M3.1` multi-node job dispatch, `M3.2` ring all-reduce gradient aggregation)
+### ✅ Phase 3.1: Multi-Node Distributed Training Orchestrator & Ring All-Reduce Protocol (COMPLETED)
+- [x] Built [`app/distributed_training_engine.py`](app/distributed_training_engine.py) coordinating data-parallel training across 2+ registered worker nodes with deterministic dataset batch sharding and `WorkerGroup` loss synchronization
+- [x] Added `POST /api/v1/training/distributed/jobs` and `GET /api/v1/training/distributed/jobs/{job_id}/shards` in [`app/enterprise_training_router.py`](app/enterprise_training_router.py) supporting `num_gpus >= 2`, batch sharding, and proportional multi-worker SLA earnings credit
+- [x] Implemented `GradientAggregator` float32 tensor bucket serialization, mean tensor reduction across worker nodes, and unified `.safetensors` adapter checkpoint export to MinIO S3 (`nebula-checkpoints`)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.1 assertions (`M3.1` multi-node job dispatch, dataset sharding & multi-worker SLA credit, `M3.2` ring all-reduce gradient tensor bucket aggregation & unified S3 safetensors export) (**122/122 passed — 100%**)
 
 ### 📋 Phase 3.2: Intelligent Capacity-Aware Job Scheduler & Dynamic Task Dispatcher
 - [ ] Build `app/scheduler.py` (`ClusterScheduler` singleton) scoring candidate worker nodes by VRAM headroom, latency, contribution limit, and SLA tier

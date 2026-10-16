@@ -604,6 +604,8 @@ def worker_node_heartbeat(
 
 
 @router.get("/api/v1/workers/{worker_id}/stats")
+@router.get("/api/v1/workers/{worker_id}/status")
+@router.get("/api/v1/workers/{worker_id}")
 @router.get("/api/workers/{worker_id}/stats")
 @router.get("/workers/{worker_id}/stats")
 def get_worker_node_stats(
@@ -632,8 +634,10 @@ def get_worker_node_stats(
         "gpu_utilization_pct": round(float(worker.gpu_utilization_pct or 0.0), 1),
         "total_tasks": completed,
         "completed_tasks": completed,
+        "total_tasks_completed": completed,
         "failed_tasks": 0,
         "earnings": earnings,
+        "total_earnings_usd": earnings,
         "hourly_rate_usd": round(float(worker.hourly_rate_usd or 0.45), 4),
         "uptime_seconds": 3600,
     }
