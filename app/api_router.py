@@ -270,28 +270,45 @@ def withdraw_funds_compat(
     amount = float(data.get("amount", 0.0))
     destination = data.get("destination", "Default Wallet")
 
+    if amount < 10.0:
+        raise HTTPException(status_code=400, detail="Minimum withdrawal is $10.00")
     if amount > user.balance:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
 
-    user.balance -= amount
+    user.balance = round(user.balance - amount, 4)
     payout = PayoutRequest(
         payout_id=str(uuid.uuid4()),
         worker_id=user.id,
         amount=amount,
+        status=PayoutStatus.PENDING,
+        payment_method=data.get("payment_method", "Crypto/USDC"),
         payment_address=destination,
     )
     db.add(payout)
+
+    trans = Transaction(
+        transaction_id=str(uuid.uuid4()),
+        user_id=user.id,
+        type=TransactionType.WITHDRAWAL,
+        amount=-amount,
+        balance_after=user.balance,
+        description=f"Withdrawal to {destination}",
+    )
+    db.add(trans)
     db.commit()
 
     return {
         "id": payout.payout_id,
+        "payout_id": payout.payout_id,
         "amount": amount,
         "currency": "USD",
         "status": "pending",
         "destination": destination,
+        "balance": user.balance,
     }
+
 
 
 @api_router.get("/wallet/transactions")

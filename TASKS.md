@@ -192,11 +192,12 @@
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.4 assertions (`M3.7` model evaluation benchmark scoring, `M3.8` dual-model side-by-side completion) (**128/128 passed — 100%**)
 
 
-### 📋 Phase 3.5: Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts
-- [ ] Enhance `app/wallet_router.py` with `POST /wallet/withdraw` (validates $10.00 min threshold) and `POST /api/v1/wallet/payouts/{id}/settle` (automated ledger settlement and balance deduction)
-- [ ] Add `GET /api/v1/billing/receipts/{job_id}` generating structured JSON and printable/downloadable enterprise compute invoices
-- [ ] Upgrade **Host Wallet Page** ([`network-nebula/src/pages/wallet.tsx`](network-nebula/src/pages/wallet.tsx)) with an interactive **Withdraw Funds Dialog**, live payout tracker, and printable invoice viewer
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.5 assertions (`M3.9` withdrawal lifecycle & ledger deduction, `M3.10` enterprise compute billing receipt generation)
+### ✅ Phase 3.5: Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts (COMPLETED)
+- [x] Enhanced [`app/wallet_router.py`](app/wallet_router.py) with `POST /wallet/withdraw` (validating $10.00 min threshold) and `POST /api/v1/wallet/payouts/{id}/settle` (automated ledger settlement and balance deduction)
+- [x] Added `GET /api/v1/billing/receipts/{job_id}` generating structured JSON and printable/downloadable enterprise compute invoices
+- [x] Upgraded **Host Wallet Page** ([`network-nebula/src/pages/wallet.tsx`](network-nebula/src/pages/wallet.tsx)) with live payout request tracker and printable invoice viewer dialog
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.5 assertions (`M3.9` withdrawal lifecycle & ledger deduction, `M3.10` enterprise compute billing receipt generation) (**130/130 passed — 100%**)
+
 
 ### 📋 Phase 3.6: Master Test Suite Expansion & Milestone 3 Signoff
 - [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.6 master validation tests (`M3.11` high-availability load balancing audit, `M3.12` Alpha Milestone 3 Master System Signoff)

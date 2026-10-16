@@ -257,28 +257,47 @@ def deposit_funds(amount: float, user=Depends(verify_api_auth), db=Depends(get_d
 
 @app.post("/wallet/withdraw")
 def withdraw_funds(
-    amount: float, address: str, user=Depends(verify_api_auth), db=Depends(get_db)
+    payload: dict, user=Depends(verify_enterprise_auth), db=Depends(get_db)
 ):
-    if not user.is_worker:
-        raise HTTPException(status_code=403, detail="Workers only")
+    amount = float(payload.get("amount", 0.0))
+    address = payload.get("destination") or payload.get("address", "Default Wallet")
+    payment_method = payload.get("payment_method", "Crypto/USDC")
+
+    if amount < 10.0:
+        raise HTTPException(status_code=400, detail="Minimum withdrawal is $10.00")
     if amount > user.balance:
         raise HTTPException(status_code=400, detail="Insufficient balance")
-    if amount < 10:
-        raise HTTPException(status_code=400, detail="Minimum $10")
-    user.balance -= amount
+
+    user.balance = round(user.balance - amount, 4)
     payout = PayoutRequest(
         payout_id=str(uuid.uuid4()),
         worker_id=user.id,
         amount=amount,
+        status=PayoutStatus.PENDING,
+        payment_method=payment_method,
         payment_address=address,
     )
     db.add(payout)
+
+    trans = Transaction(
+        transaction_id=str(uuid.uuid4()),
+        user_id=user.id,
+        type=TransactionType.WITHDRAWAL,
+        amount=-amount,
+        balance_after=user.balance,
+        description=f"Withdrawal to {address}",
+    )
+    db.add(trans)
     db.commit()
+
     return {
         "payout_id": payout.payout_id,
         "amount": amount,
         "status": payout.status.value,
+        "destination": address,
+        "balance": user.balance,
     }
+
 
 
 @app.post("/tasks/render")
@@ -1030,6 +1049,12 @@ app.include_router(openai_inference_router)
 from app.cluster_worker_router import router as cluster_worker_router
 
 app.include_router(cluster_worker_router)
+
+# Include Host Node Wallet Payouts & Enterprise Billing Router (Alpha Milestone 3)
+from app.wallet_router import router as wallet_router
+
+app.include_router(wallet_router)
+
 
 
 

@@ -2722,11 +2722,122 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Dual-model side-by-side comparative execution", str(e))
 
+    # =========================================================================
+    # Phase 3.5 (Alpha Milestone 3): Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts
+    # =========================================================================
+    print_header("Phase 3.5 (Alpha Milestone 3): Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts")
+
+    # M3.9 Host Node Wallet Withdrawal Lifecycle, Minimum Threshold & Automated Settlement
+    try:
+        # Step 1: Deposit funds so user has at least $25.00 for withdrawal testing
+        dep_res = requests.post(
+            f"{BASE_URL}/api/v1/wallet/deposit",
+            json={"amount": 25.0, "payment_method": "Credit Card"},
+            timeout=10,
+        ).json()
+        starting_bal = dep_res.get("balance", 25.0)
+
+        # Step 2: Attempt sub-threshold withdrawal ($5.00 < $10.00 min) - Expect HTTP 400
+        sub_min_res = requests.post(
+            f"{BASE_URL}/wallet/withdraw",
+            json={"amount": 5.0, "destination": "0xSubMinTestWallet"},
+            timeout=10,
+        )
+        sub_min_rejected = sub_min_res.status_code == 400
+
+        # Step 3: Execute valid withdrawal ($12.50 >= $10.00)
+        valid_withdraw_res = requests.post(
+            f"{BASE_URL}/wallet/withdraw",
+            json={"amount": 12.50, "destination": "0xNebulaPayoutHost77", "payment_method": "USDC"},
+            timeout=10,
+        )
+        valid_ok = valid_withdraw_res.status_code == 200
+        w_data = valid_withdraw_res.json() if valid_ok else {}
+        payout_id = w_data.get("payout_id") or w_data.get("id")
+
+        # Step 4: Verify ledger deduction & balance update
+        bal_res = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json()
+        expected_bal = round(starting_bal - 12.50, 4)
+
+        bal_deducted = abs(bal_res.get("balance", 0.0) - expected_bal) < 0.05
+
+        # Step 5: Settle payout via /api/v1/wallet/payouts/{id}/settle
+        settle_res = requests.post(
+            f"{BASE_URL}/api/v1/wallet/payouts/{payout_id}/settle",
+            json={"notes": "Automated test settlement"},
+            timeout=10,
+        )
+        settled_ok = settle_res.status_code == 200 and settle_res.json().get("status") in ["paid", "already_settled"]
+
+        # Step 6: Verify payout listed in /api/v1/wallet/payouts
+        p_list = requests.get(f"{BASE_URL}/api/v1/wallet/payouts", timeout=5).json()
+        payout_listed = any(p.get("payout_id") == payout_id and p.get("status") == "PAID" for p in p_list)
+
+        m3_9_ok = sub_min_rejected and valid_ok and bal_deducted and settled_ok and payout_listed
+        cur_bal = bal_res.get("balance")
+        bal_str = f"${cur_bal:.2f}" if cur_bal is not None else "N/A"
+        suite.record(
+            m3_9_ok,
+            f"Host node withdrawal & automated settlement verified (min $10 reject: {sub_min_rejected}, withdrawn: $12.50, balance: {bal_str}, settled: {settled_ok})"
+        )
+
+
+    except Exception as e:
+        suite.record(False, "Host node wallet withdrawal lifecycle & settlement", str(e))
+
+    # M3.10 Enterprise Compute Billing Receipt & Printable Invoice Generation
+    try:
+        # Step 1: Use an existing completed training job or create an authentic training task
+        from app.database import get_db as get_test_db
+        from app.models import TrainingJob as DBTrainingJob, Task as DBTask
+        db_gen = get_test_db()
+        test_session = next(db_gen)
+
+        job_record = test_session.query(DBTrainingJob).filter(DBTrainingJob.status == "completed").first()
+        test_job_id = job_record.id if job_record else None
+
+        if not test_job_id:
+            # Fallback to any task
+            task_rec = test_session.query(DBTask).first()
+            test_job_id = task_rec.task_id if task_rec else None
+
+        test_session.close()
+
+        if test_job_id:
+            receipt_res = requests.get(
+                f"{BASE_URL}/api/v1/billing/receipts/{test_job_id}",
+                timeout=10,
+            )
+            receipt_ok = receipt_res.status_code == 200
+            receipt_data = receipt_res.json() if receipt_ok else {}
+
+            has_receipt_fields = (
+                receipt_ok
+                and "invoice_number" in receipt_data
+                and "receipt_id" in receipt_data
+                and receipt_data.get("job_id") == test_job_id
+                and "line_items" in receipt_data
+                and len(receipt_data.get("line_items", [])) > 0
+                and receipt_data.get("total_usd", 0.0) >= 0.0
+                and receipt_data.get("currency") == "USD"
+                and receipt_data.get("payment_status") == "settled"
+            )
+
+            suite.record(
+                has_receipt_fields,
+                f"Enterprise compute billing receipt verified (inv: {receipt_data.get('invoice_number')}, job: {test_job_id[:16]}..., total: ${receipt_data.get('total_usd'):.4f} USD, items: {len(receipt_data.get('line_items', []))})"
+            )
+        else:
+            suite.record(False, "Enterprise compute billing receipt generation", "No test job ID available")
+    except Exception as e:
+        suite.record(False, "Enterprise compute billing receipt generation", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
     success = run_tests()
     sys.exit(0 if success else 1)
+
 
 
 
