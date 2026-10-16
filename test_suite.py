@@ -1736,6 +1736,78 @@ def run_tests():
     except Exception as e:
         suite.record(False, "CUDA hardware VRAM stability audit", str(e))
 
+    # =========================================================================
+    # Phase 2.1 (Alpha Milestone 2): Worker Telemetry Schema & Fleet Registry API
+    # =========================================================================
+    print_header("Phase 2.1 (Alpha Milestone 2): Worker Telemetry Schema & Fleet Registry API")
+
+    # M2.1 Live Cluster Fleet Telemetry & Primary RTX 4070 Auto-Discovery
+    try:
+        c_res = requests.get(f"{BASE_URL}/api/v1/cluster/telemetry")
+        if c_res.status_code == 200:
+            c_data = c_res.json()
+            nodes = c_data.get("nodes", [])
+            has_primary = any(n.get("node_id") == "node-gpu-local-01" for n in nodes)
+            has_vram = c_data.get("total_vram_gb", 0) >= 4.0 and c_data.get("allocated_vram_gb", 0) > 0
+            suite.record(has_primary and has_vram, f"Live cluster telemetry verified ({c_data.get('active_nodes')} active node(s), {c_data.get('allocated_vram_gb')}/{c_data.get('total_vram_gb')} GB VRAM allocated)")
+        else:
+            suite.record(False, "Live cluster fleet telemetry", f"Status {c_res.status_code}: {c_res.text}")
+    except Exception as e:
+        suite.record(False, "Live cluster fleet telemetry", str(e))
+
+    # M2.2 GPU Worker Node Registration with Custom Contribution Percentage (75%)
+    m2_worker_id = None
+    try:
+        reg_payload = {
+            "name": "Milestone2-Test-Contributor-Node",
+            "gpu_info": "NVIDIA GeForce RTX 4070 Laptop GPU",
+            "cpu_cores": 16,
+            "memory_gb": 32.0,
+            "gpu_memory_gb": 12.0,
+            "vram_used_gb": 1.2,
+            "vram_allocation_pct": 75,
+            "role": "Distributed LoRA & Inference",
+        }
+        reg_res = requests.post(f"{BASE_URL}/api/v1/workers/register", json=reg_payload)
+        if reg_res.status_code == 200:
+            r_body = reg_res.json()
+            m2_worker_id = r_body.get("worker_id")
+            pct_ok = r_body.get("vram_allocation_pct") == 75 and r_body.get("vram_allocated_gb") == 9.0
+            suite.record(bool(m2_worker_id) and pct_ok, f"Worker registered with 75% GPU contribution limit (ID: {str(m2_worker_id)[:12]}..., allocated: {r_body.get('vram_allocated_gb')} GB / 12.0 GB)")
+        else:
+            suite.record(False, "Worker registration with contribution %", f"Status {reg_res.status_code}: {reg_res.text}")
+    except Exception as e:
+        suite.record(False, "Worker registration with contribution %", str(e))
+
+    # M2.3 Dynamic GPU Contribution Percentage Adjustment (75% -> 50%) & CUDA Fraction Enforcement
+    try:
+        if not m2_worker_id:
+            suite.record(False, "Dynamic GPU contribution % control", "No m2_worker_id from M2.2")
+        else:
+            cfg_res = requests.patch(
+                f"{BASE_URL}/api/v1/workers/{m2_worker_id}/config",
+                json={"vram_allocation_pct": 50, "role": "50% Capped Contributor"},
+            )
+            hb_res = requests.post(
+                f"{BASE_URL}/api/v1/workers/{m2_worker_id}/heartbeat",
+                json={"vram_used_gb": 1.5, "gpu_utilization_pct": 34.5},
+            )
+            if cfg_res.status_code == 200 and hb_res.status_code == 200:
+                cfg_body = cfg_res.json()
+                hb_body = hb_res.json()
+                updated_ok = (
+                    cfg_body.get("vram_allocation_pct") == 50
+                    and cfg_body.get("vram_allocated_gb") == 6.0
+                    and hb_body.get("vram_allocation_pct") == 50
+                )
+                suite.record(updated_ok, f"Dynamic GPU contribution slider verified (75% -> 50%, 6.0 GB ceiling enforced, CUDA fraction: {cfg_body.get('cuda_fraction_enforced')})")
+            else:
+                suite.record(False, "Dynamic GPU contribution % control", f"CFG {cfg_res.status_code}, HB {hb_res.status_code}")
+            # Clean up temporary test worker so fleet stays clean
+            requests.post(f"{BASE_URL}/api/v1/workers/{m2_worker_id}/deregister")
+    except Exception as e:
+        suite.record(False, "Dynamic GPU contribution % control", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

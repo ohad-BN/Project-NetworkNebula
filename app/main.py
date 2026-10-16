@@ -839,6 +839,12 @@ def list_workers(db=Depends(get_db), user=Depends(verify_api_auth)):
                 "gpu_info": w.gpu_info,
                 "status": w.status,
                 "gpu_memory_gb": w.gpu_memory_gb,
+                "vram_used_gb": w.vram_used_gb or 0.0,
+                "vram_allocation_pct": w.vram_allocation_pct if w.vram_allocation_pct is not None else 80,
+                "gpu_utilization_pct": w.gpu_utilization_pct or 0.0,
+                "cuda_version": w.cuda_version or "12.8",
+                "role": w.role or "LoRA Training & Inference",
+                "total_earnings_usd": w.total_earnings_usd or 0.0,
             }
             for w in workers
         ]
@@ -847,11 +853,12 @@ def list_workers(db=Depends(get_db), user=Depends(verify_api_auth)):
 
 @app.post("/workers/register")
 def register_worker(
-    name: str,
+    name: str = Query(default="nebula-worker"),
     gpu_info: str = None,
     cpu_cores: int = 0,
     memory_gb: float = 0.0,
     gpu_memory_gb: float = 0.0,
+    vram_allocation_pct: int = Query(default=80, ge=10, le=100),
     supported_task_types: List[str] = Query(
         default=["inference"],
         description="Supported task types: inference, batch_inference, training",
@@ -865,6 +872,7 @@ def register_worker(
         cpu_cores=cpu_cores,
         memory_gb=memory_gb,
         gpu_memory_gb=gpu_memory_gb,
+        vram_allocation_pct=vram_allocation_pct,
         status="online",
     )
     db.add(worker)
@@ -872,6 +880,7 @@ def register_worker(
     return {
         "worker_id": worker.id,
         "name": worker.name,
+        "vram_allocation_pct": worker.vram_allocation_pct,
         "supported_task_types": supported_task_types,
     }
 
@@ -880,6 +889,8 @@ def register_worker(
 def worker_heartbeat(
     worker_id: str,
     current_task_id: str = None,
+    vram_used_gb: Optional[float] = None,
+    gpu_utilization_pct: Optional[float] = None,
     db=Depends(get_db),
 ):
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
@@ -887,9 +898,16 @@ def worker_heartbeat(
         return {"status": "error"}
     worker.last_heartbeat = datetime.utcnow()
     worker.current_task_id = current_task_id
+    if vram_used_gb is not None:
+        worker.vram_used_gb = vram_used_gb
+    if gpu_utilization_pct is not None:
+        worker.gpu_utilization_pct = gpu_utilization_pct
     worker.status = "busy" if current_task_id else "online"
     db.commit()
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "vram_allocation_pct": worker.vram_allocation_pct if worker.vram_allocation_pct is not None else 80,
+    }
 
 
 @app.get("/workers/{worker_id}")
@@ -909,6 +927,12 @@ def get_worker(
         "gpu_info": worker.gpu_info,
         "cpu_cores": worker.cpu_cores,
         "gpu_memory_gb": worker.gpu_memory_gb,
+        "vram_used_gb": worker.vram_used_gb or 0.0,
+        "vram_allocation_pct": worker.vram_allocation_pct if worker.vram_allocation_pct is not None else 80,
+        "gpu_utilization_pct": worker.gpu_utilization_pct or 0.0,
+        "cuda_version": worker.cuda_version or "12.8",
+        "role": worker.role or "LoRA Training & Inference",
+        "total_earnings_usd": worker.total_earnings_usd or 0.0,
         "total_tasks_completed": worker.total_tasks_completed,
         "is_available": worker.is_available,
     }
@@ -927,6 +951,7 @@ def worker_complete_task(
         raise HTTPException(status_code=404, detail="Worker not found")
 
     worker.total_tasks_completed += 1
+    worker.total_earnings_usd = (worker.total_earnings_usd or 0.0) + earnings
 
     # Find user and add earnings
     task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -982,5 +1007,11 @@ app.include_router(enterprise_token_router)
 from app.openai_inference_router import router as openai_inference_router
 
 app.include_router(openai_inference_router)
+
+# Include Cluster Fleet & GPU Worker Telemetry Router (Alpha Milestone 2)
+from app.cluster_worker_router import router as cluster_worker_router
+
+app.include_router(cluster_worker_router)
+
 
 

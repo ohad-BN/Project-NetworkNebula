@@ -83,6 +83,7 @@ class Worker(Base):
     __tablename__ = "workers"
 
     id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=True, index=True)
     name = Column(String(255), nullable=False)
     gpu_info = Column(String(255), nullable=True)
     status = Column(String(50), default="offline")
@@ -90,6 +91,13 @@ class Worker(Base):
     cpu_cores = Column(Integer, default=0)
     memory_gb = Column(Float, default=0.0)
     gpu_memory_gb = Column(Float, default=0.0)
+    vram_used_gb = Column(Float, default=0.0)
+    vram_allocation_pct = Column(Integer, default=80)
+    gpu_utilization_pct = Column(Float, default=0.0)
+    cuda_version = Column(String(64), default="12.8")
+    role = Column(String(100), default="LoRA Training & Inference")
+    hourly_rate_usd = Column(Float, default=0.45)
+    total_earnings_usd = Column(Float, default=0.0)
     is_available = Column(Boolean, default=True)
     total_tasks_completed = Column(Integer, default=0)
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())

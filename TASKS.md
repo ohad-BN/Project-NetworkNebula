@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 1: COMPLETE (Real AI Model Execution Active — 102/102 Tests Passing)  
+> **Project Phase:** Alpha Milestone 2: Phase 2.1 Complete (Worker Telemetry Schema & Fleet Registry Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**102/102 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**105/105 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -14,10 +14,10 @@
 | **Backend API** | FastAPI Orchestrator | ✅ | `http://localhost:8000` | Orchestration, Auth, Training APIs, and OpenAI Gateway |
 | **OpenAI Gateway**| Compatible Serving API | ✅ | `/v1/chat/completions` | Drop-in inference endpoint for enterprise Python/cURL SDKs |
 | **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/enterprise_training_router.py` | Multi-GPU LoRA/QLoRA fine-tuning, loss telemetry, S3 checkpoints |
-| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | Celery + Redis (6379) | Host workers processing training jobs and inference calls |
+| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | `app/cluster_worker_router.py` | Host workers with 10%–100% GPU contribution control |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **102/102 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **105/105 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -125,11 +125,38 @@
 
 ---
 
-## 🚀 Alpha Milestone 2: Distributed Multi-Node Worker Network (PREVIEW)
-- [ ] Implement Worker Node Registration handshake via Mutual TLS / HMAC
-- [ ] Distribute Celery task routing across multiple remote consumer nodes
-- [ ] Implement Node Heartbeat, SLA Health Telemetry, and Dynamic Compute Pricing ($NEBULA/hr)
-- [ ] Connect P2P GPU node contribution frontend view to live WebSocket heartbeat stream
+## 🚀 Alpha Milestone 2: Standalone Worker CLI Agent & Live Multi-Node Fleet Network
+
+### ✅ Phase 2.1: Enhanced Worker Telemetry Schema & Fleet Registry API (COMPLETED)
+- [x] Extended `Worker` model in [`app/models.py`](app/models.py) with `user_id`, `vram_used_gb`, `vram_allocation_pct` (`10%–100%`), `gpu_utilization_pct`, `cuda_version`, `role`, `hourly_rate_usd`, and `total_earnings_usd`
+- [x] Built [`app/cluster_worker_router.py`](app/cluster_worker_router.py) with automatic PostgreSQL column migration (`ensure_worker_schema_columns`) and physical RTX 4070 hardware introspection (`probe_local_gpu_hardware`)
+- [x] Implemented `GET /api/v1/cluster/telemetry`, `POST /api/v1/workers/register`, `PATCH /api/v1/workers/{id}/config` (with `torch.cuda.set_per_process_memory_fraction` enforcement), `POST /api/v1/workers/{id}/heartbeat`, and `GET /api/v1/workers/{id}/stats`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.1 assertions (`M2.1` live cluster telemetry, `M2.2` worker registration with 75% contribution limit, `M2.3` dynamic 75% -> 50% slider & CUDA fraction enforcement) (**105/105 passed — 100%**)
+
+### 📋 Phase 2.2: Standalone "Nebula Worker" CLI Agent (`nebula_worker.py`)
+- [ ] Create standalone [`nebula_worker.py`](nebula_worker.py) CLI script supporting `join`, `status`, and `set-limit` subcommands
+- [ ] Implement automatic CUDA GPU discovery (model, total VRAM, allocated VRAM, CUDA version, CPU cores, RAM) and `--vram-pct` (`10–100%`) memory ceiling enforcement
+- [ ] Support `--once` deterministic execution mode for automated testing & quick PowerShell verification alongside continuous daemon mode
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.2 assertions (`M2.4`, `M2.5`, `M2.6`) and verify 100% pass
+
+### 📋 Phase 2.3: Real-Time WebSocket Worker Tunnel & NAT Traversal
+- [ ] Implement `WS /ws/worker/{worker_id}` bidirectional tunnel in [`app/cluster_worker_router.py`](app/cluster_worker_router.py) for firewall-friendly outbound worker heartbeats and instant server-pushed `vram_allocation_pct` config updates
+- [ ] Implement `WS /ws/cluster` live broadcast stream for connected Cloud Console clients
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.3 assertions (`M2.7`, `M2.8`, `M2.9`) and verify 100% pass
+
+### 📋 Phase 2.4: Dynamic Task Routing, SLA Accounting & Automated Worker Earnings
+- [ ] Wire `execute_training_job` and `serve_inference_request` in [`app/worker.py`](app/worker.py) to credit completed tasks and USD compute earnings (`WORKER_SHARE = 0.70`) to the active `Worker` node and owner `User` wallet (`TransactionType.EARNING`)
+- [ ] Upgrade [`get_payout.py`](get_payout.py) to display registered GPU worker nodes, their active `vram_allocation_pct` contribution percentage, completed tasks, and per-node earnings in PowerShell
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.4 assertions (`M2.10`, `M2.11`, `M2.12`) and verify 100% pass
+
+### 📋 Phase 2.5: Live Frontend GPU Fleet (`/cluster`) & Contributor Control Panel (`/worker`)
+- [ ] Upgrade [`network-nebula/src/pages/cluster-status.tsx`](network-nebula/src/pages/cluster-status.tsx) to replace hardcoded mock nodes with live `/api/v1/cluster/telemetry` data, interactive **10%–100% GPU Contribution Sliders**, and a copyable PowerShell CLI join command
+- [ ] Upgrade [`network-nebula/src/pages/worker.tsx`](network-nebula/src/pages/worker.tsx) to connect to real worker node telemetry and contribution controls
+- [ ] Verify clean frontend production bundle (`bun run build`) and expand [`test_suite.py`](test_suite.py) with Phase 2.5 assertions (`M2.13`, `M2.14`, `M2.15`)
+
+### 📋 Phase 2.6: Master Test Suite Expansion & Milestone 2 Signoff
+- [ ] Add final Milestone 2 end-to-end multi-node & VRAM governance audit assertions to [`test_suite.py`](test_suite.py)
+- [ ] Run `python test_suite.py` to achieve 100% green pass across all **117+** tests and sign off Alpha Milestone 2
 
 ---
 
