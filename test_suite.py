@@ -2109,6 +2109,101 @@ def run_tests():
     except Exception as e:
         suite.record(False, "CLI 'get_payout.py' fleet telemetry", str(e))
 
+    # =========================================================================
+    # Phase 2.5 (Alpha Milestone 2): Live Frontend GPU Fleet & Contributor Control Panel
+    # =========================================================================
+    print_header("Phase 2.5 (Alpha Milestone 2): Live Frontend GPU Fleet & Contributor Control Panel")
+
+    # M2.13 Cluster Fleet Telemetry API & Frontend Contract Alignment
+    try:
+        t_res = requests.get(f"{BASE_URL}/api/v1/cluster/telemetry", timeout=5)
+        if t_res.status_code == 200:
+            t_body = t_res.json()
+            nodes = t_body.get("nodes", [])
+            local_node = next((n for n in nodes if n.get("node_id") == "node-gpu-local-01"), None)
+            contract_ok = (
+                t_body.get("status") == "healthy"
+                and t_body.get("active_nodes", 0) >= 1
+                and t_body.get("total_vram_gb", 0) >= 8.0
+                and t_body.get("allocated_vram_gb", 0) > 0
+                and local_node is not None
+                and "vram_allocation_pct" in local_node
+                and "vram_allocated_gb" in local_node
+                and "hourly_rate_usd" in local_node
+                and "total_earnings_usd" in local_node
+            )
+            suite.record(
+                contract_ok,
+                f"Cluster telemetry frontend contract aligned (nodes: {len(nodes)}, local VRAM: {local_node.get('vram_allocated_gb')}/{local_node.get('vram_total_gb')} GB, contrib: {local_node.get('vram_allocation_pct')}%)"
+            )
+        else:
+            suite.record(False, "Cluster telemetry frontend contract", f"HTTP {t_res.status_code}")
+    except Exception as e:
+        suite.record(False, "Cluster telemetry frontend contract", str(e))
+
+    # M2.14 Frontend Dynamic Slider Throttling Roundtrip (75% -> 80%)
+    try:
+        # Patch local node to 75%
+        patch1 = requests.patch(
+            f"{BASE_URL}/api/v1/workers/node-gpu-local-01/config",
+            json={"vram_allocation_pct": 75},
+            timeout=5
+        )
+        p1_data = patch1.json() if patch1.status_code == 200 else {}
+        # Fetch stats to verify live update
+        st_res = requests.get(f"{BASE_URL}/api/v1/workers/node-gpu-local-01/stats", timeout=5)
+        st_data = st_res.json() if st_res.status_code == 200 else {}
+
+        slider_p1_ok = (
+            patch1.status_code == 200
+            and p1_data.get("vram_allocation_pct") == 75
+            and p1_data.get("vram_allocated_gb") == 6.0
+            and p1_data.get("cuda_fraction_enforced") is True
+            and st_data.get("vram_allocation_pct") == 75
+        )
+
+        # Restore to 80%
+        patch2 = requests.patch(
+            f"{BASE_URL}/api/v1/workers/node-gpu-local-01/config",
+            json={"vram_allocation_pct": 80},
+            timeout=5
+        )
+        p2_data = patch2.json() if patch2.status_code == 200 else {}
+        slider_p2_ok = (
+            patch2.status_code == 200
+            and p2_data.get("vram_allocation_pct") == 80
+            and p2_data.get("vram_allocated_gb") == 6.4
+        )
+
+        suite.record(
+            slider_p1_ok and slider_p2_ok,
+            f"Frontend dynamic GPU contribution slider roundtrip verified (75% -> 80%, 6.4 GB allocated, CUDA fraction: {p1_data.get('cuda_fraction_enforced')})"
+        )
+    except Exception as e:
+        suite.record(False, "Frontend dynamic slider throttling", str(e))
+
+    # M2.15 Production Frontend Asset Compilation & SPA Route Reachability
+    try:
+        dist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "network-nebula", "dist")
+        index_html = os.path.join(dist_dir, "index.html")
+        assets_dir = os.path.join(dist_dir, "assets")
+
+        has_index = os.path.isfile(index_html) and os.path.getsize(index_html) > 100
+        has_assets = os.path.isdir(assets_dir) and len(os.listdir(assets_dir)) >= 2
+
+        # Check Vite dev server reachability for /cluster and /worker
+        vite_cluster = requests.get("http://localhost:5173/cluster", timeout=5)
+        vite_worker = requests.get("http://localhost:5173/worker", timeout=5)
+
+        vite_ok = vite_cluster.status_code == 200 and vite_worker.status_code == 200
+
+        suite.record(
+            has_index and has_assets and vite_ok,
+            f"Production frontend build & SPA routes verified (dist bundle: {os.path.getsize(index_html) if has_index else 0} bytes, /cluster & /worker HTTP 200)"
+        )
+    except Exception as e:
+        suite.record(False, "Production frontend build & SPA routes", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
