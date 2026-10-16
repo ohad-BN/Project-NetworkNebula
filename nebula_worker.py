@@ -101,6 +101,37 @@ def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
     }
 
 
+def run_websocket_tunnel(server_url: str, worker_id: str, once: bool = False) -> Dict[str, Any]:
+    """Connect to orchestrator via persistent WebSocket tunnel, handshake, and send heartbeat."""
+    ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{worker_id}"
+    import asyncio
+    import websockets
+
+    async def _async_tunnel():
+        async with websockets.connect(ws_url, open_timeout=10) as ws:
+            init_frame = json.loads(await ws.recv())
+            # Send live telemetry frame
+            hw = discover_hardware()
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "heartbeat",
+                        "vram_used_gb": hw["vram_used_gb"],
+                        "gpu_utilization_pct": hw["gpu_utilization_pct"],
+                    }
+                )
+            )
+            ack_frame = json.loads(await ws.recv())
+            return {
+                "tunnel_connected": True,
+                "init": init_frame,
+                "ack": ack_frame,
+                "ws_url": ws_url,
+            }
+
+    return asyncio.run(_async_tunnel())
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     """Register this GPU machine with the NetworkNebula orchestrator and run heartbeat loop."""
     server_url = args.server.rstrip("/")
@@ -183,11 +214,21 @@ def cmd_join(args: argparse.Namespace) -> int:
         "server": server_url,
     }
 
+    if getattr(args, "tunnel", False):
+        try:
+            ws_res = run_websocket_tunnel(server_url, registered_id, once=args.once)
+            result_summary["tunnel"] = ws_res
+            if not args.json:
+                print(f"  WebSocket Tunnel   : Connected ({ws_res.get('ws_url')})")
+        except Exception as e:
+            if not args.json:
+                print(f"  WebSocket Tunnel   : Offline / Fallback ({e})")
+
     if args.json:
         print(json.dumps(result_summary))
     else:
         print("\n" + "=" * 68)
-        print("  NETWORK NEBULA — STANDALONE GPU WORKER AGENT ACTIVE")
+        print("  NETWORK NEBULA - STANDALONE GPU WORKER AGENT ACTIVE")
         print("=" * 68)
         print(f"  Worker Node ID     : {result_summary['worker_id']}")
         print(f"  Node Name          : {result_summary['name']}")
@@ -313,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_p.add_argument("--role", default="LoRA Training & Fast Serving", help="Compute role")
     join_p.add_argument("--api-key", default=None, help="Optional user API key to link earnings")
     join_p.add_argument("--interval", type=int, default=15, help="Heartbeat interval in seconds")
+    join_p.add_argument("--tunnel", action="store_true", help="Maintain persistent WebSocket tunnel instead of HTTP polling")
     join_p.add_argument("--once", action="store_true", help="Register, send one heartbeat, and exit")
     join_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 

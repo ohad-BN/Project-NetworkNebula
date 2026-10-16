@@ -11,7 +11,17 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -24,6 +34,65 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Cluster & Worker Fleet"])
 
 LOCAL_PRIMARY_NODE_ID = "node-gpu-local-01"
+
+
+class WorkerTunnelManager:
+    """Manages persistent bidirectional WebSocket tunnels for remote GPU workers."""
+
+    def __init__(self):
+        self.active_tunnels: Dict[str, WebSocket] = {}
+
+    async def connect(self, worker_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_tunnels[worker_id] = websocket
+
+    def disconnect(self, worker_id: str, websocket: Optional[WebSocket] = None):
+        if worker_id in self.active_tunnels:
+            if websocket is None or self.active_tunnels[worker_id] == websocket:
+                del self.active_tunnels[worker_id]
+
+    async def send_config_update(self, worker_id: str, config: Dict[str, Any]) -> bool:
+        ws = self.active_tunnels.get(worker_id)
+        if ws:
+            try:
+                await ws.send_json({"type": "config_update", **config})
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to push config update over WebSocket to {worker_id}: {e}")
+                self.disconnect(worker_id, ws)
+        return False
+
+    def is_connected(self, worker_id: str) -> bool:
+        return worker_id in self.active_tunnels
+
+
+class ClusterBroadcastManager:
+    """Broadcasts real-time fleet telemetry frames to connected UI clients."""
+
+    def __init__(self):
+        self.subscribers: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.subscribers.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.subscribers:
+            self.subscribers.remove(websocket)
+
+    async def broadcast(self, message: Dict[str, Any]):
+        dead = []
+        for ws in self.subscribers:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+
+worker_tunnel_manager = WorkerTunnelManager()
+cluster_broadcast_manager = ClusterBroadcastManager()
 
 
 def ensure_worker_schema_columns() -> None:
@@ -196,6 +265,7 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "total_tasks_completed": int(w.total_tasks_completed or 0),
         "hourly_rate_usd": round(float(w.hourly_rate_usd or 0.45), 4),
         "total_earnings_usd": round(float(w.total_earnings_usd or 0.0), 4),
+        "tunnel_active": worker_tunnel_manager.is_connected(w.id),
         "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else datetime.utcnow().isoformat(),
     }
 
@@ -428,14 +498,14 @@ def register_worker_node(
 
 @router.patch("/api/v1/workers/{worker_id}/config")
 @router.patch("/api/workers/{worker_id}/config")
-def update_worker_config(
+async def update_worker_config(
     worker_id: str,
     payload: WorkerConfigUpdatePayload,
     db: Session = Depends(get_db),
 ):
     """
     Dynamically adjust a GPU worker's contribution percentage (10%-100%), role, or availability.
-    Immediately updates the CUDA per-process memory fraction ceiling.
+    Immediately updates the CUDA per-process memory fraction ceiling and pushes config over WebSocket tunnel.
     """
     if worker_id == LOCAL_PRIMARY_NODE_ID:
         sync_primary_local_worker(db)
@@ -466,6 +536,22 @@ def update_worker_config(
 
     res = serialize_worker_node(worker)
     res["cuda_fraction_enforced"] = cuda_enforced
+
+    # Real-time WebSocket push: if worker is connected via WebSocket tunnel, push config immediately
+    await worker_tunnel_manager.send_config_update(
+        worker_id,
+        {
+            "worker_id": worker_id,
+            "vram_allocation_pct": worker.vram_allocation_pct,
+            "role": worker.role,
+            "name": worker.name,
+            "is_available": worker.is_available,
+        },
+    )
+
+    # Broadcast node update to connected Cloud Console UI clients
+    await cluster_broadcast_manager.broadcast({"type": "node_update", "node": res})
+
     return res
 
 
@@ -569,3 +655,129 @@ def deregister_worker_node(
     worker.is_available = False
     db.commit()
     return {"status": "deregistered", "worker_id": worker_id}
+
+
+# ==============================================================================
+# WebSocket Real-Time Tunnel & Telemetry Endpoints (Phase 2.3)
+# ==============================================================================
+
+
+@router.websocket("/ws/worker/{worker_id}")
+async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str):
+    """
+    Firewall/NAT-friendly persistent bidirectional WebSocket tunnel for remote GPU workers.
+    Streams live hardware telemetry heartbeats and receives real-time server config pushes.
+    """
+    await worker_tunnel_manager.connect(worker_id, websocket)
+    logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel connected.")
+
+    db: Session = next(get_db())
+    try:
+        worker = db.query(Worker).filter(Worker.id == worker_id).first()
+        vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
+        await websocket.send_json(
+            {
+                "type": "init",
+                "worker_id": worker_id,
+                "vram_allocation_pct": vram_pct,
+                "status": "connected",
+                "message": "WebSocket tunnel established with NetworkNebula orchestrator",
+            }
+        )
+
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "heartbeat")
+
+            if msg_type in ("heartbeat", "telemetry"):
+                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
+                if w_record:
+                    w_record.last_heartbeat = datetime.utcnow()
+                    if "vram_used_gb" in data:
+                        w_record.vram_used_gb = float(data["vram_used_gb"])
+                    if "gpu_utilization_pct" in data:
+                        w_record.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                    if "current_task_id" in data:
+                        w_record.current_task_id = data["current_task_id"]
+                        w_record.status = "busy" if data["current_task_id"] else "online"
+                    else:
+                        w_record.status = "online"
+                    db.commit()
+                    db.refresh(w_record)
+                    curr_pct = int(w_record.vram_allocation_pct or 80)
+                else:
+                    curr_pct = 80
+
+                await websocket.send_json(
+                    {
+                        "type": "ack",
+                        "worker_id": worker_id,
+                        "vram_allocation_pct": curr_pct,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+                )
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong", "worker_id": worker_id})
+
+    except WebSocketDisconnect:
+        logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel disconnected.")
+    except Exception as e:
+        logger.warning(f"[WS_TUNNEL] Tunnel error for '{worker_id}': {e}")
+    finally:
+        worker_tunnel_manager.disconnect(worker_id, websocket)
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+@router.websocket("/ws/cluster")
+async def websocket_cluster_telemetry(websocket: WebSocket):
+    """
+    Live WebSocket broadcast stream for Cloud Console fleet monitoring.
+    """
+    await cluster_broadcast_manager.connect(websocket)
+    db: Session = next(get_db())
+    try:
+        workers = (
+            db.query(Worker)
+            .filter(Worker.is_available == True)
+            .order_by(Worker.created_at.asc())
+            .all()
+        )
+        nodes = [serialize_worker_node(w) for w in workers]
+        await websocket.send_json(
+            {
+                "type": "telemetry_snapshot",
+                "active_nodes": len(nodes),
+                "nodes": nodes,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
+
+        while True:
+            text_or_json = await websocket.receive_text()
+            if text_or_json == "ping":
+                await websocket.send_text("pong")
+            elif text_or_json == "refresh":
+                workers = db.query(Worker).filter(Worker.is_available == True).all()
+                nodes = [serialize_worker_node(w) for w in workers]
+                await websocket.send_json(
+                    {
+                        "type": "telemetry_snapshot",
+                        "active_nodes": len(nodes),
+                        "nodes": nodes,
+                    }
+                )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug(f"[WS_CLUSTER] Subscriber disconnected: {e}")
+    finally:
+        cluster_broadcast_manager.disconnect(websocket)
+        try:
+            db.close()
+        except Exception:
+            pass
+

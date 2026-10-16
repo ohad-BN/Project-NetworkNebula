@@ -818,6 +818,11 @@ def list_tasks(
 
 @app.websocket("/ws/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
+    if task_id == "cluster":
+        from app.cluster_worker_router import websocket_cluster_telemetry
+        await websocket_cluster_telemetry(websocket)
+        return
+
     await manager.connect(websocket, task_id)
     try:
         while True:

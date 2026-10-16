@@ -1900,6 +1900,111 @@ def run_tests():
     except Exception as e:
         suite.record(False, "CLI 'set-limit' & 'status' roundtrip", str(e))
 
+    # =========================================================================
+    # Phase 2.3 (Alpha Milestone 2): Real-Time WebSocket Worker Tunnel & NAT Traversal
+    # =========================================================================
+    print_header("Phase 2.3 (Alpha Milestone 2): Real-Time WebSocket Worker Tunnel & NAT Traversal")
+
+    ws_test_worker_id = f"test-ws-node-{uuid.uuid4().hex[:6]}"
+    ws_base = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+
+    # M2.7 WebSocket Worker Tunnel Handshake & Bidirectional Heartbeat
+    try:
+        import asyncio
+        import websockets
+
+        # Pre-register test worker node
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": ws_test_worker_id,
+                "name": "WebSocket-Tunnel-Node",
+                "gpu_info": "NVIDIA GeForce RTX 4070 Laptop GPU",
+                "vram_allocation_pct": 80,
+            },
+        )
+
+        async def _test_m27():
+            async with websockets.connect(f"{ws_base}/ws/worker/{ws_test_worker_id}", open_timeout=5.0) as ws:
+                init_msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                init_ok = (
+                    init_msg.get("type") == "init"
+                    and init_msg.get("worker_id") == ws_test_worker_id
+                    and init_msg.get("vram_allocation_pct") == 80
+                )
+
+                # Send live heartbeat frame over open tunnel
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "heartbeat",
+                            "vram_used_gb": 1.35,
+                            "gpu_utilization_pct": 33.0,
+                        }
+                    )
+                )
+                ack_msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                ack_ok = (
+                    ack_msg.get("type") == "ack"
+                    and ack_msg.get("worker_id") == ws_test_worker_id
+                    and ack_msg.get("vram_allocation_pct") == 80
+                )
+                return init_ok and ack_ok
+
+        m27_res = asyncio.run(_test_m27())
+        suite.record(m27_res, f"WebSocket worker tunnel handshake & heartbeat verified (ws://.../ws/worker/{ws_test_worker_id[:16]}...)")
+    except Exception as e:
+        suite.record(False, "WebSocket worker tunnel handshake", str(e))
+
+    # M2.8 Real-Time Server-Push Configuration Update Down Open WebSocket Tunnel
+    try:
+        async def _test_m28():
+            async with websockets.connect(f"{ws_base}/ws/worker/{ws_test_worker_id}", open_timeout=5.0) as ws:
+                await ws.recv()  # Consume init frame
+
+                # Trigger outside configuration change via REST API
+                p_res = requests.patch(
+                    f"{BASE_URL}/api/v1/workers/{ws_test_worker_id}/config",
+                    json={"vram_allocation_pct": 65},
+                )
+                if p_res.status_code != 200:
+                    return False
+
+                # Receive real-time server-pushed config frame without polling
+                push_msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                return (
+                    push_msg.get("type") == "config_update"
+                    and push_msg.get("worker_id") == ws_test_worker_id
+                    and push_msg.get("vram_allocation_pct") == 65
+                )
+
+        m28_res = asyncio.run(_test_m28())
+        suite.record(m28_res, "Real-time server-push configuration update verified over open WebSocket tunnel (80% -> 65%)")
+    except Exception as e:
+        suite.record(False, "Real-time server-push over WebSocket", str(e))
+
+    # M2.9 Cluster Fleet WebSocket Broadcast Stream & Live Telemetry Ping/Pong
+    try:
+        async def _test_m29():
+            async with websockets.connect(f"{ws_base}/ws/cluster", open_timeout=5.0) as c_ws:
+                snap_msg = json.loads(await asyncio.wait_for(c_ws.recv(), timeout=5.0))
+                snap_ok = (
+                    snap_msg.get("type") == "telemetry_snapshot"
+                    and snap_msg.get("active_nodes", 0) >= 1
+                )
+
+                # Send ping and receive pong
+                await c_ws.send("ping")
+                pong_msg = await asyncio.wait_for(c_ws.recv(), timeout=5.0)
+                return snap_ok and pong_msg == "pong"
+
+        m29_res = asyncio.run(_test_m29())
+        suite.record(m29_res, "Cluster fleet WebSocket broadcast stream verified (snapshot received, ping/pong active)")
+        # Clean up test worker
+        requests.post(f"{BASE_URL}/api/v1/workers/{ws_test_worker_id}/deregister")
+    except Exception as e:
+        suite.record(False, "Cluster fleet WebSocket broadcast", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

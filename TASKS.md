@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 2: Phase 2.2 Complete (Standalone `nebula_worker.py` CLI Agent Active)  
+> **Project Phase:** Alpha Milestone 2: Phase 2.3 Complete (Real-Time WebSocket Worker Tunnel & NAT Traversal Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**108/108 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**111/111 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -14,10 +14,10 @@
 | **Backend API** | FastAPI Orchestrator | ✅ | `http://localhost:8000` | Orchestration, Auth, Training APIs, and OpenAI Gateway |
 | **OpenAI Gateway**| Compatible Serving API | ✅ | `/v1/chat/completions` | Drop-in inference endpoint for enterprise Python/cURL SDKs |
 | **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/enterprise_training_router.py` | Multi-GPU LoRA/QLoRA fine-tuning, loss telemetry, S3 checkpoints |
-| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI worker agent with 10%–100% GPU contribution control |
+| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI & WebSocket tunnel (`/ws/worker/{id}`) with 10%–100% GPU limit |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **108/108 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **111/111 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -139,10 +139,11 @@
 - [x] Added `--once` deterministic execution mode and `--json` output for automated testing & quick PowerShell verification alongside continuous daemon mode
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.2 assertions (`M2.4` hardware discovery & CUDA fraction, `M2.5` CLI `join --once`, `M2.6` CLI `set-limit` & `status` roundtrip) (**108/108 passed — 100%**)
 
-### 📋 Phase 2.3: Real-Time WebSocket Worker Tunnel & NAT Traversal
-- [ ] Implement `WS /ws/worker/{worker_id}` bidirectional tunnel in [`app/cluster_worker_router.py`](app/cluster_worker_router.py) for firewall-friendly outbound worker heartbeats and instant server-pushed `vram_allocation_pct` config updates
-- [ ] Implement `WS /ws/cluster` live broadcast stream for connected Cloud Console clients
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.3 assertions (`M2.7`, `M2.8`, `M2.9`) and verify 100% pass
+### ✅ Phase 2.3: Real-Time WebSocket Worker Tunnel & NAT Traversal (COMPLETED)
+- [x] Implemented `WS /ws/worker/{worker_id}` bidirectional tunnel in [`app/cluster_worker_router.py`](app/cluster_worker_router.py) with initial handshake frame, live telemetry heartbeats, and instant server-pushed `vram_allocation_pct` config updates without polling
+- [x] Implemented `WS /ws/cluster` live broadcast stream for connected Cloud Console clients emitting snapshot frames and handling ping/pong
+- [x] Connected [`nebula_worker.py`](nebula_worker.py) with `--tunnel` support via `run_websocket_tunnel()`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.3 assertions (`M2.7` tunnel handshake & heartbeat, `M2.8` real-time server-push config update down open tunnel, `M2.9` cluster telemetry broadcast & ping/pong) (**111/111 passed — 100%**)
 
 ### 📋 Phase 2.4: Dynamic Task Routing, SLA Accounting & Automated Worker Earnings
 - [ ] Wire `execute_training_job` and `serve_inference_request` in [`app/worker.py`](app/worker.py) to credit completed tasks and USD compute earnings (`WORKER_SHARE = 0.70`) to the active `Worker` node and owner `User` wallet (`TransactionType.EARNING`)
