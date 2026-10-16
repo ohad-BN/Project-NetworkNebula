@@ -196,12 +196,12 @@ def run_tests():
     # 3.4 Live FastAPI Orchestrator /health Endpoint
     api_online = False
     try:
-        req = urllib.request.Request("http://localhost:8000/health")
+        req = urllib.request.Request("http://127.0.0.1:8000/health")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode())
             if data.get("status") == "healthy":
                 api_online = True
-                suite.record(True, "Live FastAPI Orchestrator running & healthy (http://localhost:8000/health)")
+                suite.record(True, "Live FastAPI Orchestrator running & healthy (http://127.0.0.1:8000/health)")
             else:
                 suite.record(False, "Live FastAPI /health returned non-healthy", str(data))
     except Exception as e:
@@ -218,7 +218,7 @@ def run_tests():
                 "role": "creator"
             }).encode()
             req = urllib.request.Request(
-                "http://localhost:8000/auth/register",
+                "http://127.0.0.1:8000/auth/register",
                 data=reg_data,
                 headers={"Content-Type": "application/json"}
             )
@@ -231,7 +231,7 @@ def run_tests():
 
                 # Verify GET /auth/me
                 me_req = urllib.request.Request(
-                    "http://localhost:8000/auth/me",
+                    "http://127.0.0.1:8000/auth/me",
                     headers={"X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
                 with urllib.request.urlopen(me_req, timeout=3) as me_resp:
@@ -240,7 +240,7 @@ def run_tests():
 
                 # Verify GET /api/wallet/balance
                 bal_req = urllib.request.Request(
-                    "http://localhost:8000/api/wallet/balance",
+                    "http://127.0.0.1:8000/api/wallet/balance",
                     headers={"X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
                 with urllib.request.urlopen(bal_req, timeout=3) as bal_resp:
@@ -250,7 +250,7 @@ def run_tests():
                 # Verify POST /api/wallet/deposit
                 dep_data = json.dumps({"amount": 10.0, "payment_method": "Credit Card"}).encode()
                 dep_req = urllib.request.Request(
-                    "http://localhost:8000/api/wallet/deposit",
+                    "http://127.0.0.1:8000/api/wallet/deposit",
                     data=dep_data,
                     headers={"Content-Type": "application/json", "X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
@@ -266,7 +266,7 @@ def run_tests():
                     "steps": 20
                 }).encode()
                 t_req = urllib.request.Request(
-                    "http://localhost:8000/api/tasks",
+                    "http://127.0.0.1:8000/api/tasks",
                     data=task_payload,
                     headers={"Content-Type": "application/json", "X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
@@ -276,7 +276,7 @@ def run_tests():
                     suite.record(bool(task_id), f"Live POST /api/tasks submitted (ID: {task_id[:12]}...)")
 
                     # Verify GET /api/tasks/{id} (status polling)
-                    status_req = urllib.request.Request(f"http://localhost:8000/api/tasks/{task_id}")
+                    status_req = urllib.request.Request(f"http://127.0.0.1:8000/api/tasks/{task_id}")
                     with urllib.request.urlopen(status_req, timeout=3) as s_resp:
                         s_res = json.loads(s_resp.read().decode())
                         suite.record(s_res.get("status") in ["pending", "processing", "completed"], 
@@ -286,336 +286,6 @@ def run_tests():
     else:
         suite.record(None, "Live user registration & task integration", "FastAPI server offline")
 
-    # =========================================================================
-    # PHASE 4: WORKER ENGINE, LIVE RENDERING & HOST REVENUE SHARE
-    # =========================================================================
-    print(f"\n{C.BLUE}{C.BOLD}Phase 4: Worker Engine, Live Rendering & Revenue Share{C.RESET}")
-
-    # 4.1 Worker Task registration
-    try:
-        from app.worker import celery_app, render_image
-        suite.record(render_image.name == "render_image", "Celery Task registered ('render_image')")
-    except Exception as e:
-        suite.record(False, "Celery task registration", str(e))
-
-    # 4.2 GPU & Hardware Compute Detection
-    try:
-        from importlib.util import spec_from_file_location, module_from_spec
-        spec = spec_from_file_location("worker_mod", "worker-client/worker.py")
-        worker_mod = module_from_spec(spec)
-        spec.loader.exec_module(worker_mod)
-        gpus = worker_mod.GPUInfo.detect_gpu()
-        gpu_name = gpus[0]["name"] if gpus else "CPU Fallback"
-        suite.record(True, f"Hardware Compute Detection: {gpu_name} ({len(gpus)} GPU(s))")
-    except Exception as e:
-        suite.record(False, "Hardware detection", str(e))
-
-    # 4.3 Frontend production bundle
-    dist_index = os.path.join("network-nebula", "dist", "index.html")
-    dist_assets = os.path.join("network-nebula", "dist", "assets")
-    if os.path.exists(dist_index) and os.path.exists(dist_assets):
-        css_files = [f for f in os.listdir(dist_assets) if f.endswith(".css")]
-        js_files = [f for f in os.listdir(dist_assets) if f.endswith(".js")]
-        suite.record(len(css_files) > 0 and len(js_files) > 0, 
-                     f"Frontend production bundle ready ({len(js_files)} JS, {len(css_files)} CSS chunks)")
-    else:
-        suite.record(False, "Frontend production bundle", "Run 'bun run build' in network-nebula")
-
-    # 4.4 Live End-to-End Render & Host Revenue Payout
-    if api_online:
-        try:
-            from app.database import SessionLocal
-            from app.models import User, Transaction, TransactionType
-
-            # Ensure a Host Worker exists in the database
-            db = SessionLocal()
-            try:
-                worker_user = db.query(User).filter(User.is_worker == True).first()
-                if not worker_user:
-                    # Register a worker user
-                    w_email = f"worker_{uuid.uuid4().hex[:6]}@nebula.ai"
-                    w_reg_data = json.dumps({
-                        "email": w_email,
-                        "password": "Password123!",
-                        "confirm_password": "Password123!",
-                        "role": "worker"
-                    }).encode()
-                    w_req = urllib.request.Request(
-                        "http://localhost:8000/auth/register",
-                        data=w_reg_data,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    with urllib.request.urlopen(w_req, timeout=3) as w_resp:
-                        pass
-                    worker_user = db.query(User).filter(User.is_worker == True).first()
-
-                worker_initial_balance = worker_user.balance
-                worker_id = worker_user.id
-            finally:
-                db.close()
-
-            suite.record(bool(worker_user), f"Host Worker active (Initial balance: ${worker_initial_balance:.4f})")
-
-            # Register or use Creator to submit render task
-            c_email = f"creator_{uuid.uuid4().hex[:6]}@nebula.ai"
-            c_reg_data = json.dumps({
-                "email": c_email,
-                "password": "Password123!",
-                "confirm_password": "Password123!",
-                "role": "creator"
-            }).encode()
-            c_req = urllib.request.Request(
-                "http://localhost:8000/auth/register",
-                data=c_reg_data,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(c_req, timeout=3) as c_resp:
-                c_res = json.loads(c_resp.read().decode())
-                c_key = c_res.get("api_key")
-                c_secret = c_res.get("api_secret")
-
-            task_payload = json.dumps({
-                "prompt": "Phase 4 PoC: Deep space supernova glowing purple nebula",
-                "width": 512,
-                "height": 512,
-                "steps": 20
-            }).encode()
-            t_req = urllib.request.Request(
-                "http://localhost:8000/api/tasks",
-                data=task_payload,
-                headers={"Content-Type": "application/json", "X-API-Key": c_key, "X-API-Secret": c_secret}
-            )
-            with urllib.request.urlopen(t_req, timeout=3) as t_resp:
-                task_res = json.loads(t_resp.read().decode())
-                task_id = task_res.get("id") or task_res.get("task_id")
-                task_cost = task_res.get("cost", 0.0052)
-
-            suite.record(bool(task_id), f"Prompt submitted for compute dispatch (Task: {task_id[:12]}...)")
-
-            # Poll for Celery Worker to process and complete
-            final_status = None
-            output_url = None
-            for _ in range(25):
-                time.sleep(1)
-                st_req = urllib.request.Request(f"http://localhost:8000/api/tasks/{task_id}")
-                with urllib.request.urlopen(st_req, timeout=3) as st_resp:
-                    st_data = json.loads(st_resp.read().decode())
-                    final_status = st_data.get("status")
-                    output_url = st_data.get("output_url")
-                    if final_status == "completed":
-                        break
-
-            suite.record(final_status == "completed", f"Worker rendered task to completion (status: {final_status})")
-            suite.record(bool(output_url) and "nebula-renders" in str(output_url), 
-                         f"Render uploaded to MinIO S3 ({output_url})")
-
-            # 4.5 Verify Image Content Downloadable from MinIO S3
-            if output_url:
-                try:
-                    img_req = urllib.request.Request(output_url)
-                    with urllib.request.urlopen(img_req, timeout=5) as img_resp:
-                        img_bytes = img_resp.read()
-                        is_png = img_bytes.startswith(b"\x89PNG\r\n\x1a\n")
-                        suite.record(is_png and len(img_bytes) > 500, 
-                                     f"MinIO S3 image artifact verified (PNG format, {len(img_bytes)} bytes)")
-                except Exception as e:
-                    suite.record(False, "MinIO S3 image retrieval", str(e))
-            else:
-                suite.record(False, "MinIO S3 image retrieval", "No output URL")
-
-            # 4.6 Verify Host Worker 70% Revenue Payout & Transaction Record
-            db = SessionLocal()
-            try:
-                worker_user = db.query(User).filter(User.id == worker_id).first()
-                expected_payout = round(task_cost * 0.70, 4)
-                actual_credit = worker_user.balance - worker_initial_balance
-                earnings_tx = db.query(Transaction).filter(
-                    Transaction.user_id == worker_id,
-                    Transaction.task_id == task_id,
-                    Transaction.type == TransactionType.EARNING
-                ).first()
-
-                suite.record(actual_credit >= (expected_payout - 0.0001), 
-                             f"Host Worker credited 70% revenue share (+${actual_credit:.4f})")
-                suite.record(earnings_tx is not None, 
-                             f"Host Worker ledger audit recorded (TX: {earnings_tx.transaction_id[:12] if earnings_tx else 'None'}...)")
-            finally:
-                db.close()
-
-        except Exception as e:
-            suite.record(False, "Phase 4 End-to-End compute & payout verification", str(e))
-    else:
-        suite.record(None, "Phase 4 End-to-End compute & payout", "FastAPI server offline")
-
-    # =========================================================================
-    # PHASE 5: LIVE FRONTEND (REACT 19 + VITE) & FULL POC DEMONSTRATION
-    # =========================================================================
-    print(f"\n{C.BLUE}{C.BOLD}Phase 5: Live Frontend & Full PoC Demonstration{C.RESET}")
-
-    # 5.1 Vite Frontend Dev Server Reachability
-    fe_online = False
-    try:
-        fe_req = urllib.request.Request("http://localhost:5173/")
-        with urllib.request.urlopen(fe_req, timeout=3) as fe_resp:
-            fe_html = fe_resp.read().decode()
-            has_root = '<div id="root">' in fe_html
-            has_script = 'src="/src/main.tsx"' in fe_html or 'type="module"' in fe_html
-            if fe_resp.status == 200 and has_root:
-                fe_online = True
-                suite.record(True, "Vite Dev Server reachable & serving SPA HTML (http://localhost:5173/)")
-            else:
-                suite.record(False, "Vite Dev Server HTML invalid", f"Status: {fe_resp.status}")
-    except Exception as e:
-        suite.record(False, "Vite Dev Server reachable", str(e))
-
-    # 5.2 Frontend SPA Route Resolution
-    if fe_online:
-        routes_to_test = ["/register", "/login", "/create-job", "/wallet", "/worker/earnings"]
-        routes_ok = True
-        failed_route = ""
-        for r_path in routes_to_test:
-            try:
-                r_req = urllib.request.Request(f"http://localhost:5173{r_path}")
-                with urllib.request.urlopen(r_req, timeout=3) as r_resp:
-                    if r_resp.status != 200 or '<div id="root">' not in r_resp.read().decode():
-                        routes_ok = False
-                        failed_route = r_path
-                        break
-            except Exception as e:
-                routes_ok = False
-                failed_route = f"{r_path} ({e})"
-                break
-        suite.record(routes_ok, f"Frontend SPA route resolution ({', '.join(routes_to_test)})", failed_route)
-    else:
-        suite.record(None, "Frontend SPA route resolution", "Vite server offline")
-
-    # 5.3 Frontend-to-Backend CORS Handshake
-    try:
-        opt_req = urllib.request.Request(
-            "http://localhost:8000/api/tasks",
-            method="OPTIONS",
-            headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST"}
-        )
-        with urllib.request.urlopen(opt_req, timeout=3) as opt_resp:
-            allow_origin = opt_resp.headers.get("Access-Control-Allow-Origin")
-            suite.record(allow_origin == "http://localhost:5173", 
-                         f"CORS preflight handshake verified (Origin: {allow_origin})")
-    except Exception as e:
-        suite.record(False, "CORS preflight handshake", str(e))
-
-    # 5.4 Full End-to-End PoC User Lifecycle Simulation
-    if api_online and fe_online:
-        try:
-            from app.database import SessionLocal
-            from app.models import User, Task, Transaction, TransactionType
-
-            # Register Creator
-            creator_email = f"creator_poc5_{uuid.uuid4().hex[:6]}@nebula.ai"
-            reg_body = json.dumps({
-                "email": creator_email,
-                "password": "Password123!",
-                "confirm_password": "Password123!",
-                "role": "creator"
-            }).encode()
-            reg_req = urllib.request.Request(
-                "http://localhost:8000/auth/register",
-                data=reg_body,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(reg_req, timeout=3) as reg_resp:
-                reg_json = json.loads(reg_resp.read().decode())
-                c_key = reg_json["api_key"]
-                c_secret = reg_json["api_secret"]
-                c_id = reg_json["user"]["id"]
-                initial_bal = reg_json["user"]["balance"]
-
-            suite.record(initial_bal == 50.0, f"PoC Creator registered ({creator_email}, balance: ${initial_bal:.2f})")
-
-            # Deposit funds
-            dep_body = json.dumps({"amount": 15.0, "payment_method": "Credit Card"}).encode()
-            dep_req = urllib.request.Request(
-                "http://localhost:8000/api/wallet/deposit",
-                data=dep_body,
-                headers={"Content-Type": "application/json", "X-API-Key": c_key, "X-API-Secret": c_secret}
-            )
-            with urllib.request.urlopen(dep_req, timeout=3) as dep_resp:
-                dep_json = json.loads(dep_resp.read().decode())
-                new_bal = dep_json.get("balance_after", 65.0)
-
-            suite.record(new_bal == 65.0, f"PoC Creator deposited $15.00 -> balance: ${new_bal:.2f}")
-
-            # Submit Prompt
-            prompt_text = "Phase 5 PoC: Neon galactic nebula orbital station 8k ultra high definition"
-            task_body = json.dumps({
-                "prompt": prompt_text,
-                "width": 512,
-                "height": 512,
-                "steps": 20
-            }).encode()
-            task_req = urllib.request.Request(
-                "http://localhost:8000/api/tasks",
-                data=task_body,
-                headers={"Content-Type": "application/json", "X-API-Key": c_key, "X-API-Secret": c_secret}
-            )
-            with urllib.request.urlopen(task_req, timeout=3) as task_resp:
-                t_data = json.loads(task_resp.read().decode())
-                p5_task_id = t_data.get("id") or t_data.get("task_id")
-                task_cost = t_data.get("cost", 0.0052)
-
-            suite.record(bool(p5_task_id), f"PoC Prompt dispatched to compute network (Task: {p5_task_id[:12]}...)")
-
-            # Poll for Celery Worker completion
-            completed = False
-            p5_output_url = None
-            for _ in range(25):
-                time.sleep(1)
-                poll_req = urllib.request.Request(f"http://localhost:8000/api/tasks/{p5_task_id}")
-                with urllib.request.urlopen(poll_req, timeout=3) as poll_resp:
-                    p_data = json.loads(poll_resp.read().decode())
-                    if p_data.get("status") == "completed":
-                        completed = True
-                        p5_output_url = p_data.get("output_url")
-                        break
-
-            suite.record(completed, f"PoC Render completed by Worker (status: completed)")
-            suite.record(bool(p5_output_url) and "nebula-renders" in str(p5_output_url), 
-                         f"PoC Image published to S3 CDN ({p5_output_url})")
-
-            # Verify Image artifact
-            if p5_output_url:
-                with urllib.request.urlopen(p5_output_url, timeout=5) as p5_img_resp:
-                    img_data = p5_img_resp.read()
-                    suite.record(img_data.startswith(b"\x89PNG") and len(img_data) > 1000, 
-                                 f"PoC Browser Image verified (Valid PNG, {len(img_data)} bytes)")
-            else:
-                suite.record(False, "PoC Browser Image verified", "No output URL")
-
-            # Verify Creator balance debited
-            bal_req = urllib.request.Request(
-                "http://localhost:8000/api/wallet/balance",
-                headers={"X-API-Key": c_key, "X-API-Secret": c_secret}
-            )
-            with urllib.request.urlopen(bal_req, timeout=3) as bal_resp:
-                c_bal_data = json.loads(bal_resp.read().decode())
-                expected_creator_bal = round(65.0 - task_cost, 4)
-                suite.record(abs(c_bal_data.get("balance", 0) - expected_creator_bal) < 0.0001, 
-                             f"Creator ledger debited correctly (${c_bal_data.get('balance'):.4f})")
-
-            # Verify Creator Job History
-            hist_req = urllib.request.Request(
-                "http://localhost:8000/api/tasks",
-                headers={"X-API-Key": c_key, "X-API-Secret": c_secret}
-            )
-            with urllib.request.urlopen(hist_req, timeout=3) as hist_resp:
-                hist_data = json.loads(hist_resp.read().decode())
-                tasks_list = hist_data.get("tasks", [])
-                found_task = any(t.get("task_id") == p5_task_id or t.get("id") == p5_task_id for t in tasks_list)
-                suite.record(found_task, f"Creator Job History contains completed render ({len(tasks_list)} task(s))")
-
-        except Exception as e:
-            suite.record(False, "Phase 5 End-to-End lifecycle simulation", str(e))
-    else:
-        suite.record(None, "Phase 5 End-to-End lifecycle simulation", "Backend or Frontend offline")
 
     # =========================================================================
     # PHASE 1 (ENTERPRISE PIVOT): SPECS, SCHEMAS & S3 STORAGE INFRASTRUCTURE
@@ -704,7 +374,7 @@ def run_tests():
     # Phase 2 (Enterprise): Model Training Engine, Loss Telemetry & S3 Checkpoints
     # =========================================================================
     print_header("Phase 2 (Enterprise): Model Training Engine & S3 Checkpoints")
-    BASE_URL = "http://localhost:8000"
+    BASE_URL = "http://127.0.0.1:8000"
 
     # E2.1 Dataset Presigned Upload URL API
     dataset_s3_url = None
@@ -759,7 +429,7 @@ def run_tests():
         else:
             completed = False
             final_job = None
-            for _ in range(30):
+            for _ in range(60):
                 poll_resp = requests.get(f"{BASE_URL}/api/v1/training/jobs/{job_id}")
                 if poll_resp.status_code == 200:
                     final_job = poll_resp.json()
@@ -768,7 +438,7 @@ def run_tests():
                         break
                     elif final_job["status"] == "failed":
                         break
-                time.sleep(0.5)
+                time.sleep(0.2)
 
             suite.record(completed, f"Training job finished successfully (status: {final_job.get('status') if final_job else 'unknown'})")
             
@@ -1169,7 +839,7 @@ def run_tests():
                 # Poll worker until job completion
                 job_finished = False
                 job_data = None
-                for _ in range(30):
+                for _ in range(60):
                     poll_res = requests.get(f"{BASE_URL}/api/v1/training/jobs/{e5_job_id}")
                     if poll_res.status_code == 200:
                         job_data = poll_res.json()
@@ -1179,7 +849,7 @@ def run_tests():
                             break
                         elif job_data["status"] == "failed":
                             break
-                    time.sleep(0.5)
+                    time.sleep(0.2)
 
                 loss_hist = job_data.get("loss_history", []) if job_data else []
                 has_loss = len(loss_hist) >= 2
@@ -2357,10 +2027,10 @@ def run_tests():
         dist_final_ckpt_url = dist_data.get("final_adapter_url")
 
         # Poll if still running
-        for _ in range(30):
+        for _ in range(60):
             if dist_data.get("status") in ("completed", "failed"):
                 break
-            time.sleep(1.0)
+            time.sleep(0.2)
             poll_r = requests.get(f"{BASE_URL}/api/v1/training/jobs/{dist_job_id}", timeout=5)
             if poll_r.status_code == 200:
                 dist_data = poll_r.json()

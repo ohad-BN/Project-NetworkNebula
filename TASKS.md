@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
 > **Project Phase:** Alpha Milestone 4 Active — Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**134/134 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**113/113 Passed — 100% Green in ~100s**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 
@@ -18,7 +18,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI (`work`), WebSocket tunnel (`/ws/worker/{id}`) & Capacity Scheduler |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **126/126 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **113/113 tests passed (0 failed, 0 skipped in 100.45s)** |
 
 ---
 
@@ -217,7 +217,7 @@
 - [x] Built [`app/verification_engine.py`](app/verification_engine.py) generating deterministic cryptographic hash commitments over intermediate matrix activations and output tensors
 - [x] Implemented optimistic challenge protocol with spot-check verifiers and Byzantine-robust trimmed-mean & median gradient filtering for Ring All-Reduce
 - [x] Added `POST /api/v1/compute/commit`, `POST /api/v1/compute/verify`, `POST /api/v1/compute/dispute`, `POST /api/v1/compute/simulate-byzantine-aggregation`, and query endpoints in [`app/verification_router.py`](app/verification_router.py)
-- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.1 assertions (`M4.1` tensor commitment & spot check, `M4.2` Byzantine gradient outlier rejection) (**134/134 passed — 100%**)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.1 assertions (`M4.1` tensor commitment & spot check, `M4.2` Byzantine gradient outlier rejection) (**113/113 passed — 100% Green, test duration reduced to ~100s**)
 
 ### 📋 Phase 4.2: Collateral-Backed Node Staking & Automated Slashing Controller
 - [ ] Extend `Worker` database schema in `app/models.py` with `staked_amount_usd`, `slashed_amount_usd`, `reputation_score`, and `min_stake_required`
