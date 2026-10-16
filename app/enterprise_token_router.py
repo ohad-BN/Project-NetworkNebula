@@ -86,6 +86,20 @@ def create_api_token(
     db.commit()
     db.refresh(new_token)
 
+    try:
+        from app.metrics_service import record_audit_log
+        record_audit_log(
+            db=db,
+            event_type="TOKEN_CREATED",
+            severity="info",
+            action=f"Provisioned API token '{payload.name}'",
+            actor_id=str(current_user.id),
+            target_id=new_token.id,
+            details={"token_prefix": token_prefix, "scopes": payload.scopes, "rate_limit_rpm": new_token.rate_limit_rpm},
+        )
+    except Exception:
+        pass
+
     return TokenCreatedResponse(
         id=new_token.id,
         name=new_token.name,
@@ -145,4 +159,19 @@ def revoke_api_token(
 
     token.is_active = False
     db.commit()
+
+    try:
+        from app.metrics_service import record_audit_log
+        record_audit_log(
+            db=db,
+            event_type="TOKEN_REVOKED",
+            severity="warning",
+            action=f"Revoked API token '{token.name}'",
+            actor_id=str(current_user.id),
+            target_id=token.id,
+            details={"token_prefix": token.token_prefix, "name": token.name},
+        )
+    except Exception:
+        pass
+
     return {"status": "revoked", "token_id": token_id}

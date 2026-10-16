@@ -3049,6 +3049,141 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Sovereign region constraint & geo-fencing", str(e))
 
+    # =========================================================================
+    # Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability
+    # =========================================================================
+    print_header("Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability")
+
+    # M4.7 Prometheus /metrics Real-Time GPU & Token Telemetry Export
+    try:
+        # 1. Scrape GET /metrics
+        prom_res = requests.get(f"{BASE_URL}/metrics", timeout=5)
+        prom_ok = prom_res.status_code == 200
+        prom_text = prom_res.text
+
+        # Validate standard Prometheus text exposition headers and metric types
+        has_prom_format = (
+            "text/plain" in prom_res.headers.get("content-type", "")
+            and "# HELP nebula_cluster_nodes_total" in prom_text
+            and "# TYPE nebula_cluster_nodes_total gauge" in prom_text
+            and "# HELP nebula_inference_tokens_total" in prom_text
+            and "# TYPE nebula_inference_tokens_total counter" in prom_text
+            and "# HELP nebula_request_latency_ms" in prom_text
+            and 'quantile="0.5"' in prom_text
+            and 'quantile="0.95"' in prom_text
+            and 'quantile="0.99"' in prom_text
+        )
+
+        # 2. Query GET /api/v1/metrics/summary for real-time JSON dashboard telemetry
+        sum_res = requests.get(f"{BASE_URL}/api/v1/metrics/summary", timeout=5)
+        sum_ok = sum_res.status_code == 200
+        sum_data = sum_res.json() if sum_ok else {}
+
+        has_summary_fields = (
+            sum_data.get("status") == "healthy"
+            and sum_data.get("sla_target_uptime_pct") == 99.9
+            and "fleet" in sum_data
+            and "total_nodes" in sum_data["fleet"]
+            and "latency_quantiles_ms" in sum_data
+            and "p50" in sum_data["latency_quantiles_ms"]
+            and "p95" in sum_data["latency_quantiles_ms"]
+            and "p99" in sum_data["latency_quantiles_ms"]
+            and "throughput" in sum_data
+            and "tokens_generated_total" in sum_data["throughput"]
+            and "governance" in sum_data
+        )
+
+        m4_7_ok = prom_ok and has_prom_format and sum_ok and has_summary_fields
+        suite.record(
+            m4_7_ok,
+            f"Prometheus /metrics & SLA telemetry export verified (p50: {sum_data.get('latency_quantiles_ms', {}).get('p50')}ms, p95: {sum_data.get('latency_quantiles_ms', {}).get('p95')}ms, tokens: {sum_data.get('throughput', {}).get('tokens_generated_total')}, SLA target: {sum_data.get('sla_target_uptime_pct')}%)"
+        )
+    except Exception as e:
+        suite.record(False, "Prometheus /metrics Real-Time GPU & Token Telemetry Export", str(e))
+
+    # M4.8 Immutable Enterprise Audit Log & Request Tracing Headers
+    try:
+        # 1. Verify distributed tracing headers across gateway responses
+        probe_res = requests.get(f"{BASE_URL}/api/v1/metrics/summary", timeout=5)
+        trace_id = probe_res.headers.get("X-Nebula-Trace-ID")
+        node_id = probe_res.headers.get("X-Nebula-Node-ID")
+        latency_hdr = probe_res.headers.get("X-Nebula-Latency-Ms")
+
+        has_tracing_headers = (
+            bool(trace_id)
+            and trace_id.startswith("nebula-trc-")
+            and bool(node_id)
+            and bool(latency_hdr)
+            and float(latency_hdr) >= 0.0
+        )
+
+        # 2. Record a custom security/governance audit log entry via POST /api/v1/audit/logs
+        audit_payload = {
+            "event_type": "SECURITY_POLICY_UPDATE",
+            "action": "Updated rate limit rule for enterprise tenant tier",
+            "severity": "info",
+            "actor_id": "admin-sec-ops",
+            "target_id": "policy-rl-99",
+            "details": {"max_rpm": 500, "region_restriction": "global"},
+        }
+        create_audit_res = requests.post(f"{BASE_URL}/api/v1/audit/logs", json=audit_payload, timeout=5)
+        create_audit_ok = create_audit_res.status_code == 201
+        created_log = create_audit_res.json().get("log", {}) if create_audit_ok else {}
+
+        # 3. Query audit trail with filters: GET /api/v1/audit/logs?event_type=SECURITY_POLICY_UPDATE
+        query_audit_res = requests.get(
+            f"{BASE_URL}/api/v1/audit/logs",
+            params={"event_type": "SECURITY_POLICY_UPDATE", "limit": 10},
+            timeout=5,
+        )
+        query_audit_ok = query_audit_res.status_code == 200
+        query_data = query_audit_res.json() if query_audit_ok else {}
+        matching_logs = query_data.get("logs", [])
+        found_created = any(l.get("log_id") == created_log.get("log_id") for l in matching_logs)
+
+        # 4. Verify token creation automatically emits audit log
+        tok_gen = requests.post(
+            f"{BASE_URL}/api/v1/tokens",
+            json={"name": f"Audit-Token-{uuid.uuid4().hex[:6]}", "scopes": "training,inference", "rate_limit_rpm": 60},
+            timeout=5,
+        )
+        tok_data = tok_gen.json() if tok_gen.status_code == 201 else {}
+        test_tok_id = tok_data.get("id")
+
+        # Query audit trail for TOKEN_CREATED
+        tok_audit_res = requests.get(
+            f"{BASE_URL}/api/v1/audit/logs",
+            params={"event_type": "TOKEN_CREATED", "target_id": test_tok_id},
+            timeout=5,
+        )
+        tok_audit_ok = tok_audit_res.status_code == 200 and tok_audit_res.json().get("total_count", 0) >= 1
+
+        # Revoke token and verify TOKEN_REVOKED log
+        if test_tok_id:
+            requests.delete(f"{BASE_URL}/api/v1/tokens/{test_tok_id}", timeout=5)
+            revoke_audit_res = requests.get(
+                f"{BASE_URL}/api/v1/audit/logs",
+                params={"event_type": "TOKEN_REVOKED", "target_id": test_tok_id},
+                timeout=5,
+            )
+            revoke_audit_ok = revoke_audit_res.status_code == 200 and revoke_audit_res.json().get("total_count", 0) >= 1
+        else:
+            revoke_audit_ok = False
+
+        m4_8_ok = (
+            has_tracing_headers
+            and create_audit_ok
+            and found_created
+            and tok_audit_ok
+            and revoke_audit_ok
+        )
+        suite.record(
+            m4_8_ok,
+            f"Immutable Enterprise Audit Log & Request Tracing verified (Trace ID: {trace_id}, Node: {node_id}, Latency: {latency_hdr}ms, Custom Audit Log: {created_log.get('log_id')}, Token Creation Audit: {tok_audit_ok}, Token Revocation Audit: {revoke_audit_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Immutable Enterprise Audit Log & Request Tracing Headers", str(e))
+
     return suite.summary()
 
 

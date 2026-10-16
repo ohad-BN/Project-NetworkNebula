@@ -101,6 +101,20 @@ class StakingEngine:
         db.commit()
         db.refresh(worker)
 
+        try:
+            from app.metrics_service import record_audit_log
+            record_audit_log(
+                db=db,
+                event_type="COLLATERAL_DEPOSIT",
+                action=f"Staked ${amount_usd:.2f} USD on worker {worker.id}",
+                actor_id=owner_id,
+                target_id=worker.id,
+                severity="info",
+                details={"amount_usd": amount_usd, "total_staked": worker.staked_amount_usd},
+            )
+        except Exception:
+            pass
+
         return {
             "status": "staked",
             "worker_id": worker.id,
@@ -162,6 +176,20 @@ class StakingEngine:
 
         db.commit()
         db.refresh(worker)
+
+        try:
+            from app.metrics_service import record_audit_log
+            record_audit_log(
+                db=db,
+                event_type="COLLATERAL_UNSTAKE",
+                action=f"Unstaked ${amount_usd:.2f} USD from worker {worker.id}",
+                actor_id=user_id or worker.user_id,
+                target_id=worker.id,
+                severity="info",
+                details={"amount_usd": amount_usd, "remaining_stake": worker.staked_amount_usd},
+            )
+        except Exception:
+            pass
 
         return {
             "status": "unstaked",
@@ -282,6 +310,27 @@ class StakingEngine:
 
         db.commit()
         db.refresh(worker)
+
+        try:
+            from app.metrics_service import record_audit_log
+            record_audit_log(
+                db=db,
+                event_type="STAKING_SLASH",
+                action=f"Slashed {penalty_pct}% (${slashed_amount:.2f} USD) on worker {worker.id}: {reason}",
+                actor_id="system",
+                target_id=worker.id,
+                severity="critical" if penalty_pct >= 100.0 else "warning",
+                details={
+                    "penalty_pct": penalty_pct,
+                    "slashed_amount_usd": slashed_amount,
+                    "remaining_stake_usd": worker.staked_amount_usd,
+                    "reason": reason,
+                    "victim_user_id": victim_user_id,
+                    "compensation_credited_usd": compensation_credited,
+                },
+            )
+        except Exception:
+            pass
 
         logger.warning(
             f"[SLASH] Node {worker.id} slashed ${slashed_amount:.4f} ({penalty_pct}%) | "

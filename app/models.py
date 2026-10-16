@@ -198,3 +198,19 @@ class ApiToken(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_used_at = Column(DateTime(timezone=True), nullable=True)
 
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    log_id = Column(String(36), unique=True, nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    severity = Column(String(16), default="info", nullable=False)
+    actor_id = Column(String(36), nullable=True, index=True)
+    target_id = Column(String(255), nullable=True, index=True)
+    action = Column(String(255), nullable=False)
+    details = Column(Text, default="{}", nullable=False)
+    ip_address = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+

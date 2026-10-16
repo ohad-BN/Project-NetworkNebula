@@ -1,5 +1,6 @@
 import json
 import random
+import time
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -9,6 +10,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -49,6 +51,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def nebula_distributed_tracing_middleware(request: Request, call_next):
+    """
+    Distributed request tracing & Prometheus telemetry middleware (Phase 4.4).
+    Injects X-Nebula-Trace-ID, X-Nebula-Node-ID, and X-Nebula-Latency-Ms headers
+    on every gateway response and updates latency percentiles.
+    """
+    start_time = time.time()
+    trace_id = request.headers.get("X-Nebula-Trace-ID") or f"nebula-trc-{uuid.uuid4().hex[:16]}"
+    node_id = getattr(settings, "NODE_ID", "nebula-gateway-us-east-1")
+
+    response = await call_next(request)
+
+    duration_ms = (time.time() - start_time) * 1000.0
+    response.headers["X-Nebula-Trace-ID"] = trace_id
+    response.headers["X-Nebula-Node-ID"] = str(node_id)
+    response.headers["X-Nebula-Latency-Ms"] = f"{duration_ms:.2f}"
+
+    try:
+        from app.metrics_service import metrics_service
+        metrics_service.record_request_latency(
+            endpoint=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        pass
+
+    return response
 
 PRICING_RATE = 0.001
 WORKER_SHARE = 0.70
@@ -1064,3 +1098,8 @@ app.include_router(verification_router)
 from app.staking_router import router as staking_router
 
 app.include_router(staking_router)
+
+# Include Enterprise Telemetry & Prometheus Observability Router (Alpha Milestone 4)
+from app.metrics_router import router as metrics_router
+
+app.include_router(metrics_router)

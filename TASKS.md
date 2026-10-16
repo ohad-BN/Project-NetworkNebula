@@ -232,11 +232,12 @@
 - [x] Upgraded [`nebula_worker.py`](nebula_worker.py) CLI agent with `--region` flag, automated RTT latency ping estimation, and `ping` diagnostic subcommand
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.3 assertions (`M4.5` latency-aware peer grouping & telemetry aggregation, `M4.6` sovereign geo-fencing enforcement) (**117/117 passed — 100%**)
 
-### 📋 Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability
-- [ ] Build `app/metrics_service.py` exporting standardized Prometheus `/metrics` (GPU utilization, active VRAM, token throughput, latency p50/p95/p99, active shards, slashing events)
-- [ ] Inject distributed tracing headers (`X-Nebula-Trace-ID`, `X-Nebula-Node-ID`, `X-Nebula-Latency-Ms`) across all gateway endpoints
-- [ ] Add immutable `AuditLog` table in `app/models.py` capturing security events, token revocations, and staking penalties
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.4 assertions (`M4.7` Prometheus `/metrics` verification, `M4.8` request tracing & immutable audit logging)
+### ✅ Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability (COMPLETED)
+- [x] Built [`app/metrics_service.py`](app/metrics_service.py) exporting standardized Prometheus format at `/metrics` (uptime, GPU utilization, active VRAM bytes, token throughput, p50/p95/p99 latency quantiles, active shards, slashing events) and high-level JSON summary at `GET /api/v1/metrics/summary`
+- [x] Injected distributed request tracing middleware in [`app/main.py`](app/main.py) returning `X-Nebula-Trace-ID`, `X-Nebula-Node-ID`, and `X-Nebula-Latency-Ms` across all gateway responses
+- [x] Added immutable `AuditLog` table in [`app/models.py`](app/models.py) and exposed `GET/POST /api/v1/audit/logs` with query filtering by event type, severity, actor, and target in [`app/metrics_router.py`](app/metrics_router.py)
+- [x] Hooked audit logging into collateral deposits/unstakes and slashing penalties in [`app/staking_engine.py`](app/staking_engine.py), and API token generation and revocation in [`app/enterprise_token_router.py`](app/enterprise_token_router.py)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.4 assertions (`M4.7` Prometheus `/metrics` verification, `M4.8` request tracing & immutable audit logging) (**119/119 passed — 100% Green in 106.86s**)
 
 ### 📋 Phase 4.5: React 19 Executive Observability & Governance Cockpit
 - [ ] Upgrade **GPU Fleet Page** (`network-nebula/src/pages/cluster-status.tsx`) with node collateral stake badges, geographic region tags, and latency heatmaps
