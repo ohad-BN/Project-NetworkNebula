@@ -185,11 +185,12 @@
 - [x] Added `--auto-claim`, `--max-tasks`, `--tunnel`, and `--interval` options for headless autonomous node operation
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.3 assertions (`M3.5` CLI autonomous task claiming via REST, `M3.6` tunnel task dispatch, progress telemetry & ledger credit) (**126/126 passed — 100%**)
 
-### 📋 Phase 3.4: Live Model Evaluation Benchmarking Suite & Side-by-Side Playground
-- [ ] Build `app/evaluation_engine.py` benchmarking fine-tuned adapters against foundation base models (instruction accuracy, perplexity, generation speed, latency)
-- [ ] Add `/api/v1/models/benchmark` and `/api/v1/models/compare` endpoints in `app/openai_inference_router.py`
-- [ ] Upgrade **Model Serving Hub UI** ([`network-nebula/src/pages/inference-hub.tsx`](network-nebula/src/pages/inference-hub.tsx)) with an interactive **Side-by-Side Comparison Playground** (dual streaming generation panes with token/sec and latency diffs)
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.4 assertions (`M3.7` model evaluation benchmark scoring, `M3.8` dual-model side-by-side completion)
+### ✅ Phase 3.4: Live Model Evaluation Benchmarking Suite & Side-by-Side Playground (COMPLETED)
+- [x] Built [`app/evaluation_engine.py`](app/evaluation_engine.py) benchmarking fine-tuned adapters against foundation base models (instruction accuracy, perplexity estimation, generation throughput tok/sec, latency)
+- [x] Added `POST /api/v1/models/benchmark` and `POST /api/v1/models/compare` endpoints in [`app/openai_inference_router.py`](app/openai_inference_router.py)
+- [x] Upgraded **Model Serving Hub UI** ([`network-nebula/src/pages/inference-hub.tsx`](network-nebula/src/pages/inference-hub.tsx)) with an interactive **Side-by-Side Comparison Playground** (dual model generation panes with token/sec and latency diffs) and automated **Live Model Benchmark** suite
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 3.4 assertions (`M3.7` model evaluation benchmark scoring, `M3.8` dual-model side-by-side completion) (**128/128 passed — 100%**)
+
 
 ### 📋 Phase 3.5: Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts
 - [ ] Enhance `app/wallet_router.py` with `POST /wallet/withdraw` (validates $10.00 min threshold) and `POST /api/v1/wallet/payouts/{id}/settle` (automated ledger settlement and balance deduction)

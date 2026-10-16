@@ -2646,10 +2646,87 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Autonomous CLI worker task execution over WebSocket tunnel", str(e))
 
+    # =========================================================================
+    # Phase 3.4 (Alpha Milestone 3): Live Model Evaluation Benchmarking & Side-by-Side Playground
+    # =========================================================================
+    print_header("Phase 3.4 (Alpha Milestone 3): Live Model Evaluation Benchmarking & Side-by-Side Playground")
+
+    # M3.7 Live Model Evaluation Benchmarking Suite (Throughput, Latency, Perplexity, Instruction Score)
+    try:
+        from app.evaluation_engine import evaluation_engine
+        eval_res = evaluation_engine.evaluate_model(
+            model_id="Qwen/Qwen2.5-0.5B-Instruct",
+            adapter_url=None,
+            max_tokens=24,
+        )
+
+        has_bench_fields = (
+            eval_res.get("total_prompts_evaluated", 0) >= 2
+            and eval_res.get("avg_tokens_per_sec", 0.0) > 0.0
+            and eval_res.get("avg_latency_ms", 0.0) > 0.0
+            and eval_res.get("avg_perplexity", 0.0) > 0.0
+            and "instruction_accuracy_score" in eval_res
+            and len(eval_res.get("details", [])) >= 2
+        )
+
+        # Also verify HTTP REST endpoint
+        bench_http = requests.post(
+            f"{BASE_URL}/api/v1/models/benchmark",
+            json={"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "max_tokens": 16},
+            timeout=30,
+        )
+        http_ok = bench_http.status_code == 200 and bench_http.json().get("status") == "success"
+
+        m3_7_ok = has_bench_fields and http_ok
+        suite.record(
+            m3_7_ok,
+            f"Live model evaluation benchmark scoring verified (throughput: {eval_res.get('avg_tokens_per_sec')} tok/s, latency: {eval_res.get('avg_latency_ms')}ms, ppl: {eval_res.get('avg_perplexity')}, accuracy: {eval_res.get('instruction_accuracy_score')}%)"
+        )
+    except Exception as e:
+        suite.record(False, "Live model evaluation benchmark scoring", str(e))
+
+    # M3.8 Dual-Model Side-by-Side Comparative Execution & Performance Deltas
+    try:
+        compare_payload = {
+            "prompt": "Explain decentralized peer-to-peer compute in one short sentence.",
+            "model_a": "Qwen/Qwen2.5-0.5B-Instruct",
+            "model_b": "Qwen/Qwen2.5-0.5B-Instruct",
+            "max_tokens": 24,
+            "temperature": 0.5,
+        }
+        cmp_http = requests.post(
+            f"{BASE_URL}/api/v1/models/compare",
+            json=compare_payload,
+            timeout=30,
+        )
+        cmp_ok = cmp_http.status_code == 200
+        cmp_data = cmp_http.json().get("comparison", {}) if cmp_ok else {}
+
+        model_a_data = cmp_data.get("model_a", {})
+        model_b_data = cmp_data.get("model_b", {})
+        comp_summary = cmp_data.get("comparison", {})
+
+        m3_8_ok = (
+            cmp_ok
+            and len(model_a_data.get("content", "")) > 0
+            and len(model_b_data.get("content", "")) > 0
+            and model_a_data.get("tokens_per_sec", 0.0) > 0.0
+            and model_b_data.get("tokens_per_sec", 0.0) > 0.0
+            and "faster_model" in comp_summary
+            and "latency_diff_ms" in comp_summary
+        )
+        suite.record(
+            m3_8_ok,
+            f"Dual-model side-by-side completion verified (A: {model_a_data.get('tokens_per_sec')} tok/s ({model_a_data.get('latency_ms')}ms), B: {model_b_data.get('tokens_per_sec')} tok/s ({model_b_data.get('latency_ms')}ms), faster: {comp_summary.get('faster_model')})"
+        )
+    except Exception as e:
+        suite.record(False, "Dual-model side-by-side comparative execution", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
     success = run_tests()
     sys.exit(0 if success else 1)
+
 
 

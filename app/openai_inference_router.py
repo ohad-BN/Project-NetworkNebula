@@ -447,3 +447,112 @@ def delete_inference_endpoint(
     db.delete(ep)
     db.commit()
     return {"status": "deleted", "endpoint_id": endpoint_id}
+
+
+# =========================================================================
+# Phase 3.4: Model Evaluation Benchmarking Suite & Side-by-Side Playground
+# =========================================================================
+
+class BenchmarkRequest(BaseModel):
+    model_id: Optional[str] = Field("Qwen/Qwen2.5-0.5B-Instruct", description="Target model ID or endpoint name")
+    adapter_url: Optional[str] = Field(None, description="Optional MinIO S3 checkpoint URL for PEFT adapter")
+    max_tokens: Optional[int] = Field(32, description="Maximum tokens per benchmark prompt")
+
+
+class CompareRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt to evaluate simultaneously on both models")
+    model_a: str = Field("Qwen/Qwen2.5-0.5B-Instruct", description="First model ID or endpoint name")
+    adapter_url_a: Optional[str] = Field(None, description="Optional S3 adapter URL for model A")
+    model_b: str = Field("Qwen/Qwen2.5-0.5B-Instruct", description="Second model ID or endpoint name")
+    adapter_url_b: Optional[str] = Field(None, description="Optional S3 adapter URL for model B")
+    max_tokens: Optional[int] = Field(48, description="Max tokens per response")
+    temperature: Optional[float] = Field(0.7, description="Sampling temperature")
+
+
+@router.post("/api/v1/models/benchmark")
+def run_model_benchmark(
+    request: BenchmarkRequest,
+    current_user: User = Depends(verify_enterprise_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Run empirical benchmarking suite on the decentralized GPU network:
+    evaluates throughput (tok/sec), latency, estimated perplexity, and instruction accuracy.
+    """
+    from app.evaluation_engine import evaluation_engine
+
+    # If the user specified an endpoint name, resolve its adapter_url if any
+    adapter_url = request.adapter_url
+    target_model = request.model_id
+    ep = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == target_model).first()
+    if ep:
+        target_model = ep.model_id
+        if not adapter_url and ep.adapter_url:
+            adapter_url = ep.adapter_url
+
+    try:
+        results = evaluation_engine.evaluate_model(
+            model_id=target_model,
+            adapter_url=adapter_url,
+            max_tokens=request.max_tokens or 32,
+        )
+        return {
+            "status": "success",
+            "requested_model": request.model_id,
+            "benchmark": results,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model evaluation benchmark failed: {str(e)}"
+        )
+
+
+@router.post("/api/v1/models/compare")
+def compare_models_side_by_side(
+    request: CompareRequest,
+    current_user: User = Depends(verify_enterprise_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Side-by-side prompt execution comparing two models or base model vs fine-tuned adapter.
+    Returns response texts, latency delta, generation throughput, and performance comparison.
+    """
+    from app.evaluation_engine import evaluation_engine
+
+    model_a = request.model_a
+    adapter_a = request.adapter_url_a
+    ep_a = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == model_a).first()
+    if ep_a:
+        model_a = ep_a.model_id
+        if not adapter_a and ep_a.adapter_url:
+            adapter_a = ep_a.adapter_url
+
+    model_b = request.model_b
+    adapter_b = request.adapter_url_b
+    ep_b = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == model_b).first()
+    if ep_b:
+        model_b = ep_b.model_id
+        if not adapter_b and ep_b.adapter_url:
+            adapter_b = ep_b.adapter_url
+
+    try:
+        comparison_res = evaluation_engine.compare_models(
+            prompt=request.prompt,
+            model_a=model_a,
+            adapter_url_a=adapter_a,
+            model_b=model_b,
+            adapter_url_b=adapter_b,
+            max_tokens=request.max_tokens or 48,
+            temperature=request.temperature if request.temperature is not None else 0.7,
+        )
+        return {
+            "status": "success",
+            "comparison": comparison_res,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Side-by-side model comparison failed: {str(e)}"
+        )
+
