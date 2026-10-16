@@ -2832,11 +2832,121 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Enterprise compute billing receipt generation", str(e))
 
+    # =========================================================================
+    # Phase 3.6 (Alpha Milestone 3): Master Test Suite Expansion & Milestone 3 Signoff
+    # =========================================================================
+    print_header("Phase 3.6 (Alpha Milestone 3): Master Test Suite Expansion & Milestone 3 Signoff")
+
+    # M3.11 Multi-Node High-Availability Load Balancing & Scheduler Capacity Audit
+    try:
+        from app.scheduler import cluster_scheduler
+        # 1. Register 3 heterogeneous worker nodes for HA stress audit
+        ha_node_a = f"ha-node-a-{uuid.uuid4().hex[:6]}"
+        ha_node_b = f"ha-node-b-{uuid.uuid4().hex[:6]}"
+        ha_node_c = f"ha-node-c-{uuid.uuid4().hex[:6]}"
+
+        for nid, gname, vram, alloc_pct in [
+            (ha_node_a, "NVIDIA H100 SXM5", 80.0, 90),
+            (ha_node_b, "NVIDIA A100-SXM4-80GB", 80.0, 75),
+            (ha_node_c, "NVIDIA RTX 4090", 24.0, 50),
+        ]:
+            requests.post(
+                f"{BASE_URL}/api/v1/workers/register",
+                json={
+                    "worker_id": nid,
+                    "name": f"HA-{nid[:8]}",
+                    "gpu_info": gname,
+                    "gpu_memory_gb": vram,
+                    "vram_allocation_pct": alloc_pct,
+                    "hourly_rate_usd": 0.85,
+                },
+                timeout=5,
+            )
+
+        # 2. Simulate dispatch under varying requirements
+        sched_res_heavy = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/simulate-dispatch",
+            json={"required_vram_gb": 40.0, "num_gpus": 1, "task_type": "training"},
+            timeout=5,
+        ).json()
+        selected_heavy_ids = sched_res_heavy.get("selected_worker_ids", [])
+        top_cand_heavy = sched_res_heavy.get("top_candidate") or {}
+        selected_heavy = top_cand_heavy.get("worker_id") or (selected_heavy_ids[0] if selected_heavy_ids else None)
+
+        sched_res_light = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/simulate-dispatch",
+            json={"required_vram_gb": 8.0, "num_gpus": 1, "task_type": "inference"},
+            timeout=5,
+        ).json()
+        selected_light_ids = sched_res_light.get("selected_worker_ids", [])
+        top_cand_light = sched_res_light.get("top_candidate") or {}
+        selected_light = top_cand_light.get("worker_id") or (selected_light_ids[0] if selected_light_ids else None)
+
+        # 3. Clean up the 3 HA test nodes
+        for nid in (ha_node_a, ha_node_b, ha_node_c):
+            requests.post(f"{BASE_URL}/api/v1/workers/{nid}/deregister", timeout=5)
+
+        m3_11_ok = (
+            selected_heavy in (ha_node_a, ha_node_b)
+            and selected_light is not None
+            and len(selected_heavy_ids) > 0
+            and len(selected_light_ids) > 0
+        )
+        heavy_str = selected_heavy[:14] if selected_heavy else "None"
+        light_str = selected_light[:14] if selected_light else "None"
+        suite.record(
+            m3_11_ok,
+            f"Multi-node HA load balancing audit verified (heavy 40GB -> {heavy_str}..., light 8GB -> {light_str}...)"
+        )
+    except Exception as e:
+        suite.record(False, "Multi-node HA load balancing audit", str(e))
+
+    # M3.12 Alpha Milestone 3 Master System Signoff
+    try:
+        # 1. Distributed training engine & shard API
+        dist_stat = requests.get(f"{BASE_URL}/api/v1/cluster/scheduler/status", timeout=5).json()
+        dist_engine_ok = dist_stat.get("eligible_workers_count", 0) > 0 or dist_stat.get("status") == "active"
+
+        # 2. Model benchmark & side-by-side comparison gateway
+        bench_chk = requests.post(
+            f"{BASE_URL}/api/v1/models/benchmark",
+            json={"model_id": "Qwen/Qwen2.5-0.5B-Instruct", "max_tokens": 8},
+            timeout=25,
+        )
+        bench_ok = bench_chk.status_code == 200
+
+        # 3. Contributor wallet withdrawals & billing receipt retrieval
+        wallet_chk = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5)
+        wallet_ok = wallet_chk.status_code == 200
+
+        # 4. Standalone worker CLI execution
+        worker_cli_res = subprocess.run(
+            [sys.executable, "nebula_worker.py", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        cli_ok = worker_cli_res.returncode == 0
+
+        # 5. Production frontend SPA build check
+        dist_index = os.path.join(os.getcwd(), "network-nebula", "dist", "index.html")
+        frontend_ok = os.path.exists(dist_index) and os.path.getsize(dist_index) > 0
+
+        milestone3_signed_off = dist_engine_ok and bench_ok and wallet_ok and cli_ok and frontend_ok
+        suite.record(
+            milestone3_signed_off,
+            f"Alpha Milestone 3 Master System Signoff Verified (Distributed Engine: {dist_engine_ok}, Benchmark Gateway: {bench_ok}, Wallet/Billing: {wallet_ok}, Worker CLI: {cli_ok}, Frontend SPA: {frontend_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Alpha Milestone 3 Master System Signoff", str(e))
+
+
     return suite.summary()
 
 if __name__ == "__main__":
     success = run_tests()
     sys.exit(0 if success else 1)
+
 
 
 
