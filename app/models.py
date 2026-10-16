@@ -109,6 +109,8 @@ class Worker(Base):
     reputation_score = Column(Float, default=100.0)
     min_stake_required = Column(Float, default=50.0)
     slash_history = Column(Text, default="[]")
+    region = Column(String(64), default="us-east", nullable=False)
+    latency_ping_ms = Column(Float, default=15.0, nullable=False)
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -160,6 +162,7 @@ class TrainingJob(Base):
     loss_history = Column(Text, default="[]", nullable=False)
     checkpoints = Column(Text, default="[]", nullable=False)
     final_adapter_url = Column(String(500), nullable=True)
+    region = Column(String(64), nullable=True)
     cost = Column(Float, default=0.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)

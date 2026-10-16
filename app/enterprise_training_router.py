@@ -59,6 +59,8 @@ class CreateDistributedTrainingJobRequest(BaseModel):
     hyperparameters: Optional[Dict[str, Any]] = Field(default=None, description="Custom hyperparameter overrides")
     total_epochs: Optional[int] = Field(default=2, ge=1, le=100, description="Total distributed training epochs")
     sync_execution: bool = Field(default=False, description="Execute distributed training synchronously in-request if true")
+    enforce_region: Optional[str] = Field(default=None, description="Strict geographic data sovereignty boundary, e.g. eu-central or us-east")
+    max_rtt_ms: Optional[float] = Field(default=None, description="Maximum inter-node latency RTT threshold for all-reduce group")
 
 
 class DatasetUploadUrlRequest(BaseModel):
@@ -105,6 +107,7 @@ class TrainingJobResponse(BaseModel):
     loss_history: List[Dict[str, Any]]
     checkpoints: List[Dict[str, Any]]
     final_adapter_url: Optional[str] = None
+    region: Optional[str] = None
     cost: float
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -151,6 +154,7 @@ def format_job_response(job: TrainingJob) -> Dict[str, Any]:
         "loss_history": parsed_loss,
         "checkpoints": parsed_checkpoints,
         "final_adapter_url": job.final_adapter_url,
+        "region": getattr(job, "region", None),
         "cost": job.cost,
         "created_at": job.created_at,
         "completed_at": job.completed_at,
@@ -263,8 +267,33 @@ def submit_distributed_training_job(
     job_name = payload.name or f"Dist-{payload.base_model.split('/')[-1]}-{payload.num_gpus}GPU-{job_id[:6]}"
 
     worker_ids = payload.worker_ids
+    if payload.enforce_region and worker_ids:
+        from app.models import Worker
+        non_compliant = (
+            db.query(Worker)
+            .filter(
+                Worker.id.in_(worker_ids),
+                Worker.region != payload.enforce_region,
+            )
+            .all()
+        )
+        if non_compliant:
+            bad_names = [f"{w.id} (region={w.region})" for w in non_compliant]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Data sovereignty compliance failure: worker nodes {bad_names} "
+                    f"are outside enforced region '{payload.enforce_region}'."
+                ),
+            )
+
     if not worker_ids or len(worker_ids) < payload.num_gpus:
-        resolved = distributed_training_engine.resolve_worker_fleet(db, num_gpus=payload.num_gpus)
+        resolved = distributed_training_engine.resolve_worker_fleet(
+            db,
+            num_gpus=payload.num_gpus,
+            enforce_region=payload.enforce_region,
+            max_latency_ms=payload.max_rtt_ms,
+        )
         if worker_ids:
             for r_id in resolved:
                 if r_id not in worker_ids and len(worker_ids) < payload.num_gpus:
@@ -279,6 +308,10 @@ def submit_distributed_training_job(
     hyperparams["distributed_mode"] = True
     hyperparams["worker_ids"] = worker_ids
     hyperparams["allreduce_protocol"] = "ring_allreduce_float32"
+    if payload.enforce_region:
+        hyperparams["enforce_region"] = payload.enforce_region
+    if payload.max_rtt_ms is not None:
+        hyperparams["max_rtt_ms"] = payload.max_rtt_ms
 
     new_job = TrainingJob(
         id=job_id,
@@ -296,6 +329,7 @@ def submit_distributed_training_job(
         loss_history="[]",
         checkpoints="[]",
         final_adapter_url=None,
+        region=payload.enforce_region,
         cost=0.0,
     )
     db.add(new_job)

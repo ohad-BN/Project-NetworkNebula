@@ -2869,6 +2869,186 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Automated slashing & customer compensation", str(e))
 
+    # =========================================================================
+    # Phase 4.3 (Alpha Milestone 4): Geo-Distributed Region Clustering & Low-Latency Sub-Networks
+    # =========================================================================
+    print_header("Phase 4.3 (Alpha Milestone 4): Geo-Distributed Region Clustering & Low-Latency Sub-Networks")
+
+    # M4.5 Topology-Aware Latency Clustering (<15ms RTT group selection)
+    try:
+        # 1. Register 3 nodes with different latencies and regions
+        topo_node_1 = f"topo-fast1-{uuid.uuid4().hex[:6]}"
+        topo_node_2 = f"topo-fast2-{uuid.uuid4().hex[:6]}"
+        topo_node_3 = f"topo-slow3-{uuid.uuid4().hex[:6]}"
+
+        for nid, reg, lat, vram in [
+            (topo_node_1, "us-east", 7.5, 24.0),
+            (topo_node_2, "us-east", 11.2, 24.0),
+            (topo_node_3, "us-west", 68.0, 24.0),
+        ]:
+            requests.post(
+                f"{BASE_URL}/api/v1/workers/register",
+                json={
+                    "worker_id": nid,
+                    "name": f"Topo-{nid[:10]}",
+                    "gpu_info": "NVIDIA RTX 4090",
+                    "gpu_memory_gb": vram,
+                    "vram_allocation_pct": 80,
+                    "region": reg,
+                    "latency_ping_ms": lat,
+                },
+                timeout=5,
+            )
+
+        # 2. Test /api/v1/cluster/scheduler/topology-group endpoint
+        topo_group_res = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/topology-group",
+            json={
+                "num_gpus": 2,
+                "max_rtt_ms": 15.0,
+                "target_region": "us-east",
+                "required_vram_gb": 4.0,
+            },
+            timeout=5,
+        ).json()
+
+        topo_status_ok = topo_group_res.get("status") == "ready"
+        cluster_allreduce_ok = topo_group_res.get("ring_allreduce_ready") is True
+        cluster_max_rtt = float(topo_group_res.get("cluster_max_rtt_ms", 999.0))
+        sub_15ms_ok = cluster_max_rtt <= 15.0
+        selected_ids = topo_group_res.get("selected_worker_ids", [])
+        slow_node_excluded = topo_node_3 not in selected_ids
+
+        # 3. Test /api/v1/cluster/regions telemetry aggregation
+        reg_res = requests.get(f"{BASE_URL}/api/v1/cluster/regions", timeout=5).json()
+        regions_list = reg_res.get("regions", [])
+        has_us_east = any(r.get("region") == "us-east" and r.get("total_nodes", 0) >= 2 for r in regions_list)
+        has_us_west = any(r.get("region") == "us-west" and r.get("total_nodes", 0) >= 1 for r in regions_list)
+        reg_telemetry_ok = has_us_east and has_us_west
+
+        # 4. CLI agent latency ping estimation test
+        cli_ping = subprocess.run(
+            [
+                sys.executable,
+                "nebula_worker.py",
+                "ping",
+                "--server",
+                BASE_URL,
+                "--region",
+                "us-east",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        ping_ok = cli_ping.returncode == 0
+        ping_data = json.loads(cli_ping.stdout.strip()) if ping_ok else {}
+        cli_ping_valid = (
+            ping_data.get("status") == "ok"
+            and float(ping_data.get("latency_ms", 999.0)) < 100.0
+            and ping_data.get("region") == "us-east"
+        )
+
+        m4_5_ok = topo_status_ok and cluster_allreduce_ok and sub_15ms_ok and slow_node_excluded and reg_telemetry_ok and cli_ping_valid
+        suite.record(
+            m4_5_ok,
+            f"Topology-aware latency clustering verified (<15ms RTT group: {selected_ids}, cluster max RTT: {cluster_max_rtt}ms, slow node {topo_node_3[:12]} excluded: {slow_node_excluded}, CLI ping: {ping_data.get('latency_ms')}ms)"
+        )
+    except Exception as e:
+        suite.record(False, "Topology-aware latency clustering", str(e))
+
+    # M4.6 Sovereign Region Constraint & Geo-Fencing Compliance Enforcement
+    try:
+        # 1. Register an EU sovereign worker node
+        eu_node_id = f"eu-sovereign-{uuid.uuid4().hex[:6]}"
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": eu_node_id,
+                "name": "EU-Frankfurt-Sovereign-Worker",
+                "gpu_info": "NVIDIA A100-SXM4-80GB",
+                "gpu_memory_gb": 80.0,
+                "vram_allocation_pct": 80,
+                "region": "eu-central",
+                "latency_ping_ms": 9.8,
+            },
+            timeout=5,
+        )
+
+        # 2. Test simulate-dispatch with enforce_region="eu-central"
+        sim_eu = requests.post(
+            f"{BASE_URL}/api/v1/cluster/scheduler/simulate-dispatch",
+            json={
+                "num_gpus": 1,
+                "required_vram_gb": 2.0,
+                "enforce_region": "eu-central",
+                "topology_aware": True,
+            },
+            timeout=5,
+        ).json()
+
+        eu_selected = sim_eu.get("selected_worker_ids", [])
+        disqualified = sim_eu.get("disqualified_nodes", [])
+        sovereignty_disqualifications = [
+            d for d in disqualified if "Data sovereignty violation" in (d.get("disqualification_reason") or "")
+        ]
+        geo_fence_filter_ok = (
+            len(eu_selected) > 0
+            and all(w.get("region") == "eu-central" for w in sim_eu.get("selected_workers", []))
+            and len(sovereignty_disqualifications) > 0
+        )
+
+        # 3. Test distributed training job strict geo-fencing violation rejection
+        dist_sovereign_reject = requests.post(
+            f"{BASE_URL}/api/v1/training/distributed/jobs",
+            json={
+                "name": "EU-GDPR-Violation-Test",
+                "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "num_gpus": 2,
+                "worker_ids": [topo_node_1, topo_node_2],  # US nodes
+                "enforce_region": "eu-central",
+                "sync_execution": False,
+            },
+            timeout=10,
+        )
+        reject_400_ok = (
+            dist_sovereign_reject.status_code == 400
+            and "Data sovereignty compliance failure" in dist_sovereign_reject.text
+        )
+
+        # 4. Test distributed training job compliant submission in sovereign region
+        dist_sovereign_accept = requests.post(
+            f"{BASE_URL}/api/v1/training/distributed/jobs",
+            json={
+                "name": "EU-GDPR-Compliant-Job",
+                "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "num_gpus": 2,
+                "enforce_region": "eu-central",
+                "sync_execution": False,
+            },
+            timeout=10,
+        )
+        accept_201_ok = (
+            dist_sovereign_accept.status_code == 201
+            and (
+                dist_sovereign_accept.json().get("region") == "eu-central"
+                or dist_sovereign_accept.json().get("hyperparameters", {}).get("enforce_region") == "eu-central"
+            )
+        )
+
+        # 5. Clean up temporary test nodes
+        for tid in [topo_node_1, topo_node_2, topo_node_3, eu_node_id]:
+            requests.post(f"{BASE_URL}/api/v1/workers/{tid}/deregister", timeout=5)
+
+        m4_6_ok = geo_fence_filter_ok and reject_400_ok and accept_201_ok
+        suite.record(
+            m4_6_ok,
+            f"Sovereign region constraint & geo-fencing verified (EU node {eu_node_id[:12]} selected, US nodes disqualified: {len(sovereignty_disqualifications)}, US nodes rejected from EU job: {reject_400_ok}, compliant job created: {accept_201_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Sovereign region constraint & geo-fencing", str(e))
+
     return suite.summary()
 
 

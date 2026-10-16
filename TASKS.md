@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
 > **Project Phase:** Alpha Milestone 4 Active — Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**115/115 Passed — 100% Green in 104.83s**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**117/117 Passed — 100% Green in 110.56s**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 
@@ -18,7 +18,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI (`work`), WebSocket tunnel (`/ws/worker/{id}`) & Capacity Scheduler |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **115/115 tests passed (0 failed, 0 skipped in 104.83s)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **117/117 tests passed (0 failed, 0 skipped in 110.56s)** |
 
 ---
 
@@ -225,11 +225,12 @@
 - [x] Added `POST /api/v1/workers/{id}/stake`, `POST /api/v1/workers/{id}/unstake`, `POST /api/v1/workers/{id}/slash`, `GET /api/v1/workers/{id}/staking`, `GET /api/v1/workers/{id}/slashing-history`, and `GET /api/v1/staking/leaderboard` in [`app/staking_router.py`](app/staking_router.py)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.2 assertions (`M4.3` collateral staking lifecycle, `M4.4` automated slashing & customer compensation ledger credit) (**115/115 passed — 100%**)
 
-### 📋 Phase 4.3: Geo-Distributed Region Clustering & Low-Latency Sub-Networks
-- [ ] Extend `Worker` model with `region` (`us-east`, `us-west`, `eu-central`, `ap-southeast`) and RTT latency estimation
-- [ ] Upgrade `ClusterScheduler` in `app/scheduler.py` with topology-aware clustering (<15ms RTT group selection) and strict data sovereignty geo-fencing (e.g. EU GDPR / US-only)
-- [ ] Upgrade `nebula_worker.py` CLI agent with `--region` flag and automated latency ping estimation
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.3 assertions (`M4.5` latency-aware peer grouping, `M4.6` sovereign geo-fencing enforcement)
+### ✅ Phase 4.3: Geo-Distributed Region Clustering & Low-Latency Sub-Networks (COMPLETED)
+- [x] Extended `Worker` model in [`app/models.py`](app/models.py) with `region` (`us-east`, `us-west`, `eu-central`, `ap-southeast`) and `latency_ping_ms` with dynamic DB migration
+- [x] Upgraded `ClusterScheduler` in [`app/scheduler.py`](app/scheduler.py) with topology-aware clustering (`<15ms` RTT group selection via `form_low_latency_cluster`), global regional breakdown (`get_regional_breakdown`), and strict data sovereignty geo-fencing (e.g. EU GDPR / US-only)
+- [x] Exposed `POST /api/v1/cluster/scheduler/topology-group` and `GET /api/v1/cluster/regions` in [`app/cluster_worker_router.py`](app/cluster_worker_router.py), and wired strict data sovereignty enforcement in [`app/enterprise_training_router.py`](app/enterprise_training_router.py) and [`app/distributed_training_engine.py`](app/distributed_training_engine.py)
+- [x] Upgraded [`nebula_worker.py`](nebula_worker.py) CLI agent with `--region` flag, automated RTT latency ping estimation, and `ping` diagnostic subcommand
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.3 assertions (`M4.5` latency-aware peer grouping & telemetry aggregation, `M4.6` sovereign geo-fencing enforcement) (**117/117 passed — 100%**)
 
 ### 📋 Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability
 - [ ] Build `app/metrics_service.py` exporting standardized Prometheus `/metrics` (GPU utilization, active VRAM, token throughput, latency p50/p95/p99, active shards, slashing events)

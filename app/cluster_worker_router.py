@@ -123,6 +123,9 @@ def ensure_worker_schema_columns() -> None:
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS reputation_score FLOAT DEFAULT 100.0",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS min_stake_required FLOAT DEFAULT 50.0",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS slash_history TEXT DEFAULT '[]'",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS region VARCHAR(64) DEFAULT 'us-east'",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS latency_ping_ms FLOAT DEFAULT 15.0",
+        "ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS region VARCHAR(64)",
         "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'STAKE'",
         "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'UNSTAKE'",
         "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'SLASH_PENALTY'",
@@ -241,6 +244,8 @@ def sync_primary_local_worker(db: Session) -> Worker:
             total_earnings_usd=0.0,
             is_available=True,
             total_tasks_completed=0,
+            region="us-east",
+            latency_ping_ms=12.5,
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -251,6 +256,10 @@ def sync_primary_local_worker(db: Session) -> Worker:
         worker.gpu_memory_gb = hw["vram_total_gb"]
         worker.vram_used_gb = hw["vram_used_gb"]
         worker.cuda_version = hw["cuda_version"]
+        if not getattr(worker, "region", None):
+            worker.region = "us-east"
+        if getattr(worker, "latency_ping_ms", None) is None:
+            worker.latency_ping_ms = 12.5
         if worker.status == "offline" and worker.is_available:
             worker.status = "online"
         worker.last_heartbeat = datetime.utcnow()
@@ -289,6 +298,11 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "total_tasks_completed": int(w.total_tasks_completed or 0),
         "hourly_rate_usd": round(float(w.hourly_rate_usd or 0.45), 4),
         "total_earnings_usd": round(float(w.total_earnings_usd or 0.0), 4),
+        "region": getattr(w, "region", "us-east") or "us-east",
+        "latency_ping_ms": round(float(getattr(w, "latency_ping_ms", 15.0) or 15.0), 2),
+        "staked_amount_usd": round(float(getattr(w, "staked_amount_usd", 0.0) or 0.0), 2),
+        "slashed_amount_usd": round(float(getattr(w, "slashed_amount_usd", 0.0) or 0.0), 2),
+        "reputation_score": round(float(getattr(w, "reputation_score", 100.0) or 100.0), 1),
         "tunnel_active": worker_tunnel_manager.is_connected(w.id),
         "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else datetime.utcnow().isoformat(),
     }
@@ -312,6 +326,8 @@ class WorkerRegisterPayload(BaseModel):
     cuda_version: Optional[str] = None
     role: Optional[str] = "LoRA Training & Inference"
     hourly_rate_usd: Optional[float] = 0.45
+    region: Optional[str] = "us-east"
+    latency_ping_ms: Optional[float] = 15.0
     supported_task_types: List[str] = ["inference", "training", "batch_inference"]
     system_info: Optional[Dict[str, Any]] = None
     wallet_address: Optional[str] = None
@@ -321,6 +337,7 @@ class WorkerConfigUpdatePayload(BaseModel):
     vram_allocation_pct: Optional[int] = Field(default=None, ge=10, le=100)
     name: Optional[str] = None
     role: Optional[str] = None
+    region: Optional[str] = None
     is_available: Optional[bool] = None
     hourly_rate_usd: Optional[float] = None
 
@@ -330,6 +347,8 @@ class WorkerHeartbeatPayload(BaseModel):
     vram_used_gb: Optional[float] = None
     gpu_utilization_pct: Optional[float] = None
     status: Optional[str] = None
+    latency_ping_ms: Optional[float] = None
+    region: Optional[str] = None
 
 
 # ==============================================================================
@@ -465,6 +484,8 @@ def register_worker_node(
     resolved_cuda = (payload.cuda_version if payload and payload.cuda_version else None) or hw["cuda_version"]
     resolved_role = (payload.role if payload and payload.role else None) or "LoRA Training & Inference"
     resolved_rate = (payload.hourly_rate_usd if payload and payload.hourly_rate_usd is not None else None) or 0.45
+    resolved_region = (payload.region if payload and payload.region else None) or "us-east"
+    resolved_latency = (payload.latency_ping_ms if payload and payload.latency_ping_ms is not None else None) or 15.0
 
     # Enforce CUDA memory limit locally if registering on host machine
     cuda_enforced = enforce_local_cuda_memory_fraction(resolved_pct)
@@ -481,6 +502,8 @@ def register_worker_node(
         worker.cuda_version = resolved_cuda
         worker.role = resolved_role
         worker.hourly_rate_usd = float(resolved_rate)
+        worker.region = resolved_region
+        worker.latency_ping_ms = float(resolved_latency)
         worker.status = "online"
         worker.is_available = True
         worker.last_heartbeat = datetime.utcnow()
@@ -505,6 +528,8 @@ def register_worker_node(
             total_earnings_usd=0.0,
             is_available=True,
             total_tasks_completed=0,
+            region=resolved_region,
+            latency_ping_ms=float(resolved_latency),
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -548,6 +573,8 @@ async def update_worker_config(
         worker.name = payload.name
     if payload.role is not None:
         worker.role = payload.role
+    if payload.region is not None:
+        worker.region = payload.region
     if payload.is_available is not None:
         worker.is_available = payload.is_available
         worker.status = "online" if payload.is_available else "offline"
@@ -607,6 +634,10 @@ def worker_node_heartbeat(
             worker.vram_used_gb = float(payload.vram_used_gb)
         if payload.gpu_utilization_pct is not None:
             worker.gpu_utilization_pct = float(payload.gpu_utilization_pct)
+        if payload.latency_ping_ms is not None:
+            worker.latency_ping_ms = float(payload.latency_ping_ms)
+        if payload.region:
+            worker.region = payload.region
         if payload.status:
             worker.status = payload.status
         else:
@@ -623,6 +654,8 @@ def worker_node_heartbeat(
         "node_status": worker.status,
         "vram_allocation_pct": int(worker.vram_allocation_pct or 80),
         "vram_allocated_gb": round(float(worker.gpu_memory_gb or 8.0) * (int(worker.vram_allocation_pct or 80) / 100.0), 2),
+        "region": getattr(worker, "region", "us-east") or "us-east",
+        "latency_ping_ms": round(float(getattr(worker, "latency_ping_ms", 15.0) or 15.0), 2),
         "timestamp": worker.last_heartbeat.isoformat(),
     }
 
@@ -904,11 +937,23 @@ class SchedulerSimulateDispatchPayload(BaseModel):
     num_gpus: int = Field(default=1, ge=1, le=64, description="Number of GPU worker nodes required")
     task_type: str = Field(default="training", description="Workload type: training, inference, batch_inference")
     exclude_worker_ids: Optional[List[str]] = Field(default=None, description="Worker IDs to exclude")
+    target_region: Optional[str] = Field(default=None, description="Preferred geographic region")
+    enforce_region: Optional[str] = Field(default=None, description="Strict sovereign geo-fence boundary (e.g. eu-central, us-east)")
+    max_latency_ms: Optional[float] = Field(default=None, description="Maximum allowed latency threshold in ms")
+    topology_aware: bool = Field(default=False, description="Prioritize tightly-coupled low-latency nodes (<15ms RTT)")
     simulate_failover_from_worker_id: Optional[str] = Field(
         default=None,
         description="Optional worker ID to simulate mid-task disconnection and failover re-routing",
     )
     task_id: Optional[str] = Field(default=None, description="Optional task/job ID for failover binding")
+
+
+class TopologyGroupPayload(BaseModel):
+    num_gpus: int = Field(default=2, ge=1, le=64, description="Number of GPU nodes required for sub-network")
+    max_rtt_ms: float = Field(default=15.0, ge=1.0, le=500.0, description="Maximum inter-node / gateway latency threshold in ms")
+    target_region: Optional[str] = Field(default=None, description="Target geographic region")
+    enforce_region: Optional[str] = Field(default=None, description="Strict geographic data sovereignty boundary")
+    required_vram_gb: float = Field(default=2.0, ge=0.5, le=512.0, description="Required VRAM per node in GB")
 
 
 class SchedulerFailoverPayload(BaseModel):
@@ -932,15 +977,27 @@ def get_cluster_scheduler_status(
     return cluster_scheduler.get_scheduler_status(db)
 
 
+@router.get("/api/v1/cluster/regions")
+def get_cluster_regional_telemetry(
+    db: Session = Depends(get_db),
+):
+    """
+    Return global fleet distribution across geographic regions (us-east, us-west, eu-central, ap-southeast),
+    average latency metrics, sub-15ms node counts, and sovereign compliance readiness.
+    """
+    from app.scheduler import cluster_scheduler
+
+    return cluster_scheduler.get_regional_breakdown(db)
+
+
 @router.post("/api/v1/cluster/scheduler/simulate-dispatch")
 def simulate_cluster_scheduler_dispatch(
     payload: SchedulerSimulateDispatchPayload,
     db: Session = Depends(get_db),
 ):
     """
-    Evaluate all registered worker nodes against `required_vram_gb` and user-configured
-    `vram_allocation_pct` contribution ceilings, returning the optimal node match(es),
-    full candidate score breakdown, disqualified nodes, and optional failover re-routing.
+    Evaluate all registered worker nodes against `required_vram_gb`, user-configured
+    `vram_allocation_pct` contribution ceilings, geographic region constraints, and latency thresholds.
     """
     from app.scheduler import cluster_scheduler
 
@@ -950,6 +1007,10 @@ def simulate_cluster_scheduler_dispatch(
         num_gpus=payload.num_gpus,
         task_type=payload.task_type,
         exclude_worker_ids=payload.exclude_worker_ids,
+        target_region=payload.target_region,
+        enforce_region=payload.enforce_region,
+        max_latency_ms=payload.max_latency_ms,
+        topology_aware=payload.topology_aware,
         record_dispatch=True,
     )
 
@@ -966,6 +1027,27 @@ def simulate_cluster_scheduler_dispatch(
         result["failover_event"] = failover_event
 
     return result
+
+
+@router.post("/api/v1/cluster/scheduler/topology-group")
+def form_cluster_topology_group(
+    payload: TopologyGroupPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Form an optimal, tightly coupled sub-network cluster (<15ms RTT) for Ring All-Reduce
+    distributed training, strictly honoring geographic data sovereignty if enforce_region is set.
+    """
+    from app.scheduler import cluster_scheduler
+
+    return cluster_scheduler.form_low_latency_cluster(
+        db=db,
+        num_gpus=payload.num_gpus,
+        max_rtt_ms=payload.max_rtt_ms,
+        target_region=payload.target_region,
+        enforce_region=payload.enforce_region,
+        required_vram_gb=payload.required_vram_gb,
+    )
 
 
 @router.post("/api/v1/cluster/scheduler/failover")

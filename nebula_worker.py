@@ -32,6 +32,22 @@ DEFAULT_SERVER_URL = os.environ.get("NEBULA_SERVER_URL", "http://localhost:8000"
 DEFAULT_WORKER_ID = "node-gpu-local-01"
 
 
+def measure_server_latency(server_url: str) -> float:
+    """Measure round-trip time (RTT) ping latency to the orchestrator in milliseconds."""
+    try:
+        t0 = time.perf_counter()
+        res = requests.get(f"{server_url}/health", timeout=3)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return max(1.0, latency_ms)
+    except Exception:
+        try:
+            t0 = time.perf_counter()
+            res = requests.get(f"{server_url}/api/v1/cluster/telemetry", timeout=3)
+            return max(1.0, round((time.perf_counter() - t0) * 1000.0, 2))
+        except Exception:
+            return 15.0
+
+
 def discover_hardware() -> Dict[str, Any]:
     """Auto-detect physical GPU, VRAM, CUDA runtime, CPU cores, and system memory."""
     cpu_cores = os.cpu_count() or 8
@@ -139,6 +155,8 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     hw = discover_hardware()
     limit_info = apply_vram_limit(vram_pct)
+    lat_ms = measure_server_latency(server_url)
+    region = getattr(args, "region", "us-east") or "us-east"
 
     node_name = args.name or f"{hw['hostname']} ({hw['gpu_model']})"
     worker_id = args.worker_id or DEFAULT_WORKER_ID
@@ -159,6 +177,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         "gpu_utilization_pct": hw["gpu_utilization_pct"],
         "cuda_version": hw["cuda_version"],
         "role": args.role,
+        "region": region,
+        "latency_ping_ms": lat_ms,
     }
 
     try:
@@ -184,6 +204,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         "vram_used_gb": hw["vram_used_gb"],
         "gpu_utilization_pct": hw["gpu_utilization_pct"],
         "status": "online",
+        "region": region,
+        "latency_ping_ms": lat_ms,
     }
     try:
         hb_res = requests.post(
@@ -209,6 +231,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         "vram_allocated_gb": reg_data.get("vram_allocated_gb"),
         "vram_used_gb": hw["vram_used_gb"],
         "vram_allocation_pct": server_pct,
+        "region": reg_data.get("region", region),
+        "latency_ping_ms": lat_ms,
         "cuda_fraction_enforced": limit_info["cuda_enforced"],
         "cuda_version": hw["cuda_version"],
         "server": server_url,
@@ -235,6 +259,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(f"  GPU Accelerator    : {result_summary['gpu_model']}")
         print(f"  CUDA / Runtime     : {result_summary['cuda_version']}")
         print(f"  Contribution Limit : {result_summary['vram_allocation_pct']}% ({result_summary['vram_allocated_gb']} GB / {result_summary['vram_total_gb']} GB)")
+        print(f"  Geographic Region  : {result_summary['region']}")
+        print(f"  RTT Ping Latency   : {result_summary['latency_ping_ms']} ms")
         print(f"  CUDA Cap Enforced  : {result_summary['cuda_fraction_enforced']}")
         print(f"  Orchestrator URL   : {server_url}")
         print("=" * 68 + "\n")
@@ -247,12 +273,15 @@ def cmd_join(args: argparse.Namespace) -> int:
         while True:
             time.sleep(args.interval)
             live_hw = discover_hardware()
+            live_lat = measure_server_latency(server_url)
             r_hb = requests.post(
                 f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
                 headers=headers,
                 json={
                     "vram_used_gb": live_hw["vram_used_gb"],
                     "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
+                    "latency_ping_ms": live_lat,
+                    "region": region,
                 },
                 timeout=10,
             )
@@ -266,6 +295,26 @@ def cmd_join(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         if not args.json:
             print("\n[NEBULA_WORKER] Shutting down worker agent gracefully.")
+    return 0
+
+
+def cmd_ping(args: argparse.Namespace) -> int:
+    """Measure round-trip latency to orchestrator and print regional diagnostics."""
+    server_url = args.server.rstrip("/")
+    lat = measure_server_latency(server_url)
+    region = getattr(args, "region", "us-east") or "us-east"
+    result = {
+        "status": "ok",
+        "server": server_url,
+        "latency_ms": lat,
+        "region": region,
+        "low_latency_eligible": lat <= 15.0,
+    }
+    if args.json:
+        print(json.dumps(result))
+    else:
+        elig = "YES (<15ms RTT Ring All-Reduce Ready)" if lat <= 15.0 else "NO (>15ms RTT)"
+        print(f"[PING] Server: {server_url} | RTT Latency: {lat}ms | Region: {region} | Low-Latency Sub-Network: {elig}")
     return 0
 
 
@@ -556,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     join_p.add_argument("--name", default=None, help="Friendly display name for this GPU node")
     join_p.add_argument("--vram-pct", type=int, default=80, help="GPU VRAM contribution percentage (10-100)")
     join_p.add_argument("--role", default="LoRA Training & Fast Serving", help="Compute role")
+    join_p.add_argument("--region", default="us-east", help="Geographic compute region (us-east, us-west, eu-central, ap-southeast)")
     join_p.add_argument("--api-key", default=None, help="Optional user API key to link earnings")
     join_p.add_argument("--interval", type=int, default=15, help="Heartbeat interval in seconds")
     join_p.add_argument("--tunnel", action="store_true", help="Maintain persistent WebSocket tunnel instead of HTTP polling")
@@ -579,11 +629,18 @@ def build_parser() -> argparse.ArgumentParser:
     work_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
     work_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
     work_p.add_argument("--vram-pct", type=int, default=80, help="GPU VRAM contribution percentage (10-100)")
+    work_p.add_argument("--region", default="us-east", help="Geographic compute region")
     work_p.add_argument("--auto-claim", action="store_true", default=True, help="Automatically claim available tasks")
     work_p.add_argument("--max-tasks", type=int, default=1, help="Max tasks to complete before exiting (0 for infinite)")
     work_p.add_argument("--interval", type=float, default=0.5, help="Polling interval in seconds")
     work_p.add_argument("--tunnel", action="store_true", help="Execute tasks over persistent WebSocket tunnel")
     work_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
+
+    # ping command (Phase 4.3)
+    ping_p = subparsers.add_parser("ping", help="Measure ping RTT latency and regional eligibility")
+    ping_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    ping_p.add_argument("--region", default="us-east", help="Geographic compute region")
+    ping_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     return parser
 
@@ -599,6 +656,8 @@ def main() -> int:
         return cmd_set_limit(args)
     elif args.command == "work":
         return cmd_work(args)
+    elif args.command == "ping":
+        return cmd_ping(args)
     return 1
 
 
