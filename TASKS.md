@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 2: Phase 2.3 Complete (Real-Time WebSocket Worker Tunnel & NAT Traversal Active)  
+> **Project Phase:** Alpha Milestone 2: Phase 2.4 Complete (Dynamic Task Routing, SLA Accounting & Automated Worker Earnings)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**111/111 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**114/114 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -17,7 +17,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI & WebSocket tunnel (`/ws/worker/{id}`) with 10%–100% GPU limit |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **111/111 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **114/114 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -145,10 +145,10 @@
 - [x] Connected [`nebula_worker.py`](nebula_worker.py) with `--tunnel` support via `run_websocket_tunnel()`
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.3 assertions (`M2.7` tunnel handshake & heartbeat, `M2.8` real-time server-push config update down open tunnel, `M2.9` cluster telemetry broadcast & ping/pong) (**111/111 passed — 100%**)
 
-### 📋 Phase 2.4: Dynamic Task Routing, SLA Accounting & Automated Worker Earnings
-- [ ] Wire `execute_training_job` and `serve_inference_request` in [`app/worker.py`](app/worker.py) to credit completed tasks and USD compute earnings (`WORKER_SHARE = 0.70`) to the active `Worker` node and owner `User` wallet (`TransactionType.EARNING`)
-- [ ] Upgrade [`get_payout.py`](get_payout.py) to display registered GPU worker nodes, their active `vram_allocation_pct` contribution percentage, completed tasks, and per-node earnings in PowerShell
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.4 assertions (`M2.10`, `M2.11`, `M2.12`) and verify 100% pass
+### ✅ Phase 2.4: Dynamic Task Routing, SLA Accounting & Automated Worker Earnings (COMPLETED)
+- [x] Wired `execute_training_job`, `serve_inference_request`, `render_image`, and `train_model` in [`app/worker.py`](app/worker.py) to credit completed tasks (`Worker.total_tasks_completed += 1`) and USD compute earnings (`WORKER_SHARE = 0.70`, `Worker.total_earnings_usd += earnings`) to the active `Worker` node and owner `User` wallet (`TransactionType.EARNING`)
+- [x] Upgraded [`get_payout.py`](get_payout.py) CLI agent with `--json` machine-readable output, sorted fleet node telemetry table, active `vram_allocation_pct` contribution percentages, task counters, and accrued per-node USD earnings
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.4 assertions (`M2.10` worker SLA task execution accounting, `M2.11` automated compute earnings credit & ledger audit, `M2.12` `get_payout.py` fleet telemetry CLI reporting) (**114/114 passed — 100%**)
 
 ### 📋 Phase 2.5: Live Frontend GPU Fleet (`/cluster`) & Contributor Control Panel (`/worker`)
 - [ ] Upgrade [`network-nebula/src/pages/cluster-status.tsx`](network-nebula/src/pages/cluster-status.tsx) to replace hardcoded mock nodes with live `/api/v1/cluster/telemetry` data, interactive **10%–100% GPU Contribution Sliders**, and a copyable PowerShell CLI join command

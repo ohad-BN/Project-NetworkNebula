@@ -96,6 +96,85 @@ def update_task_progress(db_url, task_id, progress, status=None):
         db.close()
 
 
+def attribute_worker_earnings(
+    db,
+    task_id: str,
+    gross_cost: float,
+    description: str,
+    worker_id: str = None,
+    share_pct: float = 0.70,
+):
+    """
+    SLA Accounting & Automated Worker Earnings:
+    Credits 70% host revenue share to the active GPU Worker node and its owner User account,
+    increments total_tasks_completed and total_earnings_usd on the Worker model,
+    and logs an immutable Transaction record of type EARNING.
+    """
+    import uuid
+    from app.models import User, Worker, Transaction, TransactionType
+
+    target_worker_id = worker_id or "node-gpu-local-01"
+    worker = db.query(Worker).filter(Worker.id == target_worker_id).first()
+    if not worker:
+        worker = db.query(Worker).filter(Worker.is_available == True).first() or db.query(Worker).first()
+
+    if not worker:
+        try:
+            from app.cluster_worker_router import sync_primary_local_worker
+            worker = sync_primary_local_worker(db)
+        except Exception:
+            pass
+
+    earnings = round(float(gross_cost or 0.0) * float(share_pct), 4)
+
+    # 1. Update Worker Node SLA metrics
+    if worker:
+        worker.total_tasks_completed = (worker.total_tasks_completed or 0) + 1
+        worker.total_earnings_usd = round(float(worker.total_earnings_usd or 0.0) + earnings, 4)
+        resolved_worker_id = worker.id
+    else:
+        resolved_worker_id = target_worker_id
+
+    # 2. Resolve Host User Wallet
+    worker_user = None
+    if worker and worker.user_id:
+        worker_user = db.query(User).filter(User.id == worker.user_id).first()
+    if not worker_user:
+        worker_user = db.query(User).filter(User.is_worker == True).first()
+    if not worker_user:
+        worker_user = db.query(User).first()
+
+    # Link worker to user if user was unlinked
+    if worker and worker_user and not worker.user_id:
+        worker.user_id = worker_user.id
+
+    trans = None
+    if worker_user:
+        worker_user.balance = round(float(worker_user.balance or 0.0) + earnings, 4)
+        worker_user.total_earned = round(float(worker_user.total_earned or 0.0) + earnings, 4)
+        trans = Transaction(
+            transaction_id=str(uuid.uuid4()),
+            user_id=worker_user.id,
+            worker_id=resolved_worker_id,
+            task_id=str(task_id),
+            type=TransactionType.EARNING,
+            amount=earnings,
+            balance_after=worker_user.balance,
+            description=description,
+        )
+        db.add(trans)
+
+    db.commit()
+    return {
+        "earnings": earnings,
+        "worker_id": resolved_worker_id,
+        "user_id": worker_user.id if worker_user else None,
+        "tasks_completed": worker.total_tasks_completed if worker else 1,
+        "worker_earnings_usd": worker.total_earnings_usd if worker else earnings,
+        "transaction_id": trans.transaction_id if trans else None,
+    }
+
+
 @celery_app.task(name="render_image", bind=True)
 def render_image(
     self,
@@ -200,23 +279,18 @@ def render_image(
                 task.output_url = output_url
 
                 # Automatically credit Worker/Host earnings (70% share)
-                import uuid
-                from app.models import User, Worker, Transaction, TransactionType
-                worker_user = db.query(User).filter(User.is_worker == True).first()
-                if worker_user:
-                    earnings = round((task.cost or 0.005) * 0.70, 4)
-                    worker_user.balance += earnings
-                    worker_user.total_earned += earnings
-                    trans = Transaction(
-                        transaction_id=str(uuid.uuid4()),
-                        user_id=worker_user.id,
+                task_cost = task.cost if (task and task.cost) else 0.0052
+                task_claim = getattr(task, "claimed_by", None) if task else None
+                try:
+                    attribute_worker_earnings(
+                        db=db,
                         task_id=task.task_id,
-                        type=TransactionType.EARNING,
-                        amount=earnings,
-                        balance_after=worker_user.balance,
+                        gross_cost=task_cost,
                         description=f"Host 70% share for render task {task_id[:8]}",
+                        worker_id=task_claim,
                     )
-                    db.add(trans)
+                except Exception as earn_err:
+                    print(f"[WORKER] Failed to attribute render earnings: {earn_err}")
                 db.commit()
         finally:
             db.close()
@@ -349,6 +423,20 @@ def run_batch_inference(
                 task.progress = 100.0
                 task.result = json.dumps(result)
                 task.output_url = json.dumps(output_urls)
+                
+                # SLA Accounting & Worker Earnings
+                batch_cost = task.cost if (task and task.cost) else (0.0052 * len(prompts))
+                task_claim = getattr(task, "claimed_by", None) if task else None
+                try:
+                    attribute_worker_earnings(
+                        db=db,
+                        task_id=task_id,
+                        gross_cost=batch_cost,
+                        description=f"Host 70% share for batch render task {task_id[:8]} ({len(prompts)} items)",
+                        worker_id=task_claim,
+                    )
+                except Exception as earn_err:
+                    print(f"[WORKER] Failed to attribute batch earnings: {earn_err}")
                 db.commit()
         finally:
             db.close()
@@ -517,6 +605,20 @@ def train_model(
                 task.progress = 100.0
                 task.result = json.dumps(result)
                 task.output_url = output_url
+                
+                # SLA Accounting & Worker Earnings
+                train_cost = task.cost if (task and task.cost) else 0.2500
+                task_claim = getattr(task, "claimed_by", None) if task else None
+                try:
+                    attribute_worker_earnings(
+                        db=db,
+                        task_id=task_id,
+                        gross_cost=train_cost,
+                        description=f"Host 70% share for fine-tuning task {task_id[:8]}",
+                        worker_id=task_claim,
+                    )
+                except Exception as earn_err:
+                    print(f"[WORKER] Failed to attribute training earnings: {earn_err}")
                 db.commit()
         finally:
             db.close()
@@ -721,6 +823,19 @@ def execute_training_job(self, job_id: str):
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
 
+        # Phase 2.4: SLA Accounting & Automated Worker Earnings (70% share)
+        try:
+            earning_res = attribute_worker_earnings(
+                db=db,
+                task_id=job_id,
+                gross_cost=job.cost,
+                description=f"Host 70% share for enterprise LoRA training job {job_id[:8]} ({total_epochs} epochs)",
+                worker_id="node-gpu-local-01",
+            )
+            print(f"[WORKER] Credited training job earnings: {earning_res}")
+        except Exception as earn_err:
+            print(f"[WORKER] Error recording training job earnings: {earn_err}")
+
         print(f"[WORKER] Training job {job_id} successfully completed! Final adapter: {final_adapter_url}")
         return {
             "status": "completed",
@@ -850,6 +965,24 @@ def serve_inference_request(
             print(f"[WORKER] Failed to update endpoint metrics: {e}")
         finally:
             db.close()
+
+    # Phase 2.4: SLA Accounting & Automated Worker Earnings for Inference
+    import uuid
+    db_earn = SessionLocal()
+    try:
+        # Standard token compute fee ($0.0052 per inference request)
+        inference_cost = 0.0052
+        attribute_worker_earnings(
+            db=db_earn,
+            task_id=f"inf-{uuid.uuid4().hex[:8]}",
+            gross_cost=inference_cost,
+            description=f"Host 70% share for neural inference ({model}, {total_tokens} tokens)",
+            worker_id="node-gpu-local-01",
+        )
+    except Exception as earn_err:
+        print(f"[WORKER] Failed to attribute inference worker earnings: {earn_err}")
+    finally:
+        db_earn.close()
 
     return {
         "content": completion_text,

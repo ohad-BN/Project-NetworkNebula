@@ -2005,6 +2005,110 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Cluster fleet WebSocket broadcast", str(e))
 
+    # =========================================================================
+    # Phase 2.4 (Alpha Milestone 2): Dynamic Task Routing, SLA Accounting & Automated Worker Earnings
+    # =========================================================================
+    print_header("Phase 2.4 (Alpha Milestone 2): Dynamic Task Routing, SLA Accounting & Automated Worker Earnings")
+
+    # M2.10 Worker Task Execution SLA Accounting & Counter Increment
+    try:
+        from app.worker import attribute_worker_earnings, serve_inference_request
+        from app.models import Worker, User, Transaction, TransactionType
+
+        db = SessionLocal()
+        try:
+            from app.cluster_worker_router import sync_primary_local_worker
+            primary_worker = sync_primary_local_worker(db)
+            init_tasks = primary_worker.total_tasks_completed or 0
+            init_worker_earnings = primary_worker.total_earnings_usd or 0.0
+        finally:
+            db.close()
+
+        # Execute genuine neural inference request through serve_inference_request
+        inf_task_res = serve_inference_request(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            messages=[{"role": "user", "content": "NetworkNebula SLA task routing ping"}],
+            max_tokens=16
+        )
+
+        db = SessionLocal()
+        try:
+            w_after = db.query(Worker).filter(Worker.id == "node-gpu-local-01").first()
+            tasks_accounted = (
+                w_after is not None
+                and (w_after.total_tasks_completed or 0) >= (init_tasks + 1)
+                and inf_task_res.get("total_tokens", 0) > 0
+            )
+            suite.record(
+                tasks_accounted,
+                f"Worker task execution SLA accounting verified (node: {w_after.id}, tasks completed: {w_after.total_tasks_completed}, prompt+completion tokens: {inf_task_res.get('total_tokens')})"
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        suite.record(False, "Worker task execution SLA accounting", str(e))
+
+    # M2.11 Automated Compute Earnings Credit & Ledger Audit (70% Host Share)
+    try:
+        db = SessionLocal()
+        try:
+            w_post = db.query(Worker).filter(Worker.id == "node-gpu-local-01").first()
+            expected_payout = round(0.0052 * 0.70, 4)
+            # Find recent transaction of type EARNING for node-gpu-local-01
+            recent_earning_tx = db.query(Transaction).filter(
+                Transaction.worker_id == "node-gpu-local-01",
+                Transaction.type == TransactionType.EARNING
+            ).order_by(Transaction.created_at.desc()).first()
+
+            earning_ok = (
+                w_post is not None
+                and (w_post.total_earnings_usd or 0.0) >= (init_worker_earnings + expected_payout - 0.0001)
+                and recent_earning_tx is not None
+                and recent_earning_tx.amount >= (expected_payout - 0.0001)
+            )
+            suite.record(
+                earning_ok,
+                f"Automated compute earnings credited to node & user ledger (Node: ${w_post.total_earnings_usd:.4f}, TX: {recent_earning_tx.transaction_id[:12] if recent_earning_tx else 'None'}..., +${recent_earning_tx.amount if recent_earning_tx else 0:.4f})"
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        suite.record(False, "Automated compute earnings credit & ledger audit", str(e))
+
+    # M2.12 CLI 'get_payout.py' Fleet Telemetry & Node Earnings Reporting
+    try:
+        payout_proc = subprocess.run(
+            [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        payout_text_proc = subprocess.run(
+            [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if payout_proc.returncode == 0 and payout_text_proc.returncode == 0:
+            p_data = json.loads(payout_proc.stdout.strip())
+            nodes = p_data.get("nodes", [])
+            local_node = next((n for n in nodes if n.get("node_id") == "node-gpu-local-01"), {})
+            cli_payout_ok = (
+                local_node.get("node_id") == "node-gpu-local-01"
+                and local_node.get("vram_allocation_pct") in (80, 85, 75, 50, 70, 65)
+                and local_node.get("total_tasks_completed", 0) >= 1
+                and local_node.get("total_earnings_usd", 0.0) > 0.0
+                and "REGISTERED GPU WORKER NODES" in payout_text_proc.stdout
+            )
+            suite.record(
+                cli_payout_ok,
+                f"CLI 'get_payout.py' fleet telemetry verified (node: {local_node.get('node_id')}, contrib: {local_node.get('vram_allocation_pct')}%, tasks: {local_node.get('total_tasks_completed')}, accrued: ${local_node.get('total_earnings_usd'):.4f})"
+            )
+        else:
+            suite.record(False, "CLI 'get_payout.py' fleet telemetry", f"Exit {payout_proc.returncode}/{payout_text_proc.returncode}: {payout_proc.stderr}")
+    except Exception as e:
+        suite.record(False, "CLI 'get_payout.py' fleet telemetry", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
