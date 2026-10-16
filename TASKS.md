@@ -1,8 +1,9 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 3 — Phase 3.3 Active (Autonomous CLI Worker Task Execution & Tunnel Dispatch)  
+> **Project Phase:** Alpha Milestone 4 Active — Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**126/126 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**132/132 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
+
 
 ---
 
@@ -210,7 +211,48 @@
 
 ---
 
+## 🚀 Alpha Milestone 4: Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA
+
+### 📋 Phase 4.1: Cryptographic Execution Verification & Optimistic Fraud Proofs
+- [ ] Build `app/verification_engine.py` generating deterministic cryptographic hash commitments over intermediate matrix activations and output tensors
+- [ ] Implement optimistic challenge protocol with spot-check verifiers and Byzantine-robust trimmed-mean gradient filtering for Ring All-Reduce
+- [ ] Add `POST /api/v1/compute/verify` and `POST /api/v1/compute/dispute` in `app/verification_router.py`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.1 assertions (`M4.1` tensor commitment & spot check, `M4.2` Byzantine gradient outlier rejection)
+
+### 📋 Phase 4.2: Collateral-Backed Node Staking & Automated Slashing Controller
+- [ ] Extend `Worker` database schema in `app/models.py` with `staked_amount_usd`, `slashed_amount_usd`, `reputation_score`, and `min_stake_required`
+- [ ] Build `app/staking_engine.py` managing collateral lockups ($50-$500 USD), automated slashing penalties for ungraceful drops/fraud, and compensatory customer redistribution
+- [ ] Add `POST /api/v1/workers/{id}/stake`, `POST /api/v1/workers/{id}/unstake`, and `GET /api/v1/workers/{id}/slashing-history` in `app/staking_router.py`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.2 assertions (`M4.3` collateral staking lifecycle, `M4.4` automated slashing & customer compensation ledger credit)
+
+### 📋 Phase 4.3: Geo-Distributed Region Clustering & Low-Latency Sub-Networks
+- [ ] Extend `Worker` model with `region` (`us-east`, `us-west`, `eu-central`, `ap-southeast`) and RTT latency estimation
+- [ ] Upgrade `ClusterScheduler` in `app/scheduler.py` with topology-aware clustering (<15ms RTT group selection) and strict data sovereignty geo-fencing (e.g. EU GDPR / US-only)
+- [ ] Upgrade `nebula_worker.py` CLI agent with `--region` flag and automated latency ping estimation
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.3 assertions (`M4.5` latency-aware peer grouping, `M4.6` sovereign geo-fencing enforcement)
+
+### 📋 Phase 4.4: Enterprise Prometheus Telemetry, OpenTelemetry & SLA Observability
+- [ ] Build `app/metrics_service.py` exporting standardized Prometheus `/metrics` (GPU utilization, active VRAM, token throughput, latency p50/p95/p99, active shards, slashing events)
+- [ ] Inject distributed tracing headers (`X-Nebula-Trace-ID`, `X-Nebula-Node-ID`, `X-Nebula-Latency-Ms`) across all gateway endpoints
+- [ ] Add immutable `AuditLog` table in `app/models.py` capturing security events, token revocations, and staking penalties
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.4 assertions (`M4.7` Prometheus `/metrics` verification, `M4.8` request tracing & immutable audit logging)
+
+### 📋 Phase 4.5: React 19 Executive Observability & Governance Cockpit
+- [ ] Upgrade **GPU Fleet Page** (`network-nebula/src/pages/cluster-status.tsx`) with node collateral stake badges, geographic region tags, and latency heatmaps
+- [ ] Upgrade **Worker Control Panel** (`network-nebula/src/pages/worker.tsx`) with collateral staking dialog and slashing history tracker
+- [ ] Build **Enterprise Governance & SLA Cockpit Page** (`network-nebula/src/pages/governance.tsx`) tracking 99.9% SLA uptime, verifiable proof logs, and dispute resolver
+- [ ] Verify clean production build (`bun run build`) with zero TypeScript errors
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.5 assertions (`M4.9` governance telemetry serialization, `M4.10` production frontend SPA compilation)
+
+### 📋 Phase 4.6: Master Test Suite Expansion & Milestone 4 Production Signoff
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.6 master validation tests (`M4.11` Byzantine fault tolerance stress test, `M4.12` Milestone 4 Production Hardening Master Signoff)
+- [ ] Verify clean production frontend compilation (`bun run build`) with zero TypeScript errors
+- [ ] Run `python test_suite.py` to achieve 100% green pass across all **144+** automated tests and sign off Alpha Milestone 4
+
+---
+
 ## ⚡ Instant Command Cheatsheet
+
 
 ```powershell
 # Run the single authoritative test suite:
