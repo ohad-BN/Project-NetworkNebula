@@ -1055,6 +1055,7 @@ from app.wallet_router import router as wallet_router
 
 app.include_router(wallet_router)
 
+# Include Cryptographic Compute Verification & Dispute Router (Alpha Milestone 4)
+from app.verification_router import router as verification_router
 
-
-
+app.include_router(verification_router)

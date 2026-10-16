@@ -2940,8 +2940,126 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Alpha Milestone 3 Master System Signoff", str(e))
 
+    # =========================================================================
+    # Phase 4.1 (Alpha Milestone 4): Cryptographic Execution Verification & Optimistic Fraud Proofs
+    # =========================================================================
+    print_header("Phase 4.1 (Alpha Milestone 4): Cryptographic Execution Verification & Optimistic Fraud Proofs")
+
+    # M4.1 Cryptographic Output Tensor Hash Commitment & Spot-Check Verification
+    try:
+        from app.verification_engine import verification_engine
+        test_task_id = f"task-zk-{uuid.uuid4().hex[:8]}"
+        test_worker_id = "node-gpu-local-01"
+        test_tensor = [0.105 * i - 0.05 for i in range(100)]
+
+        # 1. Commit via API
+        commit_res = requests.post(
+            f"{BASE_URL}/api/v1/compute/commit",
+            json={
+                "task_id": test_task_id,
+                "worker_id": test_worker_id,
+                "tensor_data": test_tensor,
+                "sample_rate": 0.1,
+                "seed": "nebula-m4-seed",
+            },
+            timeout=10,
+        )
+        commit_ok = commit_res.status_code == 200
+        commit_data = commit_res.json().get("commitment", {})
+
+        # 2. Verify legitimate output via API
+        verify_res = requests.post(
+            f"{BASE_URL}/api/v1/compute/verify",
+            json={
+                "task_id": test_task_id,
+                "worker_id": test_worker_id,
+                "commitment_hash": commit_data.get("full_hash"),
+                "tensor_sample": commit_data.get("sample_values"),
+                "ground_truth_sample": commit_data.get("sample_values"),
+                "tolerance": 1e-4,
+            },
+            timeout=10,
+        )
+        verify_ok = verify_res.status_code == 200 and verify_res.json().get("valid") is True
+
+        # 3. Dispute fraudulent worker output (tampered values)
+        dispute_res = requests.post(
+            f"{BASE_URL}/api/v1/compute/dispute",
+            json={
+                "task_id": test_task_id,
+                "worker_id": test_worker_id,
+                "disputed_commitment": commit_data,
+                "evidence": {
+                    "challenger_samples": [v + 50.0 for v in commit_data.get("sample_values", [])]
+                },
+                "tolerance": 1e-4,
+            },
+            timeout=10,
+        )
+        disp_data = dispute_res.json().get("dispute", {}) if dispute_res.status_code == 200 else {}
+        dispute_ok = (
+            dispute_res.status_code == 200
+            and disp_data.get("fraud_confirmed") is True
+            and disp_data.get("penalty_recommended") == "slash_100_percent"
+        )
+
+        m4_1_ok = commit_ok and verify_ok and dispute_ok
+        suite.record(
+            m4_1_ok,
+            f"Cryptographic tensor commitment & optimistic fraud proof verified (commit: {commit_data.get('commitment_id')}, samples: {commit_data.get('sample_count')}, fraud confirmed: {disp_data.get('fraud_confirmed')}, penalty: {disp_data.get('penalty_recommended')})"
+        )
+    except Exception as e:
+        suite.record(False, "Cryptographic tensor commitment & spot check", str(e))
+
+    # M4.2 Byzantine-Robust Gradient Outlier Rejection during Ring All-Reduce
+    try:
+        import numpy as np
+        from app.verification_engine import verification_engine
+        from app.distributed import GradientAggregator
+
+        # 1. Test verification engine trimmed-mean and median rejection of poisoned worker
+        honest_workers = ["node-h100-01", "node-h100-02", "node-h100-03"]
+        byzantine_worker = "node-byzantine-evil"
+        all_workers = honest_workers + [byzantine_worker]
+
+        honest_grad1 = [0.05, -0.12, 0.33, 0.01, -0.45]
+        honest_grad2 = [0.06, -0.11, 0.35, 0.02, -0.44]
+        honest_grad3 = [0.04, -0.13, 0.32, 0.01, -0.46]
+        poisoned_grad = [1000.0, -9999.0, 5000.0, -3000.0, 8888.0]
+
+        robust_agg = verification_engine.aggregate_gradients_byzantine_robust(
+            gradients=[honest_grad1, honest_grad2, honest_grad3, poisoned_grad],
+            worker_ids=all_workers,
+            method="trimmed_mean",
+            trim_ratio=0.25,
+        )
+
+        is_flagged = byzantine_worker in robust_agg.get("flagged_poisoned_workers", [])
+        agg_grad = robust_agg.get("aggregated_gradient")
+        agg_val_first = float(agg_grad[0])
+        not_poisoned = abs(agg_val_first - 0.05) < 0.05
+
+        # 2. Test GradientAggregator end-to-end integration
+        aggregator = GradientAggregator(num_workers=4, robust_byzantine=True, method="trimmed_mean")
+        bid = aggregator.create_bucket("lora_test_weight", (5,))
+        for wid, gvec in zip(all_workers, [honest_grad1, honest_grad2, honest_grad3, poisoned_grad]):
+            gb = np.array(gvec, dtype=np.float32).tobytes()
+            aggregator.add_gradient(bid, wid, gb)
+
+        reduced_bytes = aggregator.get_aggregated_gradient(bid)
+        reduced_np = np.frombuffer(reduced_bytes, dtype=np.float32) if reduced_bytes else np.array([])
+        agg_integrated_clean = len(reduced_np) == 5 and abs(float(reduced_np[0]) - 0.05) < 0.05
+
+        m4_2_ok = is_flagged and not_poisoned and agg_integrated_clean
+        suite.record(
+            m4_2_ok,
+            f"Byzantine gradient outlier rejection verified (flagged: {robust_agg.get('flagged_poisoned_workers')}, robust center: [{agg_val_first:.4f}, ...], poison rejected: {not_poisoned})"
+        )
+    except Exception as e:
+        suite.record(False, "Byzantine gradient outlier rejection", str(e))
 
     return suite.summary()
+
 
 if __name__ == "__main__":
     success = run_tests()
