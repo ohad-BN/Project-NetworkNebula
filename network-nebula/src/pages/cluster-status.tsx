@@ -183,7 +183,7 @@ export function ClusterStatusPage() {
   const totalVram = telemetry?.total_vram_gb || nodes.reduce((acc, n) => acc + (n.vram_total_gb || 0), 0);
   const allocatedVram = telemetry?.allocated_vram_gb || nodes.reduce((acc, n) => acc + (n.vram_allocated_gb || 0), 0);
   const clusterEarnings = nodes.reduce((acc, n) => acc + (n.total_earnings_usd || 0), 0);
-  const totalCompletedTasks = nodes.reduce((acc, n) => acc + (n.total_tasks_completed || 0), 0);
+  const totalStakedCollateral = nodes.reduce((acc, n) => acc + (n.staked_amount_usd || 0), 0);
 
   return (
     <div className="container mx-auto py-8 px-4 max-w-6xl">
@@ -206,7 +206,7 @@ export function ClusterStatusPage() {
             )}
           </div>
           <p className="text-muted-foreground mt-1">
-            Real-time status of decentralized compute hosts, dynamic 10%–100% VRAM contribution sliders, and S3 object fabrics
+            Real-time status of decentralized compute hosts, collateral-backed node staking, dynamic 10%–100% VRAM contribution sliders, and S3 object fabrics
           </p>
         </div>
 
@@ -225,23 +225,23 @@ export function ClusterStatusPage() {
       </div>
 
       {/* Cluster Overview Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
         <Card>
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
               <Cpu className="h-4 w-4 text-primary" />
-              Active Compute Nodes
+              Compute Nodes
             </CardDescription>
-            <CardTitle className="text-2xl font-bold">{nodes.length} Nodes</CardTitle>
+            <CardTitle className="text-2xl font-bold">{nodes.length} Active</CardTitle>
           </CardHeader>
         </Card>
         <Card>
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
               <HardDrive className="h-4 w-4 text-purple-500" />
-              Cluster GPU Allocation
+              GPU Allocation
             </CardDescription>
-            <CardTitle className="text-2xl font-bold font-mono">
+            <CardTitle className="text-xl font-bold font-mono">
               {allocatedVram.toFixed(1)} / {totalVram.toFixed(0)} GB
             </CardTitle>
           </CardHeader>
@@ -249,22 +249,33 @@ export function ClusterStatusPage() {
         <Card>
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
-              <DollarSign className="h-4 w-4 text-emerald-500" />
-              Cluster Earnings Accrued
+              <ShieldCheck className="h-4 w-4 text-amber-500" />
+              Collateral Staked
             </CardDescription>
-            <CardTitle className="text-2xl font-bold text-emerald-500 font-mono">
-              ${clusterEarnings.toFixed(4)}
+            <CardTitle className="text-xl font-bold font-mono text-purple-500">
+              ${totalStakedCollateral.toFixed(2)}
             </CardTitle>
           </CardHeader>
         </Card>
         <Card>
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
-              <ShieldCheck className="h-4 w-4 text-amber-500" />
-              SLA Tasks Completed
+              <Activity className="h-4 w-4 text-emerald-500" />
+              SLA Availability
             </CardDescription>
-            <CardTitle className="text-2xl font-bold text-amber-500">
-              {totalCompletedTasks} Jobs
+            <CardTitle className="text-xl font-bold text-emerald-500 font-mono">
+              99.9% Target
+            </CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription className="flex items-center gap-1.5">
+              <DollarSign className="h-4 w-4 text-emerald-500" />
+              Cluster Earned
+            </CardDescription>
+            <CardTitle className="text-xl font-bold text-emerald-500 font-mono">
+              ${clusterEarnings.toFixed(4)}
             </CardTitle>
           </CardHeader>
         </Card>
@@ -332,10 +343,11 @@ export function ClusterStatusPage() {
               <thead className="text-xs uppercase bg-muted/50 text-muted-foreground border-b">
                 <tr>
                   <th className="py-3 px-4">Worker Node</th>
+                  <th className="py-3 px-4">Region & Latency</th>
+                  <th className="py-3 px-4">Staked & Reputation</th>
                   <th className="py-3 px-4">GPU Hardware</th>
-                  <th className="py-3 px-4 min-w-[200px]">GPU Contribution Slider (10%-100%)</th>
+                  <th className="py-3 px-4 min-w-[180px]">GPU Contribution Slider (10%-100%)</th>
                   <th className="py-3 px-4">VRAM Ceiling</th>
-                  <th className="py-3 px-4">Tasks</th>
                   <th className="py-3 px-4">Earned</th>
                   <th className="py-3 px-4 text-right">Status</th>
                 </tr>
@@ -345,6 +357,7 @@ export function ClusterStatusPage() {
                   nodes.slice(0, 25).map((n) => {
                     const allocPct = n.vram_allocation_pct ?? 80;
                     const isUpdating = updatingNodeId === n.node_id;
+                    const ping = n.latency_ping_ms ?? 15.0;
 
                     return (
                       <tr key={n.node_id || n.id} className="hover:bg-muted/30 transition-colors">
@@ -362,16 +375,42 @@ export function ClusterStatusPage() {
                           </div>
                         </td>
                         <td className="py-3 px-4">
-                          <div className="font-medium">{n.gpu_model || n.gpu_info}</div>
-                          <div className="text-xs text-muted-foreground font-mono">
+                          <div className="flex items-center gap-1.5">
+                            <Badge variant="outline" className="text-[10px] uppercase font-mono">
+                              {n.region || "us-east"}
+                            </Badge>
+                            <span className={`text-[11px] font-mono ${ping <= 15 ? "text-emerald-500 font-semibold" : "text-amber-500"}`}>
+                              ⚡ {ping.toFixed(1)}ms
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="flex items-center gap-1.5">
+                            {(n.staked_amount_usd || 0) > 0 ? (
+                              <Badge className="bg-purple-600 text-[10px] font-mono">
+                                ${(n.staked_amount_usd || 0).toFixed(0)} Staked
+                              </Badge>
+                            ) : (
+                              <Badge variant="outline" className="text-muted-foreground text-[10px]">
+                                Unstaked
+                              </Badge>
+                            )}
+                            <span className="text-xs font-mono text-muted-foreground">
+                              {(n.reputation_score || 100).toFixed(0)}% Rep
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-medium text-xs">{n.gpu_model || n.gpu_info}</div>
+                          <div className="text-[11px] text-muted-foreground font-mono">
                             CUDA: {n.cuda_version || "12.8"}
                           </div>
                         </td>
                         <td className="py-3 px-4">
-                          <div className="space-y-1.5 max-w-[220px]">
+                          <div className="space-y-1 max-w-[200px]">
                             <div className="flex items-center justify-between text-xs">
                               <span className="font-medium text-foreground">
-                                Limit: {allocPct}%
+                                {allocPct}%
                               </span>
                               <span className="text-muted-foreground font-mono text-[11px]">
                                 {n.vram_allocated_gb?.toFixed(1) || (n.vram_total_gb * allocPct / 100).toFixed(1)} / {n.vram_total_gb?.toFixed(1)} GB
@@ -390,9 +429,6 @@ export function ClusterStatusPage() {
                         </td>
                         <td className="py-3 px-4 font-mono text-xs">
                           {n.vram_allocated_gb?.toFixed(1) || 6.4} GB
-                        </td>
-                        <td className="py-3 px-4 font-mono text-xs font-semibold">
-                          {n.total_tasks_completed || 0}
                         </td>
                         <td className="py-3 px-4 font-mono text-xs font-semibold text-emerald-500">
                           ${(n.total_earnings_usd || 0).toFixed(4)}
@@ -413,7 +449,7 @@ export function ClusterStatusPage() {
                   })
                 ) : (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-muted-foreground">
+                    <td colSpan={8} className="py-8 text-center text-muted-foreground">
                       No worker nodes registered yet. Run the join command above to connect!
                     </td>
                   </tr>

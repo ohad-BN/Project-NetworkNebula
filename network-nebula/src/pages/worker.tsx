@@ -4,6 +4,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Activity,
   CheckCircle2,
@@ -19,6 +21,7 @@ import {
   HardDrive,
   ShieldCheck,
   TrendingUp,
+  Award,
 } from "lucide-react";
 import {
   workersService,
@@ -34,6 +37,9 @@ export function WorkerDashboardPage() {
   const [isUpdating, setIsUpdating] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
   const [lastHeartbeat, setLastHeartbeat] = useState<Date | null>(new Date());
+  const [stakeAmount, setStakeAmount] = useState<string>("50");
+  const [unstakeAmount, setUnstakeAmount] = useState<string>("25");
+  const [isStakingOp, setIsStakingOp] = useState<boolean>(false);
 
   const loadWorkerData = useCallback(async (targetId?: string) => {
     try {
@@ -108,6 +114,44 @@ export function WorkerDashboardPage() {
     setCopiedCmd(id);
     toast.success("Command copied to clipboard");
     setTimeout(() => setCopiedCmd(null), 2500);
+  };
+
+  const handleStakeCollateral = async () => {
+    if (!node) return;
+    const amount = parseFloat(stakeAmount);
+    if (isNaN(amount) || amount <= 0) {
+      toast.error("Please enter a valid stake amount");
+      return;
+    }
+    try {
+      setIsStakingOp(true);
+      const res = await workersService.stakeCollateral(node.node_id || node.id, amount);
+      toast.success(res.message || `Deposited $${amount.toFixed(2)} collateral`);
+      loadWorkerData(node.node_id || node.id);
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || "Failed to stake collateral");
+    } finally {
+      setIsStakingOp(false);
+    }
+  };
+
+  const handleUnstakeCollateral = async () => {
+    if (!node) return;
+    const amount = parseFloat(unstakeAmount);
+    if (isNaN(amount) || amount <= 0) {
+      toast.error("Please enter a valid unstake amount");
+      return;
+    }
+    try {
+      setIsStakingOp(true);
+      const res = await workersService.unstakeCollateral(node.node_id || node.id, amount);
+      toast.success(res.message || `Unstaked $${amount.toFixed(2)} collateral`);
+      loadWorkerData(node.node_id || node.id);
+    } catch (err: any) {
+      toast.error(err.response?.data?.detail || "Failed to unstake collateral");
+    } finally {
+      setIsStakingOp(false);
+    }
   };
 
   if (isLoading) {
@@ -343,6 +387,120 @@ export function WorkerDashboardPage() {
             </CardContent>
           </Card>
         </div>
+
+        {/* Collateral-Backed Node Staking & Slashing SLA Governance Card (Phase 4.5) */}
+        <Card className="border-purple-500/30 bg-card/60 backdrop-blur-sm">
+          <CardHeader>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Award className="h-5 w-5 text-purple-500" />
+                Collateral Staking & Slashing SLA Governance
+              </CardTitle>
+              <div className="flex items-center gap-2">
+                {(node?.staked_amount_usd || 0) >= (node?.min_stake_required || 50) ? (
+                  <Badge variant="default" className="bg-purple-600 text-xs">
+                    Enterprise Job Qualified
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" className="text-amber-500 border-amber-500 text-xs">
+                    Min ${(node?.min_stake_required || 50).toFixed(0)} Stake Needed
+                  </Badge>
+                )}
+              </div>
+            </div>
+            <CardDescription>
+              Host collateral deposit locks node priority for distributed training jobs. Unannounced drops or fraud proofs trigger automated slashing.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+              <div className="p-3 border rounded-lg bg-muted/20">
+                <span className="text-xs text-muted-foreground">Staked Collateral</span>
+                <div className="text-2xl font-bold font-mono text-purple-500 mt-1">
+                  ${(node?.staked_amount_usd || 0).toFixed(2)}
+                </div>
+                <span className="text-[11px] text-muted-foreground">Min Required: ${(node?.min_stake_required || 50).toFixed(0)}</span>
+              </div>
+              <div className="p-3 border rounded-lg bg-muted/20">
+                <span className="text-xs text-muted-foreground">SLA Reputation Score</span>
+                <div className="text-2xl font-bold font-mono text-emerald-500 mt-1">
+                  {(node?.reputation_score || 100).toFixed(1)}%
+                </div>
+                <span className="text-[11px] text-muted-foreground">0 unannounced drops</span>
+              </div>
+              <div className="p-3 border rounded-lg bg-muted/20">
+                <span className="text-xs text-muted-foreground">Cumulative Slashed</span>
+                <div className="text-2xl font-bold font-mono text-red-500 mt-1">
+                  ${(node?.slashed_amount_usd || 0).toFixed(2)}
+                </div>
+                <span className="text-[11px] text-muted-foreground">Penalties deducted</span>
+              </div>
+              <div className="p-3 border rounded-lg bg-muted/20">
+                <span className="text-xs text-muted-foreground">Region / Inter-Node Ping</span>
+                <div className="text-lg font-bold font-mono text-foreground mt-1 uppercase">
+                  {node?.region || "us-east"}
+                </div>
+                <span className="text-[11px] text-emerald-500 font-mono">⚡ {node?.latency_ping_ms ?? 15.0} ms</span>
+              </div>
+            </div>
+
+            {/* Deposit & Unstake Controls */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2 border-t">
+              <div className="space-y-3">
+                <Label htmlFor="stakeInput" className="text-xs font-semibold">Deposit Collateral Stake ($USD)</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="stakeInput"
+                    type="number"
+                    min="10"
+                    step="5"
+                    value={stakeAmount}
+                    onChange={(e) => setStakeAmount(e.target.value)}
+                    placeholder="50.00"
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    onClick={handleStakeCollateral}
+                    disabled={isStakingOp || !node}
+                    className="gap-1.5 shrink-0 bg-purple-600 hover:bg-purple-700"
+                  >
+                    <Award className="h-4 w-4" /> Deposit Stake
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Deposit collateral to qualify for high-priority distributed LoRA and fine-tuning epochs.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <Label htmlFor="unstakeInput" className="text-xs font-semibold">Withdraw Collateral Stake ($USD)</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="unstakeInput"
+                    type="number"
+                    min="1"
+                    step="5"
+                    value={unstakeAmount}
+                    onChange={(e) => setUnstakeAmount(e.target.value)}
+                    placeholder="25.00"
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    onClick={handleUnstakeCollateral}
+                    disabled={isStakingOp || !node || (node?.staked_amount_usd || 0) <= 0}
+                    variant="outline"
+                    className="gap-1.5 shrink-0"
+                  >
+                    Unstake Collateral
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Available to unstake anytime when not locked in active training epochs.
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
 
         {/* Quick CLI Commands Widget */}
         <Card>

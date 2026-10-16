@@ -403,10 +403,19 @@ class StakingEngine:
                 "worker_id": w.id,
                 "name": w.name,
                 "gpu_info": w.gpu_info,
+                "region": getattr(w, "region", "us-east") or "us-east",
                 "staked_amount_usd": float(w.staked_amount_usd or 0.0),
+                "slashed_amount_usd": float(w.slashed_amount_usd or 0.0),
                 "reputation_score": float(w.reputation_score or 100.0),
                 "status": w.status,
                 "is_available": w.is_available,
+                "tier": (
+                    "High-Priority Enterprise Cluster"
+                    if float(w.staked_amount_usd or 0.0) >= MIN_TRAINING_STAKE_USD
+                    else "Standard Dedicated Worker"
+                    if float(w.staked_amount_usd or 0.0) >= MIN_INFERENCE_STAKE_USD
+                    else "Unstaked Node"
+                ),
             }
             for w in workers
         ]

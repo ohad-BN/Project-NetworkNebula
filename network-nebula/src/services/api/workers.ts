@@ -31,6 +31,12 @@ export interface ClusterNodeTelemetry {
   total_earnings_usd: number;
   tunnel_active: boolean;
   last_heartbeat: string;
+  staked_amount_usd?: number;
+  slashed_amount_usd?: number;
+  reputation_score?: number;
+  min_stake_required?: number;
+  region?: string;
+  latency_ping_ms?: number;
 }
 
 export interface ClusterTelemetryResponse {
@@ -52,6 +58,23 @@ export interface WorkerConfigUpdateResponse {
   vram_allocated_gb: number;
   cuda_fraction_enforced: boolean;
   tunnel_pushed: boolean;
+}
+
+export interface StakingInfoResponse {
+  status: string;
+  worker_id: string;
+  staked_amount_usd: number;
+  slashed_amount_usd: number;
+  reputation_score: number;
+  min_stake_required: number;
+  is_qualified_for_training: boolean;
+  slash_history: Array<{
+    type: string;
+    penalty_pct: number;
+    amount_slashed: number;
+    reason: string;
+    timestamp: string;
+  }>;
 }
 
 export const workersService = {
@@ -94,5 +117,33 @@ export const workersService = {
 
   deregister: async (workerId: string): Promise<void> => {
     await apiClient.post(`/workers/${workerId}/deregister`);
+  },
+
+  stakeCollateral: async (
+    workerId: string,
+    amount: number
+  ): Promise<{ status: string; staked_amount_usd: number; message: string }> => {
+    const response = await apiClient.post(`/api/v1/workers/${workerId}/stake`, { amount });
+    return response.data;
+  },
+
+  unstakeCollateral: async (
+    workerId: string,
+    amount: number
+  ): Promise<{ status: string; remaining_stake_usd: number; message: string }> => {
+    const response = await apiClient.post(`/api/v1/workers/${workerId}/unstake`, { amount });
+    return response.data;
+  },
+
+  getStakingInfo: async (workerId: string): Promise<StakingInfoResponse> => {
+    const response = await apiClient.get(`/api/v1/workers/${workerId}/staking`);
+    return response.data;
+  },
+
+  getSlashingHistory: async (
+    workerId: string
+  ): Promise<{ status: string; worker_id: string; total_slashed_usd: number; events: any[] }> => {
+    const response = await apiClient.get(`/api/v1/workers/${workerId}/slashing-history`);
+    return response.data;
   },
 };

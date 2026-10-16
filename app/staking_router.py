@@ -167,8 +167,11 @@ def get_staking_leaderboard(
     """List highest-staked and highest-reputation GPU nodes in the cluster."""
     try:
         nodes = staking_engine.get_staking_leaderboard(db=db, limit=limit)
+        total_staked = sum(float(n.get("staked_amount_usd", 0.0) or 0.0) for n in nodes)
         return {
+            "status": "ok",
             "total": len(nodes),
+            "total_staked_usd": round(total_staked, 2),
             "leaderboard": nodes,
         }
     except Exception as e:

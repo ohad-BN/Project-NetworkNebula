@@ -17,6 +17,7 @@ import { TrainingStudioPage } from "@/pages/training-studio";
 import { InferenceHubPage } from "@/pages/inference-hub";
 import { ApiTokensPage } from "@/pages/api-tokens";
 import { ClusterStatusPage } from "@/pages/cluster-status";
+import { GovernancePage } from "@/pages/governance";
 import type { ReactNode } from "react";
 
 function ProtectedRouteWrapper({
@@ -45,6 +46,7 @@ function App() {
           <Route path="/inference" element={<InferenceHubPage />} />
           <Route path="/api-tokens" element={<ApiTokensPage />} />
           <Route path="/cluster" element={<ClusterStatusPage />} />
+          <Route path="/governance" element={<GovernancePage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/register/worker" element={<RegisterWorkerPage />} />
