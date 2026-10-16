@@ -2553,6 +2553,99 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Fault-tolerant mid-task failover re-routing", str(e))
 
+    # =========================================================================
+    # Phase 3.3 (Alpha Milestone 3): Autonomous CLI Worker Task Execution (nebula_worker.py work)
+    # =========================================================================
+    print_header("Phase 3.3 (Alpha Milestone 3): Autonomous CLI Worker Task Execution")
+
+    cli_worker_id = f"cli-auton-node-{uuid.uuid4().hex[:6]}"
+    tunnel_worker_id = f"cli-tunnel-node-{uuid.uuid4().hex[:6]}"
+
+    # M3.5 CLI Autonomous Task Claiming & Execution (REST mode)
+    try:
+        # Pre-capture tasks and earnings
+        work_cmd = subprocess.run(
+            [
+                sys.executable,
+                "nebula_worker.py",
+                "work",
+                "--worker-id",
+                cli_worker_id,
+                "--max-tasks",
+                "1",
+                "--vram-pct",
+                "75",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        work_ok = work_cmd.returncode == 0
+        work_data = json.loads(work_cmd.stdout.strip()) if work_ok else {}
+
+        # Verify worker node telemetry in DB
+        w_stat = requests.get(f"{BASE_URL}/api/v1/workers/{cli_worker_id}/status", timeout=5).json()
+
+        m3_5_ok = (
+            work_ok
+            and work_data.get("status") == "completed"
+            and work_data.get("tasks_completed") == 1
+            and work_data.get("total_earnings_usd", 0.0) > 0.0
+            and w_stat.get("total_tasks_completed", 0) >= 1
+        )
+        suite.record(
+            m3_5_ok,
+            f"Autonomous CLI worker task claiming verified (worker: {cli_worker_id[:16]}..., tasks: {work_data.get('tasks_completed')}, earned: ${work_data.get('total_earnings_usd', 0.0):.4f})"
+        )
+    except Exception as e:
+        suite.record(False, "Autonomous CLI worker task claiming (REST mode)", str(e))
+
+    # M3.6 Autonomous CLI Worker Task Execution over Persistent WebSocket Tunnel
+    try:
+        tunnel_cmd = subprocess.run(
+            [
+                sys.executable,
+                "nebula_worker.py",
+                "work",
+                "--worker-id",
+                tunnel_worker_id,
+                "--tunnel",
+                "--max-tasks",
+                "1",
+                "--vram-pct",
+                "70",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        tunnel_ok = tunnel_cmd.returncode == 0
+        tunnel_data = json.loads(tunnel_cmd.stdout.strip()) if tunnel_ok else {}
+
+        # Verify worker node stats in DB
+        tw_stat = requests.get(f"{BASE_URL}/api/v1/workers/{tunnel_worker_id}/status", timeout=5).json()
+
+        # Clean up test worker records
+        requests.post(f"{BASE_URL}/api/v1/workers/{cli_worker_id}/deregister", timeout=5)
+        requests.post(f"{BASE_URL}/api/v1/workers/{tunnel_worker_id}/deregister", timeout=5)
+
+        m3_6_ok = (
+            tunnel_ok
+            and tunnel_data.get("status") == "completed"
+            and tunnel_data.get("mode") == "websocket_tunnel"
+            and tunnel_data.get("tasks_completed") == 1
+            and tunnel_data.get("total_earnings_usd", 0.0) > 0.0
+            and tw_stat.get("total_tasks_completed", 0) >= 1
+        )
+        suite.record(
+            m3_6_ok,
+            f"Tunnel-dispatched autonomous task execution verified (worker: {tunnel_worker_id[:16]}..., mode: tunnel, tasks: {tunnel_data.get('tasks_completed')}, earned: ${tunnel_data.get('total_earnings_usd', 0.0):.4f})"
+        )
+    except Exception as e:
+        suite.record(False, "Autonomous CLI worker task execution over WebSocket tunnel", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ Provides real-time hardware introspection, GPU contribution percentage control (
 worker node registration, heartbeat synchronization, and cluster telemetry.
 """
 
+import json
 import logging
 import os
 import time
@@ -27,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import engine, get_db
-from app.models import Task, Transaction, TransactionType, User, Worker
+from app.models import Task, TaskStatus, Transaction, TransactionType, User, Worker
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,17 @@ class WorkerTunnelManager:
                 return True
             except Exception as e:
                 logger.warning(f"Failed to push config update over WebSocket to {worker_id}: {e}")
+                self.disconnect(worker_id, ws)
+        return False
+
+    async def send_task_dispatch(self, worker_id: str, task_data: Dict[str, Any]) -> bool:
+        ws = self.active_tunnels.get(worker_id)
+        if ws:
+            try:
+                await ws.send_json({"type": "task_dispatch", **task_data})
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to push task dispatch over WebSocket to {worker_id}: {e}")
                 self.disconnect(worker_id, ws)
         return False
 
@@ -724,6 +736,90 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str):
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong", "worker_id": worker_id})
 
+            elif msg_type == "claim_task":
+                # Look for queued tasks
+                task = db.query(Task).filter(Task.status == TaskStatus.QUEUED, Task.claimed_by == None).first()
+                if not task:
+                    # Auto-provision a task for autonomous execution
+                    task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
+                    w_record = db.query(Worker).filter(Worker.id == worker_id).first()
+                    task = Task(
+                        task_id=task_id,
+                        user_id=w_record.user_id if w_record else None,
+                        prompt=data.get("prompt", "Project NetworkNebula autonomous neural inference execution"),
+                        status=TaskStatus.PROCESSING,
+                        task_mode="standalone",
+                        cost=0.0052,
+                        claimed_by=worker_id,
+                    )
+                    db.add(task)
+                else:
+                    task.claimed_by = worker_id
+                    task.status = TaskStatus.PROCESSING
+
+                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
+                if w_record:
+                    w_record.current_task_id = task.task_id
+                    w_record.status = "busy"
+                db.commit()
+
+                await websocket.send_json({
+                    "type": "task_dispatch",
+                    "task": {
+                        "task_id": task.task_id,
+                        "prompt": task.prompt,
+                        "task_type": "inference",
+                        "width": getattr(task, "width", 512),
+                        "height": getattr(task, "height", 512),
+                        "steps": getattr(task, "steps", 20),
+                        "cost": float(task.cost or 0.0052),
+                    }
+                })
+
+            elif msg_type == "task_progress":
+                tid = data.get("task_id")
+                prog = float(data.get("progress", 0.0))
+                t_obj = db.query(Task).filter(Task.task_id == tid).first()
+                if t_obj:
+                    t_obj.progress = prog
+                    db.commit()
+                await websocket.send_json({
+                    "type": "progress_ack",
+                    "task_id": tid,
+                    "progress": prog,
+                })
+
+            elif msg_type == "task_complete":
+                tid = data.get("task_id")
+                res_obj = data.get("result", {})
+                t_obj = db.query(Task).filter(Task.task_id == tid).first()
+                earnings_res = {}
+                if t_obj:
+                    t_obj.status = TaskStatus.SUCCESS
+                    t_obj.progress = 100.0
+                    t_obj.result = json.dumps(res_obj)
+                    from app.worker import attribute_worker_earnings
+                    earnings_res = attribute_worker_earnings(
+                        db=db,
+                        task_id=tid,
+                        gross_cost=float(t_obj.cost or 0.0052),
+                        description=f"Host 70% share for autonomous tunnel task {tid[:8]}",
+                        worker_id=worker_id,
+                    )
+                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
+                if w_record:
+                    w_record.current_task_id = None
+                    w_record.status = "online"
+                db.commit()
+
+                await websocket.send_json({
+                    "type": "task_complete_ack",
+                    "task_id": tid,
+                    "status": "completed",
+                    "earnings": earnings_res.get("earnings", 0.0036),
+                    "total_earnings_usd": earnings_res.get("worker_earnings_usd", 0.0),
+                })
+
     except WebSocketDisconnect:
         logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel disconnected.")
     except Exception as e:
@@ -879,5 +975,169 @@ def trigger_cluster_scheduler_failover(
         task_type=payload.task_type,
         reason=payload.reason,
     )
+
+
+# ==============================================================================
+# Autonomous CLI Worker Task Claim & Execution Endpoints (Phase 3.3)
+# ==============================================================================
+
+
+class WorkerClaimTaskRequest(BaseModel):
+    task_type: Optional[str] = "inference"
+    vram_available_gb: Optional[float] = None
+    auto_create: bool = True
+    prompt: Optional[str] = None
+
+
+class WorkerTaskProgressRequest(BaseModel):
+    progress: float = Field(default=0.0, ge=0.0, le=100.0)
+    step: Optional[int] = None
+    loss: Optional[float] = None
+    telemetry: Optional[Dict[str, Any]] = None
+
+
+class WorkerTaskCompleteRequest(BaseModel):
+    result: Optional[Dict[str, Any]] = None
+    output_url: Optional[str] = None
+    latency_ms: Optional[float] = None
+    tokens: Optional[int] = None
+
+
+@router.post("/api/v1/workers/{worker_id}/claim-task")
+def worker_claim_task(
+    worker_id: str,
+    payload: Optional[WorkerClaimTaskRequest] = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Allow an autonomous CLI worker node to claim an enqueued task for execution.
+    Auto-provisions a task if the queue is empty and auto_create is True.
+    """
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if not worker:
+        # Auto-register if not yet in database
+        from app.cluster_worker_router import sync_primary_local_worker
+        if worker_id == LOCAL_PRIMARY_NODE_ID:
+            worker = sync_primary_local_worker(db)
+        else:
+            raise HTTPException(status_code=404, detail=f"Worker {worker_id} not registered")
+
+    # Look for existing queued task
+    task = db.query(Task).filter(Task.status == TaskStatus.QUEUED, Task.claimed_by == None).first()
+    if not task:
+        if payload and not payload.auto_create:
+            return {"status": "empty_queue", "task": None}
+        # Auto-create autonomous task for worker
+        task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
+        prompt_text = (payload.prompt if payload and payload.prompt else None) or "NetworkNebula autonomous neural forward pass"
+        task = Task(
+            task_id=task_id,
+            user_id=worker.user_id,
+            prompt=prompt_text,
+            status=TaskStatus.PROCESSING,
+            task_mode="standalone",
+            cost=0.0052,
+            claimed_by=worker_id,
+        )
+        db.add(task)
+    else:
+        task.claimed_by = worker_id
+        task.status = TaskStatus.PROCESSING
+
+    worker.current_task_id = task.task_id
+    worker.status = "busy"
+    db.commit()
+
+    return {
+        "status": "claimed",
+        "worker_id": worker_id,
+        "task": {
+            "task_id": task.task_id,
+            "prompt": task.prompt,
+            "task_type": "inference",
+            "width": getattr(task, "width", 512),
+            "height": getattr(task, "height", 512),
+            "steps": getattr(task, "steps", 20),
+            "cost": float(task.cost or 0.0052),
+        },
+    }
+
+
+@router.post("/api/v1/workers/{worker_id}/tasks/{task_id}/progress")
+def worker_update_task_progress(
+    worker_id: str,
+    task_id: str,
+    payload: WorkerTaskProgressRequest,
+    db: Session = Depends(get_db),
+):
+    """Update execution progress and step metrics for an active worker task."""
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task.progress = float(payload.progress)
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if worker:
+        worker.current_task_id = task_id
+        worker.status = "busy"
+    db.commit()
+
+    return {"status": "ok", "task_id": task_id, "progress": task.progress}
+
+
+@router.post("/api/v1/workers/{worker_id}/tasks/{task_id}/complete")
+def worker_complete_task(
+    worker_id: str,
+    task_id: str,
+    payload: Optional[WorkerTaskCompleteRequest] = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Report task completion from autonomous CLI worker, update database,
+    and credit 70% compute revenue to the worker node and owner user wallet.
+    """
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    res_dict = (payload.result if payload and payload.result else {}) or {
+        "status": "completed",
+        "worker_id": worker_id,
+        "latency_ms": payload.latency_ms if payload else 45.0,
+        "tokens": payload.tokens if payload else 24,
+    }
+    task.status = TaskStatus.SUCCESS
+    task.progress = 100.0
+    task.result = json.dumps(res_dict)
+    if payload and payload.output_url:
+        task.output_url = payload.output_url
+
+    # Credit 70% compute earnings
+    from app.worker import attribute_worker_earnings
+
+    gross_cost = float(task.cost or 0.0052)
+    earning_res = attribute_worker_earnings(
+        db=db,
+        task_id=task_id,
+        gross_cost=gross_cost,
+        description=f"Host 70% share for autonomous task {task_id[:8]}",
+        worker_id=worker_id,
+    )
+
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if worker:
+        worker.current_task_id = None
+        worker.status = "online"
+    db.commit()
+
+    return {
+        "status": "completed",
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "gross_cost": gross_cost,
+        "earnings": earning_res.get("earnings", 0.0036),
+        "total_tasks_completed": earning_res.get("tasks_completed", 1),
+        "total_earnings_usd": earning_res.get("worker_earnings_usd", 0.0036),
+    }
 
 

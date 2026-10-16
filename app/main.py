@@ -779,6 +779,19 @@ def report_task_complete(
                 {"status": "completed", "output_url": output_url, **result_data}
             )
 
+        if db_task.claimed_by:
+            try:
+                from app.worker import attribute_worker_earnings
+                attribute_worker_earnings(
+                    db=db,
+                    task_id=task_id,
+                    gross_cost=float(db_task.cost or 0.0052),
+                    description=f"Host 70% share for CLI worker task {task_id[:8]}",
+                    worker_id=db_task.claimed_by,
+                )
+            except Exception as earn_err:
+                print(f"[MAIN] Failed to credit worker earnings on complete: {earn_err}")
+
     db.commit()
     return {"task_id": task_id, "status": db_task.status.value}
 
