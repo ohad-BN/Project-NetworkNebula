@@ -1808,6 +1808,98 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Dynamic GPU contribution % control", str(e))
 
+    # =========================================================================
+    # Phase 2.2 (Alpha Milestone 2): Standalone "Nebula Worker" CLI Agent
+    # =========================================================================
+    print_header("Phase 2.2 (Alpha Milestone 2): Standalone 'Nebula Worker' CLI Agent")
+
+    # M2.4 Standalone CLI Hardware Auto-Discovery & CUDA Fraction Enforcement
+    try:
+        import nebula_worker
+        hw_info = nebula_worker.discover_hardware()
+        lim_res = nebula_worker.apply_vram_limit(70)
+        hw_ok = (
+            hw_info.get("cuda_available") is True
+            and hw_info.get("gpu_memory_gb", 0) >= 4.0
+            and lim_res.get("cuda_enforced") is True
+            and lim_res.get("vram_allocation_pct") == 70
+        )
+        suite.record(hw_ok, f"CLI hardware auto-discovery verified ({hw_info.get('gpu_model')}, {hw_info.get('gpu_memory_gb')} GB, 70% fraction enforced)")
+    except Exception as e:
+        suite.record(False, "CLI hardware auto-discovery & CUDA fraction", str(e))
+
+    # M2.5 Standalone CLI 'join --once' Subprocess Registration & Heartbeat
+    try:
+        import subprocess
+        join_proc = subprocess.run(
+            [
+                sys.executable,
+                "nebula_worker.py",
+                "join",
+                "--worker-id",
+                "node-gpu-local-01",
+                "--vram-pct",
+                "85",
+                "--once",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if join_proc.returncode == 0:
+            join_out = json.loads(join_proc.stdout.strip().splitlines()[-1])
+            join_ok = (
+                join_out.get("status") == "online"
+                and join_out.get("worker_id") == "node-gpu-local-01"
+                and join_out.get("vram_allocation_pct") == 85
+            )
+            suite.record(join_ok, f"CLI 'nebula_worker.py join --once' verified (node: {join_out.get('worker_id')}, contributing: {join_out.get('vram_allocation_pct')}%)")
+        else:
+            suite.record(False, "CLI 'nebula_worker.py join --once'", f"Exit {join_proc.returncode}: {join_proc.stderr}")
+    except Exception as e:
+        suite.record(False, "CLI 'nebula_worker.py join --once'", str(e))
+
+    # M2.6 Standalone CLI 'set-limit' & 'status' Live Control Roundtrip
+    try:
+        lim_proc = subprocess.run(
+            [
+                sys.executable,
+                "nebula_worker.py",
+                "set-limit",
+                "--worker-id",
+                "node-gpu-local-01",
+                "--vram-pct",
+                "80",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        stat_proc = subprocess.run(
+            [sys.executable, "nebula_worker.py", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if lim_proc.returncode == 0 and stat_proc.returncode == 0:
+            lim_json = json.loads(lim_proc.stdout.strip().splitlines()[-1])
+            stat_json = json.loads(stat_proc.stdout.strip().splitlines()[-1])
+            local_node = next(
+                (n for n in stat_json.get("nodes", []) if n.get("node_id") == "node-gpu-local-01"),
+                {},
+            )
+            cli_roundtrip_ok = (
+                lim_json.get("vram_allocation_pct") == 80
+                and local_node.get("vram_allocation_pct") == 80
+            )
+            suite.record(cli_roundtrip_ok, f"CLI 'set-limit' & 'status' verified (85% -> 80%, allocated: {local_node.get('vram_allocated_gb')}/{local_node.get('vram_total_gb')} GB)")
+        else:
+            suite.record(False, "CLI 'set-limit' & 'status' roundtrip", f"Exit codes {lim_proc.returncode}, {stat_proc.returncode}")
+    except Exception as e:
+        suite.record(False, "CLI 'set-limit' & 'status' roundtrip", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":

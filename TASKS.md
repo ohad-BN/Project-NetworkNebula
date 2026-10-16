@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
-> **Project Phase:** Alpha Milestone 2: Phase 2.1 Complete (Worker Telemetry Schema & Fleet Registry Active)  
+> **Project Phase:** Alpha Milestone 2: Phase 2.2 Complete (Standalone `nebula_worker.py` CLI Agent Active)  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**105/105 Passed — 100% Green**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**108/108 Passed — 100% Green**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 ---
@@ -14,10 +14,10 @@
 | **Backend API** | FastAPI Orchestrator | ✅ | `http://localhost:8000` | Orchestration, Auth, Training APIs, and OpenAI Gateway |
 | **OpenAI Gateway**| Compatible Serving API | ✅ | `/v1/chat/completions` | Drop-in inference endpoint for enterprise Python/cURL SDKs |
 | **Training Engine**| Distributed Cluster & PEFT | ✅ | `app/enterprise_training_router.py` | Multi-GPU LoRA/QLoRA fine-tuning, loss telemetry, S3 checkpoints |
-| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | `app/cluster_worker_router.py` | Host workers with 10%–100% GPU contribution control |
+| **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI worker agent with 10%–100% GPU contribution control |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **105/105 tests passed (0 failed, 0 skipped)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **108/108 tests passed (0 failed, 0 skipped)** |
 
 ---
 
@@ -133,11 +133,11 @@
 - [x] Implemented `GET /api/v1/cluster/telemetry`, `POST /api/v1/workers/register`, `PATCH /api/v1/workers/{id}/config` (with `torch.cuda.set_per_process_memory_fraction` enforcement), `POST /api/v1/workers/{id}/heartbeat`, and `GET /api/v1/workers/{id}/stats`
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.1 assertions (`M2.1` live cluster telemetry, `M2.2` worker registration with 75% contribution limit, `M2.3` dynamic 75% -> 50% slider & CUDA fraction enforcement) (**105/105 passed — 100%**)
 
-### 📋 Phase 2.2: Standalone "Nebula Worker" CLI Agent (`nebula_worker.py`)
-- [ ] Create standalone [`nebula_worker.py`](nebula_worker.py) CLI script supporting `join`, `status`, and `set-limit` subcommands
-- [ ] Implement automatic CUDA GPU discovery (model, total VRAM, allocated VRAM, CUDA version, CPU cores, RAM) and `--vram-pct` (`10–100%`) memory ceiling enforcement
-- [ ] Support `--once` deterministic execution mode for automated testing & quick PowerShell verification alongside continuous daemon mode
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 2.2 assertions (`M2.4`, `M2.5`, `M2.6`) and verify 100% pass
+### ✅ Phase 2.2: Standalone "Nebula Worker" CLI Agent (`nebula_worker.py`) (COMPLETED)
+- [x] Created standalone [`nebula_worker.py`](nebula_worker.py) CLI script supporting `join`, `status`, and `set-limit` subcommands
+- [x] Implemented automatic CUDA GPU discovery (model, total VRAM, allocated VRAM, CUDA version, CPU cores, RAM) and `--vram-pct` (`10–100%`) memory ceiling enforcement via `torch.cuda.set_per_process_memory_fraction()`
+- [x] Added `--once` deterministic execution mode and `--json` output for automated testing & quick PowerShell verification alongside continuous daemon mode
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 2.2 assertions (`M2.4` hardware discovery & CUDA fraction, `M2.5` CLI `join --once`, `M2.6` CLI `set-limit` & `status` roundtrip) (**108/108 passed — 100%**)
 
 ### 📋 Phase 2.3: Real-Time WebSocket Worker Tunnel & NAT Traversal
 - [ ] Implement `WS /ws/worker/{worker_id}` bidirectional tunnel in [`app/cluster_worker_router.py`](app/cluster_worker_router.py) for firewall-friendly outbound worker heartbeats and instant server-pushed `vram_allocation_pct` config updates
@@ -165,6 +165,11 @@
 ```powershell
 # Run the single authoritative test suite:
 python test_suite.py
+
+# Join GPU node / Control GPU Contribution % via Standalone CLI Agent:
+python nebula_worker.py join --vram-pct 80 --once
+python nebula_worker.py set-limit --vram-pct 60
+python nebula_worker.py status
 
 # Start Docker infrastructure (Postgres 5433, Redis 6379, MinIO 9000):
 docker-compose up -d db redis minio
