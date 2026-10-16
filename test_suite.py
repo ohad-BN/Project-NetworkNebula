@@ -897,7 +897,7 @@ def run_tests():
             "min_replicas": 1,
             "max_replicas": 4
         }
-        dep_res = requests.post(f"{BASE_URL}/api/v1/inference/endpoints", json=ep_payload)
+        dep_res = requests.post(f"{BASE_URL}/api/v1/inference/endpoints", json=ep_payload, headers=e5_auth_headers)
         if dep_res.status_code in (200, 201) and "id" in dep_res.json():
             e5_endpoint_id = dep_res.json()["id"]
 
@@ -982,7 +982,7 @@ def run_tests():
     # E5.9 Zero-Trust Lifecycle Teardown & Revocation Verification
     try:
         # Undeploy dedicated endpoint
-        del_ep_res = requests.delete(f"{BASE_URL}/api/v1/inference/endpoints/{e5_endpoint_id}")
+        del_ep_res = requests.delete(f"{BASE_URL}/api/v1/inference/endpoints/{e5_endpoint_id}", headers=e5_auth_headers)
         ep_deleted = del_ep_res.status_code == 200 and del_ep_res.json().get("status") == "deleted"
 
         # Revoke customer API token
@@ -2728,7 +2728,149 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Byzantine gradient outlier rejection", str(e))
 
+    # =========================================================================
+    # Phase 4.2 (Alpha Milestone 4): Collateral-Backed Node Staking & Slashing Controller
+    # =========================================================================
+    print_header("Phase 4.2 (Alpha Milestone 4): Collateral-Backed Node Staking & Automated Slashing")
+
+    # M4.3 Collateral Staking Lifecycle & Minimum Stake Enforcement
+    try:
+        stake_node_id = f"staked-node-{uuid.uuid4().hex[:6]}"
+        # 1. Register worker
+        requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": stake_node_id,
+                "name": f"Staked-Node-{stake_node_id[:8]}",
+                "gpu_info": "NVIDIA H100 SXM5",
+                "gpu_memory_gb": 80.0,
+                "vram_allocation_pct": 80,
+                "hourly_rate_usd": 1.25,
+            },
+            timeout=5,
+        )
+
+        # 2. Deposit collateral stake ($250.00 USD)
+        stake_res = requests.post(
+            f"{BASE_URL}/api/v1/workers/{stake_node_id}/stake",
+            json={"amount_usd": 250.0},
+            timeout=5,
+        ).json()
+        staked_ok = (
+            stake_res.get("status") == "staked"
+            and stake_res.get("staked_amount_usd") == 250.0
+            and stake_res.get("is_qualified") is True
+        )
+
+        # 3. Check status & tier qualification
+        st_res = requests.get(f"{BASE_URL}/api/v1/workers/{stake_node_id}/staking", timeout=5).json()
+        tier_ok = (
+            st_res.get("is_qualified_inference") is True
+            and st_res.get("is_qualified_training") is True
+            and st_res.get("reputation_score") == 100.0
+        )
+
+        # 4. Partial unstake ($50.00 USD)
+        unstake_res = requests.post(
+            f"{BASE_URL}/api/v1/workers/{stake_node_id}/unstake",
+            json={"amount_usd": 50.0},
+            timeout=5,
+        ).json()
+        unstake_ok = (
+            unstake_res.get("status") == "unstaked"
+            and unstake_res.get("remaining_stake_usd") == 200.0
+        )
+
+        # 5. Verify presence in staking leaderboard
+        lead_res = requests.get(f"{BASE_URL}/api/v1/staking/leaderboard?limit=10", timeout=5).json()
+        found_in_board = any(n.get("worker_id") == stake_node_id for n in lead_res.get("leaderboard", []))
+
+        m4_3_ok = staked_ok and tier_ok and unstake_ok and found_in_board
+        suite.record(
+            m4_3_ok,
+            f"Collateral staking lifecycle & minimum stake verified (staked: $250 -> remaining: ${unstake_res.get('remaining_stake_usd')}, tier qualified: {tier_ok}, leaderboard: {found_in_board})"
+        )
+    except Exception as e:
+        suite.record(False, "Collateral staking lifecycle & minimum stake", str(e))
+
+    # M4.4 Automated Slashing Execution & Customer Compensation Ledger Credit
+    try:
+        from app.database import SessionLocal
+        from app.models import User, Transaction, TransactionType
+
+        # 1. Identify enterprise customer to receive compensation
+        db_session = SessionLocal()
+        victim_user = db_session.query(User).filter(User.is_worker == False).first() or db_session.query(User).first()
+        victim_uid = victim_user.id if victim_user else None
+        initial_victim_bal = victim_user.balance if victim_user else 0.0
+        db_session.close()
+
+        # 2. Execute 25% slash penalty for unannounced epoch drop
+        test_task_sla = f"task-sla-drop-{uuid.uuid4().hex[:6]}"
+        slash_res_25 = requests.post(
+            f"{BASE_URL}/api/v1/workers/{stake_node_id}/slash",
+            json={
+                "reason": "UNANNOUNCED_EPOCH_DISCONNECT",
+                "penalty_pct": 25.0,
+                "task_id": test_task_sla,
+                "victim_user_id": victim_uid,
+            },
+            timeout=5,
+        ).json()
+
+        slash_25_ok = (
+            slash_res_25.get("slashed") is True
+            and slash_res_25.get("slashed_amount_usd") == 50.0
+            and slash_res_25.get("remaining_stake_usd") == 150.0
+            and slash_res_25.get("compensation_credited_usd") == 40.0
+            and slash_res_25.get("reputation_score") == 80.0
+        )
+
+        # 3. Verify customer ledger balance credited + Transaction record
+        db_session = SessionLocal()
+        victim_after = db_session.query(User).filter(User.id == victim_uid).first()
+        comp_tx = db_session.query(Transaction).filter(
+            Transaction.user_id == victim_uid,
+            Transaction.type == TransactionType.COMPENSATION
+        ).order_by(Transaction.created_at.desc()).first()
+        bal_gain = round(victim_after.balance - initial_victim_bal, 2)
+        customer_credited = bal_gain >= 40.0 and comp_tx is not None
+        db_session.close()
+
+        # 4. Verify 100% fraud slashing bans the worker and sets reputation to 0
+        slash_res_100 = requests.post(
+            f"{BASE_URL}/api/v1/workers/{stake_node_id}/slash",
+            json={
+                "reason": "CRYPTOGRAPHIC_FRAUD_POISONED_GRADIENTS",
+                "penalty_pct": 100.0,
+                "task_id": f"fraud-{uuid.uuid4().hex[:6]}",
+                "victim_user_id": victim_uid,
+            },
+            timeout=5,
+        ).json()
+        banned_ok = (
+            slash_res_100.get("banned") is True
+            and slash_res_100.get("reputation_score") == 0.0
+            and slash_res_100.get("remaining_stake_usd") == 0.0
+        )
+
+        # 5. Check slashing history audit trail
+        hist_res = requests.get(f"{BASE_URL}/api/v1/workers/{stake_node_id}/slashing-history", timeout=5).json()
+        history_recorded = hist_res.get("total_slash_events") == 2
+
+        # Clean up
+        requests.post(f"{BASE_URL}/api/v1/workers/{stake_node_id}/deregister", timeout=5)
+
+        m4_4_ok = slash_25_ok and customer_credited and banned_ok and history_recorded
+        suite.record(
+            m4_4_ok,
+            f"Automated slashing & customer compensation verified (slashed 25%: ${slash_res_25.get('slashed_amount_usd')}, customer credited: +${slash_res_25.get('compensation_credited_usd')} [TX: {comp_tx.transaction_id[:8] if comp_tx else 'None'}], 100% fraud banned: {banned_ok}, history events: {hist_res.get('total_slash_events')})"
+        )
+    except Exception as e:
+        suite.record(False, "Automated slashing & customer compensation", str(e))
+
     return suite.summary()
+
 
 
 if __name__ == "__main__":

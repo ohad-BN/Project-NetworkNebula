@@ -1059,3 +1059,8 @@ app.include_router(wallet_router)
 from app.verification_router import router as verification_router
 
 app.include_router(verification_router)
+
+# Include Node Staking & Automated Slashing Router (Alpha Milestone 4)
+from app.staking_router import router as staking_router
+
+app.include_router(staking_router)

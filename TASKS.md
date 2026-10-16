@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
 > **Project Phase:** Alpha Milestone 4 Active — Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**113/113 Passed — 100% Green in ~100s**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**115/115 Passed — 100% Green in 104.83s**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 
@@ -18,7 +18,7 @@
 | **Compute Fleet** | Local RTX 4070 / Remote GPUs | ✅ | [`nebula_worker.py`](nebula_worker.py) | Standalone CLI (`work`), WebSocket tunnel (`/ws/worker/{id}`) & Capacity Scheduler |
 | **Object Storage**| MinIO S3 Buckets | ✅ | `http://localhost:9000` | `nebula-datasets`, `nebula-checkpoints`, `nebula-models` |
 | **Database** | PostgreSQL | ✅ | `localhost:5433` | Schemas for Organizations, Jobs, Endpoints, and Transactions |
-| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **113/113 tests passed (0 failed, 0 skipped in 100.45s)** |
+| **Master Test Suite**| Single Test Runner | ✅ | [`test_suite.py`](test_suite.py) | **115/115 tests passed (0 failed, 0 skipped in 104.83s)** |
 
 ---
 
@@ -219,11 +219,11 @@
 - [x] Added `POST /api/v1/compute/commit`, `POST /api/v1/compute/verify`, `POST /api/v1/compute/dispute`, `POST /api/v1/compute/simulate-byzantine-aggregation`, and query endpoints in [`app/verification_router.py`](app/verification_router.py)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.1 assertions (`M4.1` tensor commitment & spot check, `M4.2` Byzantine gradient outlier rejection) (**113/113 passed — 100% Green, test duration reduced to ~100s**)
 
-### 📋 Phase 4.2: Collateral-Backed Node Staking & Automated Slashing Controller
-- [ ] Extend `Worker` database schema in `app/models.py` with `staked_amount_usd`, `slashed_amount_usd`, `reputation_score`, and `min_stake_required`
-- [ ] Build `app/staking_engine.py` managing collateral lockups ($50-$500 USD), automated slashing penalties for ungraceful drops/fraud, and compensatory customer redistribution
-- [ ] Add `POST /api/v1/workers/{id}/stake`, `POST /api/v1/workers/{id}/unstake`, and `GET /api/v1/workers/{id}/slashing-history` in `app/staking_router.py`
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 4.2 assertions (`M4.3` collateral staking lifecycle, `M4.4` automated slashing & customer compensation ledger credit)
+### ✅ Phase 4.2: Collateral-Backed Node Staking & Automated Slashing Controller (COMPLETED)
+- [x] Extended `Worker` database schema in [`app/models.py`](app/models.py) with `staked_amount_usd`, `slashed_amount_usd`, `reputation_score`, `min_stake_required`, and `slash_history`
+- [x] Built [`app/staking_engine.py`](app/staking_engine.py) managing collateral lockups ($50-$500 USD), automated slashing penalties (25% unannounced drop, 100% fraud ban), and 80% compensatory customer balance credit
+- [x] Added `POST /api/v1/workers/{id}/stake`, `POST /api/v1/workers/{id}/unstake`, `POST /api/v1/workers/{id}/slash`, `GET /api/v1/workers/{id}/staking`, `GET /api/v1/workers/{id}/slashing-history`, and `GET /api/v1/staking/leaderboard` in [`app/staking_router.py`](app/staking_router.py)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 4.2 assertions (`M4.3` collateral staking lifecycle, `M4.4` automated slashing & customer compensation ledger credit) (**115/115 passed — 100%**)
 
 ### 📋 Phase 4.3: Geo-Distributed Region Clustering & Low-Latency Sub-Networks
 - [ ] Extend `Worker` model with `region` (`us-east`, `us-west`, `eu-central`, `ap-southeast`) and RTT latency estimation

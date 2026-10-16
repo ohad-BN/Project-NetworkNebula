@@ -28,6 +28,10 @@ class TransactionType(str, enum.Enum):
     WITHDRAWAL = "WITHDRAWAL"
     EARNING = "EARNING"
     REFUND = "REFUND"
+    STAKE = "STAKE"
+    UNSTAKE = "UNSTAKE"
+    SLASH_PENALTY = "SLASH_PENALTY"
+    COMPENSATION = "COMPENSATION"
 
 
 class PayoutStatus(str, enum.Enum):
@@ -100,6 +104,11 @@ class Worker(Base):
     total_earnings_usd = Column(Float, default=0.0)
     is_available = Column(Boolean, default=True)
     total_tasks_completed = Column(Integer, default=0)
+    staked_amount_usd = Column(Float, default=0.0)
+    slashed_amount_usd = Column(Float, default=0.0)
+    reputation_score = Column(Float, default=100.0)
+    min_stake_required = Column(Float, default=50.0)
+    slash_history = Column(Text, default="[]")
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

@@ -118,11 +118,23 @@ def ensure_worker_schema_columns() -> None:
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS role VARCHAR(100) DEFAULT 'LoRA Training & Inference'",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS hourly_rate_usd FLOAT DEFAULT 0.45",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS total_earnings_usd FLOAT DEFAULT 0.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS staked_amount_usd FLOAT DEFAULT 0.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS slashed_amount_usd FLOAT DEFAULT 0.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS reputation_score FLOAT DEFAULT 100.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS min_stake_required FLOAT DEFAULT 50.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS slash_history TEXT DEFAULT '[]'",
+        "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'STAKE'",
+        "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'UNSTAKE'",
+        "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'SLASH_PENALTY'",
+        "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'COMPENSATION'",
     ]
     try:
         with engine.begin() as conn:
             for stmt in alter_statements:
-                conn.execute(text(stmt))
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
     except Exception as e:
         logger.debug(f"Schema column check skipped or already applied: {e}")
 
