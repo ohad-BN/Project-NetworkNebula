@@ -165,6 +165,45 @@
 
 ---
 
+## 🚀 Alpha Milestone 3: Multi-Node Distributed Training, Intelligent Scheduling & Model Benchmarking
+
+### 📋 Phase 3.1: Multi-Node Distributed Training Orchestrator & Ring All-Reduce Protocol
+- [ ] Build `app/distributed_training_engine.py` coordinating data-parallel training across 2+ registered worker nodes
+- [ ] Add `POST /api/v1/training/distributed/jobs` in `app/enterprise_training_router.py` supporting `num_gpus >= 2`, batch sharding, and multi-node coordination
+- [ ] Implement gradient tensor bucket serialization, mean tensor reduction across worker nodes, and unified `.safetensors` adapter checkpoint export to MinIO S3 (`nebula-checkpoints`)
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.1 assertions (`M3.1` multi-node job dispatch, `M3.2` ring all-reduce gradient aggregation)
+
+### 📋 Phase 3.2: Intelligent Capacity-Aware Job Scheduler & Dynamic Task Dispatcher
+- [ ] Build `app/scheduler.py` (`ClusterScheduler` singleton) scoring candidate worker nodes by VRAM headroom, latency, contribution limit, and SLA tier
+- [ ] Implement automatic worker heartbeat timeout detection and transparent mid-task failover re-routing to healthy standby nodes
+- [ ] Expose `GET /api/v1/cluster/scheduler/status` and `POST /api/v1/cluster/scheduler/simulate-dispatch`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.2 assertions (`M3.3` capacity-aware node matching, `M3.4` fault-tolerant failover re-routing)
+
+### 📋 Phase 3.3: Autonomous CLI Worker Task Execution (`nebula_worker.py --work`)
+- [ ] Extend [`nebula_worker.py`](nebula_worker.py) with `work` subcommand (`python nebula_worker.py work --worker-id <id>`) to pull/receive tasks over WebSocket tunnel
+- [ ] Execute local neural forward passes or PEFT training batches within enforced VRAM fraction ceilings and stream step progress back to orchestrator
+- [ ] Add `--auto-claim` and `--max-tasks` options for headless autonomous node operation
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.3 assertions (`M3.5` CLI autonomous task claiming, `M3.6` tunnel task dispatch & progress telemetry)
+
+### 📋 Phase 3.4: Live Model Evaluation Benchmarking Suite & Side-by-Side Playground
+- [ ] Build `app/evaluation_engine.py` benchmarking fine-tuned adapters against foundation base models (instruction accuracy, perplexity, generation speed, latency)
+- [ ] Add `/api/v1/models/benchmark` and `/api/v1/models/compare` endpoints in `app/openai_inference_router.py`
+- [ ] Upgrade **Model Serving Hub UI** ([`network-nebula/src/pages/inference-hub.tsx`](network-nebula/src/pages/inference-hub.tsx)) with an interactive **Side-by-Side Comparison Playground** (dual streaming generation panes with token/sec and latency diffs)
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.4 assertions (`M3.7` model evaluation benchmark scoring, `M3.8` dual-model side-by-side completion)
+
+### 📋 Phase 3.5: Host Node Automated Payouts, Wallet Withdrawals & Billing Receipts
+- [ ] Enhance `app/wallet_router.py` with `POST /wallet/withdraw` (validates $10.00 min threshold) and `POST /api/v1/wallet/payouts/{id}/settle` (automated ledger settlement and balance deduction)
+- [ ] Add `GET /api/v1/billing/receipts/{job_id}` generating structured JSON and printable/downloadable enterprise compute invoices
+- [ ] Upgrade **Host Wallet Page** ([`network-nebula/src/pages/wallet.tsx`](network-nebula/src/pages/wallet.tsx)) with an interactive **Withdraw Funds Dialog**, live payout tracker, and printable invoice viewer
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.5 assertions (`M3.9` withdrawal lifecycle & ledger deduction, `M3.10` enterprise compute billing receipt generation)
+
+### 📋 Phase 3.6: Master Test Suite Expansion & Milestone 3 Signoff
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 3.6 master validation tests (`M3.11` high-availability load balancing audit, `M3.12` Alpha Milestone 3 Master System Signoff)
+- [ ] Verify clean production frontend compilation (`bun run build`) with zero TypeScript errors
+- [ ] Run `python test_suite.py` to achieve 100% green pass across all **132+** automated tests and sign off Alpha Milestone 3
+
+---
+
 ## ⚡ Instant Command Cheatsheet
 
 ```powershell
