@@ -2204,6 +2204,109 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Production frontend build & SPA routes", str(e))
 
+    # =========================================================================
+    # Phase 2.6 (Alpha Milestone 2): Master Test Suite Expansion & Milestone 2 Signoff
+    # =========================================================================
+    print_header("Phase 2.6 (Alpha Milestone 2): Master Multi-Node Validation & Milestone 2 Signoff")
+
+    # M2.16 Multi-Node Dynamic Load Distribution & Fleet Registration Audit
+    try:
+        remote_peer_id = f"peer-gpu-mesh-{uuid.uuid4().hex[:6]}"
+        # Register second worker node in cluster
+        r_reg = requests.post(
+            f"{BASE_URL}/api/v1/workers/register",
+            json={
+                "worker_id": remote_peer_id,
+                "name": "Peer-GPU-Worker-Node",
+                "gpu_info": "NVIDIA GeForce RTX 4090",
+                "vram_allocation_pct": 70,
+                "role": "Distributed Inference Peer",
+                "hourly_rate_usd": 0.65
+            },
+            timeout=5
+        )
+        reg_ok = r_reg.status_code == 200
+
+        # Query cluster telemetry to verify multi-node aggregation
+        t_multi = requests.get(f"{BASE_URL}/api/v1/cluster/telemetry", timeout=5).json()
+        active_count = t_multi.get("active_nodes", 0)
+        nodes_list = t_multi.get("nodes", [])
+        peer_found = any(n.get("node_id") == remote_peer_id for n in nodes_list)
+        local_found = any(n.get("node_id") == "node-gpu-local-01" for n in nodes_list)
+
+        # Cleanly de-register peer node
+        r_dereg = requests.post(f"{BASE_URL}/api/v1/workers/{remote_peer_id}/deregister", timeout=5)
+        dereg_ok = r_dereg.status_code == 200
+
+        multi_ok = reg_ok and active_count >= 2 and peer_found and local_found and dereg_ok
+        suite.record(
+            multi_ok,
+            f"Multi-node dynamic fleet registration & lifecycle audit verified (peer: {remote_peer_id[:16]}..., active nodes: {active_count}, clean deregistration: {dereg_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Multi-node dynamic fleet registration audit", str(e))
+
+    # M2.17 End-to-End VRAM Governance & 10%-100% Boundary Clamp Enforcement
+    try:
+        import nebula_worker
+
+        # Test boundary clamping: sub-10% clamped to 10%, super-100% clamped to 100%
+        clamp_low = nebula_worker.apply_vram_limit(5)
+        clamp_high = nebula_worker.apply_vram_limit(120)
+        mid_test = nebula_worker.apply_vram_limit(50)
+        restored = nebula_worker.apply_vram_limit(80)
+
+        bounds_ok = (
+            clamp_low.get("vram_allocation_pct") == 10
+            and clamp_low.get("cuda_fraction") == 0.10
+            and clamp_high.get("vram_allocation_pct") == 100
+            and clamp_high.get("cuda_fraction") == 1.00
+            and mid_test.get("vram_allocation_pct") == 50
+            and mid_test.get("cuda_fraction") == 0.50
+            and restored.get("vram_allocation_pct") == 80
+            and restored.get("cuda_fraction") == 0.80
+        )
+        suite.record(
+            bounds_ok,
+            f"End-to-end VRAM governance & boundary clamp verified (5%->{clamp_low.get('vram_allocation_pct')}%, 120%->{clamp_high.get('vram_allocation_pct')}%, restored to 80%)"
+        )
+    except Exception as e:
+        suite.record(False, "End-to-end VRAM governance & boundary clamp", str(e))
+
+    # M2.18 Alpha Milestone 2 End-to-End System Integrity & Signoff
+    try:
+        # Check all core subsystems:
+        # 1. FastAPI health
+        h_ok = requests.get(f"{BASE_URL}/health", timeout=5).status_code == 200
+        # 2. Foundation model catalog
+        m_ok = requests.get(f"{BASE_URL}/api/v1/models/catalog", timeout=5).status_code == 200
+        # 3. Cluster telemetry
+        c_ok = requests.get(f"{BASE_URL}/api/v1/cluster/telemetry", timeout=5).status_code == 200
+        # 4. Standalone worker CLI status
+        cli_stat = subprocess.run(
+            [sys.executable, "nebula_worker.py", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        cli_ok = cli_stat.returncode == 0
+        # 5. Worker payout CLI
+        payout_cli = subprocess.run(
+            [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        payout_ok = payout_cli.returncode == 0
+
+        milestone2_signed_off = h_ok and m_ok and c_ok and cli_ok and payout_ok
+        suite.record(
+            milestone2_signed_off,
+            f"Alpha Milestone 2 Master System Integrity Signoff Verified (API: {h_ok}, Models: {m_ok}, Fleet: {c_ok}, Worker CLI: {cli_ok}, Payout CLI: {payout_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Alpha Milestone 2 Master System Integrity Signoff", str(e))
+
     return suite.summary()
 
 if __name__ == "__main__":
