@@ -117,6 +117,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     max_tokens: Optional[int] = Field(default=512, ge=1, le=8192)
     stream: Optional[bool] = Field(default=False, description="Whether to stream back partial chunks via SSE")
+    speculative: Optional[bool] = Field(default=False, description="Enable Decentralized Speculative Decoding (DSD)")
+    draft_k: Optional[int] = Field(default=4, ge=1, le=16, description="Speculative draft token window size")
+
 
 
 class DeployEndpointRequest(BaseModel):
@@ -224,6 +227,45 @@ def create_chat_completion(
     endpoint_id = endpoint.id if endpoint else None
     actual_model = endpoint.model_id if endpoint else payload.model
     adapter_url = endpoint.adapter_url if endpoint else None
+
+    # Check if Decentralized Speculative Decoding (DSD) is requested
+    if getattr(payload, "speculative", False):
+        from app.speculative_engine import speculative_engine
+        prompt_text = " ".join([m.content for m in payload.messages]) if payload.messages else "Hello"
+        max_tok = min(payload.max_tokens or 32, 256)
+        spec_res = speculative_engine.generate_completion(
+            prompt=prompt_text,
+            max_tokens=max_tok,
+            draft_k=getattr(payload, "draft_k", 4) or 4,
+            target_model_id=actual_model,
+            temperature=payload.temperature or 0.7,
+        )
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_timestamp,
+            "model": payload.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": spec_res["completion"],
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": len(prompt_text.split()),
+                "completion_tokens": spec_res["tokens_generated"],
+                "total_tokens": len(prompt_text.split()) + spec_res["tokens_generated"],
+            },
+            "speculative_telemetry": {
+                "target_forward_passes": spec_res["target_forward_passes"],
+                "round_trips_saved": spec_res["round_trips_saved"],
+                "round_trip_savings_pct": spec_res["round_trip_savings_pct"],
+                "tokens_per_pass": spec_res["tokens_per_pass"],
+                "effective_speedup_factor": spec_res["effective_speedup_factor"],
+            },
+        }
 
     # Check if requested model is a decentralized sharded model (e.g. 70B/72B/33B)
     from app.sharding_engine import sharding_engine

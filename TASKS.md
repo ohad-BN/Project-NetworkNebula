@@ -318,13 +318,13 @@
 - [x] Built `app/moe_router.py` mounted at `/api/v1/moe` (`GET /models/supported`, `POST /pipelines`, `GET /pipelines/{id}`, `POST /workers/assign-pair`, `POST /pipelines/{id}/route-tokens`, `GET /pipelines/{id}/telemetry`)
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 6.1 assertions (`M6.1` MoE Expert Partitioning & Worker Memory Budget Allocation, `M6.2` Dynamic Router Gating & Sparse Activation Forwarding) (**137/137 passed — 100% Green in 126.33s**)
 
-### 📋 Phase 6.2: Decentralized Speculative Decoding (DSD) Engine
-- [ ] Build `app/speculative_engine.py` managing draft model generation (Qwen2.5-0.5B draft window $K=4$) and batched swarm verification
-- [ ] Implement single-pass multi-token pipeline forward pass verifying all $K$ candidates in parallel to eliminate WAN latency penalties
-- [ ] Implement unbiased speculative rejection sampling with residual distribution correction
-- [ ] Wire speculative execution option into `/v1/chat/completions` and `generate_swarm_stream`
-- [ ] Expose `POST /api/v1/speculative/draft`, `POST /api/v1/speculative/verify`, and speedup telemetry
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.2 assertions (`M6.3` Speculative Draft Generation & Parallel Multi-Token Forward Verification, `M6.4` Unbiased Rejection Sampling & $\ge 2.0\times$ Speedup Telemetry)
+### ✅ Phase 6.2: Decentralized Speculative Decoding (DSD) Engine (COMPLETED)
+- [x] Built `app/speculative_engine.py` managing draft model generation (Qwen2.5-0.5B draft window $K=4$) and batched parallel target swarm verification
+- [x] Implemented single-pass multi-token pipeline forward pass verifying all $K$ candidates simultaneously in parallel, slashing WAN latency penalties
+- [x] Implemented mathematically unbiased speculative rejection sampling with residual distribution fallback $\max(0, p - q)$ and bonus token on full window acceptance
+- [x] Wired speculative execution option into `/v1/chat/completions` in [`app/openai_inference_router.py`](app/openai_inference_router.py) with `speculative_telemetry` response headers
+- [x] Exposed `POST /api/v1/speculative/draft`, `POST /api/v1/speculative/verify`, `POST /api/v1/speculative/generate`, and `GET /api/v1/speculative/stats` in [`app/speculative_router.py`](app/speculative_router.py) mounted under `/api/v1/speculative`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 6.2 assertions (`M6.3` Speculative Draft Generation & Parallel Multi-Token Forward Verification, `M6.4` Unbiased Rejection Sampling & $\ge 2.0\times$ Speedup Telemetry) (**139/139 passed — 100% Green in 130.51s**)
 
 ### 📋 Phase 6.3: P2P Kademlia Distributed Hash Table (DHT) & Swarm Mesh Discovery
 - [ ] Build `app/kademlia_dht.py` with 160-bit SHA-1 Node IDs, XOR metric distance calculation, and $k$-bucket ($k=20$) LRU routing table

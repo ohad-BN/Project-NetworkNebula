@@ -1114,3 +1114,9 @@ from app.moe_router import router as moe_router
 
 app.include_router(moe_router)
 
+# Include Decentralized Speculative Decoding (DSD) Router (Alpha Milestone 6)
+from app.speculative_router import router as speculative_router
+
+app.include_router(speculative_router)
+
+

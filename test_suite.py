@@ -4203,7 +4203,126 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Dynamic router gating & sparse activation forwarding", str(e))
 
+    # =========================================================================
+    # Phase 6.2 (Alpha Milestone 6): Decentralized Speculative Decoding (DSD) Engine
+    # =========================================================================
+    print_header("Phase 6.2 (Alpha Milestone 6): Decentralized Speculative Decoding (DSD) Engine")
+
+    # M6.3 Speculative Draft Generation & Parallel Multi-Token Forward Verification
+    try:
+        from app.speculative_engine import speculative_engine
+
+        # 1. Test draft generation: K=4 candidate tokens
+        prompt_tokens = [101, 2054, 2003, 1037]
+        draft_out = speculative_engine.draft_generator.generate_draft_tokens(
+            prompt_tokens=prompt_tokens,
+            k=4,
+            temperature=0.7,
+        )
+        draft_tokens = draft_out.get("draft_tokens", [])
+        draft_probs_data = draft_out.get("draft_probs_data", [])
+
+        draft_ok = (
+            len(draft_tokens) == 4
+            and len(draft_probs_data) == 4
+            and all(len(cands) == 256 for cands, _ in draft_probs_data)
+            and all(abs(float(np.sum(probs)) - 1.0) < 1e-4 for _, probs in draft_probs_data)
+        )
+
+        # 2. Parallel target verification on draft window
+        verify_res = speculative_engine.verifier.verify_window(
+            draft_tokens=draft_tokens,
+            draft_probs_data=draft_probs_data,
+            temperature=0.7,
+            seed=1234,
+        )
+        tokens_produced = verify_res.get("tokens_produced", 0)
+        step_details = verify_res.get("step_details", [])
+
+        # 3. REST endpoints test: /api/v1/speculative/draft & /api/v1/speculative/verify
+        r_http_draft = requests.post(f"{BASE_URL}/api/v1/speculative/draft", json={
+            "prompt": "Decentralized speculative decoding test",
+            "k": 4,
+        }, timeout=5).json()
+        http_draft_ok = r_http_draft.get("status") == "success" and len(r_http_draft.get("draft_tokens", [])) == 4
+
+        r_http_verify = requests.post(f"{BASE_URL}/api/v1/speculative/verify", json={
+            "draft_tokens": r_http_draft.get("draft_tokens"),
+            "k": 4,
+        }, timeout=5).json()
+        http_verify_ok = r_http_verify.get("status") == "success" and r_http_verify.get("tokens_produced", 0) >= 1
+
+        m6_3_ok = (
+            draft_ok
+            and tokens_produced >= 1
+            and len(step_details) >= 1
+            and http_draft_ok
+            and http_verify_ok
+        )
+        suite.record(
+            m6_3_ok,
+            f"Speculative draft generation & parallel multi-token forward verification verified (draft K: 4, tokens produced: {tokens_produced}, step details: {len(step_details)}, HTTP draft: {http_draft_ok}, HTTP verify: {http_verify_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Speculative draft generation & parallel multi-token forward verification", str(e))
+
+    # M6.4 Unbiased Rejection Sampling & >= 2.0x Speedup Telemetry
+    try:
+        # 1. Execute end-to-end continuous speculative decoding loop via REST API
+        r_gen = requests.post(f"{BASE_URL}/api/v1/speculative/generate", json={
+            "prompt": "Decentralized speculative decoding accelerates token throughput",
+            "max_tokens": 16,
+            "draft_k": 4,
+            "model_id": "meta-llama/Llama-3-70B",
+            "temperature": 0.7,
+        }, timeout=10).json()
+
+        gen_tokens = r_gen.get("tokens_generated", 0)
+        target_passes = r_gen.get("target_forward_passes", 99)
+        speedup = r_gen.get("effective_speedup_factor", 0.0)
+        savings_pct = r_gen.get("round_trip_savings_pct", 0.0)
+
+        # 2. Check aggregate statistics
+        r_stats = requests.get(f"{BASE_URL}/api/v1/speculative/stats", timeout=5).json()
+        tel = r_stats.get("telemetry", {})
+        acc_rate_pct = tel.get("acceptance_rate_pct", 0.0)
+        round_trips_saved = tel.get("round_trips_saved", 0)
+
+        # 3. Test OpenAI Gateway /v1/chat/completions integration with speculative=True
+        r_oa = requests.post(f"{BASE_URL}/v1/chat/completions", json={
+            "model": "meta-llama/Llama-3-70B",
+            "messages": [{"role": "user", "content": "Explain speculative decoding speedup"}],
+            "max_tokens": 8,
+            "speculative": True,
+            "draft_k": 4,
+        }, timeout=10).json()
+
+        oa_ok = (
+            r_oa.get("object") == "chat.completion"
+            and len(r_oa.get("choices", [{}])[0].get("message", {}).get("content", "")) > 0
+            and "speculative_telemetry" in r_oa
+            and r_oa["speculative_telemetry"].get("effective_speedup_factor", 0.0) >= 1.5
+        )
+
+        m6_4_ok = (
+            r_gen.get("status") == "success"
+            and gen_tokens == 16
+            and target_passes <= 8  # Sub-linear forward passes vs tokens
+            and speedup >= 2.0      # >= 2.0x acceleration factor
+            and savings_pct >= 50.0 # >= 50% WAN round-trip savings
+            and acc_rate_pct >= 60.0 # High quality draft alignment
+            and round_trips_saved >= 8
+            and oa_ok
+        )
+        suite.record(
+            m6_4_ok,
+            f"Unbiased rejection sampling & speculative acceleration telemetry verified (tokens: {gen_tokens}, target passes: {target_passes}/16, speedup: {speedup}x, round-trips saved: {round_trips_saved} ({savings_pct}%), acceptance: {acc_rate_pct}%, OpenAI gateway: {oa_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Unbiased rejection sampling & >= 2.0x speedup telemetry", str(e))
+
     return suite.summary()
+
 
 
 
