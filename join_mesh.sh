@@ -18,16 +18,20 @@ if ! python3 -c "import requests, websockets" &>/dev/null; then
     pip3 install --quiet requests websockets || python3 -m pip install --quiet requests websockets || true
 fi
 
-read -p "Enter NetworkNebula Server IP/Host [default: 127.0.0.1]: " SERVER_IP
+printf "Enter NetworkNebula Server IP/Host [default: 127.0.0.1]: "
+read SERVER_IP
 SERVER_IP=${SERVER_IP:-127.0.0.1}
 
-read -p "Enter Node Display Name [default: MacBook-Worker]: " NODE_NAME
+printf "Enter Node Display Name [default: MacBook-Worker]: "
+read NODE_NAME
 NODE_NAME=${NODE_NAME:-MacBook-Worker}
 
-read -p "Enter Unique Worker ID [default: node-macbook]: " WORKER_ID
+printf "Enter Unique Worker ID [default: node-macbook]: "
+read WORKER_ID
 WORKER_ID=${WORKER_ID:-node-macbook}
 
-read -p "Enter GPU/Unified Memory Contribution Percentage (10-100) [default: 75]: " VRAM_PCT
+printf "Enter GPU/Unified Memory Contribution Percentage (10-100) [default: 75]: "
+read VRAM_PCT
 VRAM_PCT=${VRAM_PCT:-75}
 
 echo ""

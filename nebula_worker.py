@@ -26,7 +26,20 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
-import requests
+try:
+    import requests
+except ImportError:
+    print("[*] Installing required client library 'requests'...")
+    import subprocess
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "requests"])
+    except Exception:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "requests"])
+        except Exception as _e:
+            print(f"[ERROR] Could not install requests automatically: {_e}", file=sys.stderr)
+            sys.exit(1)
+    import requests
 
 DEFAULT_SERVER_URL = os.environ.get("NEBULA_SERVER_URL", "http://localhost:8000")
 DEFAULT_WORKER_ID = "node-gpu-local-01"
@@ -171,11 +184,29 @@ def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
     }
 
 
+def ensure_websockets():
+    try:
+        import websockets
+        return websockets
+    except ImportError:
+        print("[*] Installing required client library 'websockets'...")
+        import subprocess
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "websockets"])
+        except Exception:
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "websockets"])
+            except Exception:
+                pass
+        import websockets
+        return websockets
+
+
 def run_websocket_tunnel(server_url: str, worker_id: str, once: bool = False) -> Dict[str, Any]:
     """Connect to orchestrator via persistent WebSocket tunnel, handshake, and send heartbeat."""
     ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{worker_id}"
     import asyncio
-    import websockets
+    websockets = ensure_websockets()
 
     async def _async_tunnel():
         async with websockets.connect(ws_url, open_timeout=10) as ws:
@@ -503,7 +534,7 @@ def cmd_work(args: argparse.Namespace) -> int:
     if getattr(args, "tunnel", False):
         # WebSocket Tunnel Execution Mode
         import asyncio
-        import websockets
+        websockets = ensure_websockets()
 
         ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{worker_id}"
 
