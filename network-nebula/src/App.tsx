@@ -19,6 +19,7 @@ import { ApiTokensPage } from "@/pages/api-tokens";
 import { ClusterStatusPage } from "@/pages/cluster-status";
 import { GovernancePage } from "@/pages/governance";
 import { SwarmStudioPage } from "@/pages/swarm-studio";
+import { MoeStudioPage } from "@/pages/moe-studio";
 import type { ReactNode } from "react";
 
 function ProtectedRouteWrapper({
@@ -46,6 +47,7 @@ function App() {
           <Route path="/training" element={<TrainingStudioPage />} />
           <Route path="/inference" element={<InferenceHubPage />} />
           <Route path="/swarm" element={<SwarmStudioPage />} />
+          <Route path="/moe" element={<MoeStudioPage />} />
           <Route path="/api-tokens" element={<ApiTokensPage />} />
           <Route path="/cluster" element={<ClusterStatusPage />} />
           <Route path="/governance" element={<GovernancePage />} />

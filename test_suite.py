@@ -4683,7 +4683,87 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Crypto deposit verification & automated host worker withdrawal settlement", str(e))
 
+    # =========================================================================
+    # Phase 6.5 (Alpha Milestone 6): React 19 MoE Visualizer, Speculative Dashboard & Payment Center
+    # =========================================================================
+    print_header("Phase 6.5 (Alpha Milestone 6): React 19 MoE Visualizer, Speculative Dashboard & Payment Center")
+
+    # M6.9 MoE & Speculative Decoding REST Telemetry Serialization Protocol Audit
+    try:
+        # 1. MoE Models Catalog & Pipelines
+        moe_models_res = requests.get(f"{BASE_URL}/api/v1/moe/models/supported", timeout=5).json()
+        moe_models = moe_models_res.get("models", [])
+        has_mixtral = any("Mixtral" in m.get("name", "") for m in moe_models)
+        has_experts = all(m.get("total_experts", 0) >= 8 and (m.get("top_k_experts", 0) >= 2 or m.get("active_experts", 0) >= 2) for m in moe_models if "Mixtral" in m.get("name", "") or "DeepSeek" in m.get("name", ""))
+
+        moe_pipes_res = requests.get(f"{BASE_URL}/api/v1/moe/pipelines", timeout=5).json()
+        moe_pipes = moe_pipes_res.get("pipelines", [])
+        has_moe_pipes = isinstance(moe_pipes, list) and len(moe_pipes) >= 1
+
+        # 2. Speculative Decoding Telemetry Stats
+        spec_stats_res = requests.get(f"{BASE_URL}/api/v1/speculative/stats", timeout=5).json()
+        spec_valid = (
+            spec_stats_res.get("status") in ["operational", "success"]
+            and ("Qwen" in spec_stats_res.get("draft_model", "") or "Qwen" in str(spec_stats_res))
+            and spec_stats_res.get("draft_window_k", 4) == 4
+        )
+
+        # 3. Kademlia DHT Node & Routing Table Serialization
+        dht_node_res = requests.get(f"{BASE_URL}/api/v1/dht/node/info", timeout=5).json()
+        dht_rt_res = requests.get(f"{BASE_URL}/api/v1/dht/routing-table", timeout=5).json()
+        dht_valid = (
+            len(dht_node_res.get("node_id", "")) == 40
+            and "contacts" in dht_rt_res
+            and dht_rt_res.get("status") == "success"
+        )
+
+        # 4. Billing & Micro-Escrow Serialization
+        bill_stats_res = requests.get(f"{BASE_URL}/api/v1/billing/stats", timeout=5).json()
+        crypto_addr_res = requests.get(f"{BASE_URL}/api/v1/billing/crypto/deposit-address?user_id=test_m6_9", timeout=5).json()
+        bill_valid = (
+            bill_stats_res.get("status") == "operational"
+            and "base" in crypto_addr_res.get("supported_chains", {})
+            and "solana" in crypto_addr_res.get("supported_chains", {})
+        )
+
+        m6_9_ok = has_mixtral and has_experts and has_moe_pipes and spec_valid and dht_valid and bill_valid
+        suite.record(
+            m6_9_ok,
+            f"MoE & Speculative Decoding REST telemetry serialization verified (MoE models: {len(moe_models)}, active pipes: {len(moe_pipes)}, draft K: {spec_stats_res.get('draft_window_k')}, DHT node: {dht_node_res.get('node_id')[:8]}..., chains: {len(crypto_addr_res.get('supported_chains', {}))})"
+        )
+    except Exception as e:
+        suite.record(False, "MoE & Speculative Decoding REST telemetry serialization protocol", str(e))
+
+    # M6.10 Production Frontend SPA Compilation & MoE/Speculative Route Integration
+    try:
+        dist_dir = os.path.join(os.path.dirname(__file__), "network-nebula", "dist")
+        index_html = os.path.join(dist_dir, "index.html")
+        assets_dir = os.path.join(dist_dir, "assets")
+
+        html_exists = os.path.isfile(index_html) and os.path.getsize(index_html) > 0
+        js_files = [f for f in os.listdir(assets_dir) if f.endswith(".js")] if os.path.isdir(assets_dir) else []
+        has_js = len(js_files) > 0
+
+        # Check bundle content for MoE studio strings and route
+        moe_in_bundle = False
+        for jf in js_files:
+            jpath = os.path.join(assets_dir, jf)
+            with open(jpath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                if "/moe" in content and ("MoE" in content or "Speculative" in content):
+                    moe_in_bundle = True
+                    break
+
+        m6_10_ok = html_exists and has_js and moe_in_bundle
+        suite.record(
+            m6_10_ok,
+            f"Production frontend SPA compilation & MoE/Speculative route integration verified (dist/index.html: {html_exists}, bundle JS: {len(js_files)} files, /moe route in bundle: {moe_in_bundle})"
+        )
+    except Exception as e:
+        suite.record(False, "Production frontend SPA compilation & MoE/Speculative route integration", str(e))
+
     return suite.summary()
+
 
 
 

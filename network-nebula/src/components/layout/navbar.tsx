@@ -35,6 +35,7 @@ export function Navbar({ user, onLogout }: NavbarProps) {
     { href: "/training", label: "Training Studio" },
     { href: "/inference", label: "Model Serving" },
     { href: "/swarm", label: "Swarm Studio" },
+    { href: "/moe", label: "MoE & Speculative" },
     { href: "/api-tokens", label: "API Tokens" },
     { href: "/cluster", label: "GPU Fleet" },
     { href: "/worker", label: "Worker Node" },

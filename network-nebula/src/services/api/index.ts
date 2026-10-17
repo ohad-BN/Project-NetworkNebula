@@ -5,4 +5,5 @@ export { walletService } from "./wallet";
 export { workersService } from "./workers";
 export { governanceService } from "./governance";
 export { swarmService } from "./swarm";
+export { moeService } from "./moe";
 
