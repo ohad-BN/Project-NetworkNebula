@@ -19,15 +19,23 @@ if %errorlevel% neq 0 (
 set /p SERVER_IP="Enter NetworkNebula Server IP/Host [default: 127.0.0.1]: "
 if "%SERVER_IP%"=="" set SERVER_IP=127.0.0.1
 
+:: Prompt for Node Name
+set /p NODE_NAME="Enter Node Display Name [default: My-RTX-4070]: "
+if "%NODE_NAME%"=="" set NODE_NAME=My-RTX-4070
+
+:: Prompt for Worker ID
+set /p WORKER_ID="Enter Unique Worker ID [default: node-pc-rtx4070]: "
+if "%WORKER_ID%"=="" set WORKER_ID=node-pc-rtx4070
+
 :: Prompt for VRAM Contribution %
 set /p VRAM_PCT="Enter GPU VRAM Contribution Percentage (10-100) [default: 75]: "
 if "%VRAM_PCT%"=="" set VRAM_PCT=75
 
 echo.
-echo [*] Probing local GPU and connecting to http://%SERVER_IP%:8000 with %VRAM_PCT%%% VRAM limit...
+echo [*] Probing local GPU and connecting to http://%SERVER_IP%:8000 as '%NODE_NAME%' (%WORKER_ID%) with %VRAM_PCT%%% VRAM limit...
 echo [*] Press Ctrl+C at any time to disconnect gracefully.
 echo.
 
-python nebula_worker.py join --server http://%SERVER_IP%:8000 --vram-pct %VRAM_PCT% --tunnel
+python nebula_worker.py join --server http://%SERVER_IP%:8000 --name "%NODE_NAME%" --worker-id "%WORKER_ID%" --vram-pct %VRAM_PCT% --tunnel
 
 pause
