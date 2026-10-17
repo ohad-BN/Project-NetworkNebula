@@ -64,6 +64,19 @@ class PipelineGenerateRequest(BaseModel):
     stream: Optional[bool] = Field(default=False, description="Whether to stream tokens via SSE")
 
 
+class StageFailoverRequest(BaseModel):
+    reason: Optional[str] = Field(default="manual_admin_trigger", description="Reason for triggering stage failover")
+    session_id: Optional[str] = Field(default=None, description="Optional active session ID for immediate KV-cache sync")
+
+
+class SimulateDropoutRequest(BaseModel):
+    prompt: Optional[str] = Field(default="Testing swarm auto-healing and pipeline rerouting", description="Prompt text")
+    max_tokens: Optional[int] = Field(default=8, ge=1, le=128, description="Max tokens to generate")
+    drop_stage_idx: int = Field(ge=0, description="Stage index to simulate node failure on")
+    drop_at_step: int = Field(ge=0, description="Generation step number at which to trigger node failure")
+    session_id: Optional[str] = Field(default=None, description="Active session ID")
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -349,4 +362,91 @@ def generate_by_model(
     except Exception as e:
         logger.error(f"Swarm model generate error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Fault Tolerance, Auto-Healing & Standby Failover Endpoints (Phase 5.4)
+# ---------------------------------------------------------------------------
+
+@router.get("/pipelines/{pipeline_id}/fault-tolerance", summary="Get Pipeline Fault Tolerance & Redundancy Report")
+def get_pipeline_fault_tolerance(pipeline_id: str):
+    """
+    Returns redundancy metrics, standby node health, and historic failover event logs
+    for the specified pipeline.
+    """
+    try:
+        report = sharding_engine.get_fault_tolerance(pipeline_id)
+        return {
+            "status": "success",
+            "pipeline_id": pipeline_id,
+            "fault_tolerance": report,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Fault tolerance inspection failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/pipelines/{pipeline_id}/stages/{stage_idx}/failover", summary="Trigger Stage Failover & Standby Promotion")
+def trigger_stage_failover_endpoint(
+    pipeline_id: str,
+    stage_idx: int,
+    payload: StageFailoverRequest = StageFailoverRequest(),
+):
+    """
+    Promotes the first standby worker to primary on the requested stage,
+    evicting the dropped node and synchronizing KV-cache state.
+    """
+    try:
+        record = sharding_engine.trigger_stage_failover(
+            pipeline_id=pipeline_id,
+            stage_idx=stage_idx,
+            reason=payload.reason or "manual_admin_trigger",
+            session_id=payload.session_id,
+        )
+        return {
+            "status": "success",
+            "pipeline_id": pipeline_id,
+            "stage_idx": stage_idx,
+            "failover": record,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Stage failover failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/pipelines/{pipeline_id}/simulate-dropout", summary="Simulate Dynamic Node Dropout Mid-Generation")
+def simulate_pipeline_dropout(
+    pipeline_id: str,
+    payload: SimulateDropoutRequest,
+):
+    """
+    Runs autoregressive generation on the pipeline while dynamically simulating a node crash
+    at the designated step number. Verifies zero token loss and automatic standby promotion.
+    """
+    try:
+        result = sharding_engine.generate_swarm_completion(
+            pipeline_id=pipeline_id,
+            prompt=payload.prompt or "Testing swarm auto-healing and pipeline rerouting",
+            max_tokens=payload.max_tokens or 8,
+            session_id=payload.session_id,
+            simulate_drop_at_step=payload.drop_at_step,
+            drop_stage_idx=payload.drop_stage_idx,
+        )
+        return {
+            "status": "success",
+            "pipeline_id": pipeline_id,
+            "simulation": result,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Simulate dropout failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 

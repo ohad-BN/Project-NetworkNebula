@@ -280,10 +280,13 @@
 - [x] Wired `/v1/chat/completions` in [`app/openai_inference_router.py`](app/openai_inference_router.py) to automatically route 70B+ sharded models through active swarm pipelines with token-by-token SSE streaming and non-streaming responses
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.3 assertions (`M5.5` distributed attention KV-cache coordination & step latency reduction audit, `M5.6` OpenAI-compatible swarm chat completions & SSE streaming) (**129/129 passed — 100% Green**)
 
-### 📋 Phase 5.4: Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing
-- [ ] Implement redundant layer shard assignment (primary + standby replica per layer block) in `app/sharding_engine.py`
-- [ ] Implement dynamic dropout detection and zero-loss mid-generation activation rerouting with fast standby KV-cache sync
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.4 assertions (`M5.7`, `M5.8`) and verify 100% green pass
+### ✅ Phase 5.4: Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing (COMPLETED)
+- [x] Implemented redundant layer shard assignment (`primary_worker_id` + `standby_worker_ids` list per stage) with `redundancy_level` tiering (`optimal`, `degraded`, `none`), `stages_with_standby`, and `total_standbys` metrics in [`app/sharding_engine.py`](app/sharding_engine.py)
+- [x] Built dynamic dropout detection and zero-loss mid-generation activation rerouting (`pipeline.auto_heal_stage` and `execute_pipeline_forward_pass`) promoting standby replicas to primary, demoting dropped nodes to `offline_worker_ids`, and logging immutable failover records
+- [x] Implemented fast standby replica KV-cache cloning (`sync_stage_kv`) in [`app/kv_cache_manager.py`](app/kv_cache_manager.py) ensuring promoted standby nodes immediately resume attention computation without prompt re-encoding
+- [x] Added fault tolerance and failover REST endpoints in [`app/sharding_router.py`](app/sharding_router.py): `GET /api/v1/swarm/pipelines/{id}/fault-tolerance`, `POST /api/v1/swarm/pipelines/{id}/stages/{stage_idx}/failover`, and `POST /api/v1/swarm/pipelines/{id}/simulate-dropout`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.4 assertions (`M5.7` redundant layer shard assignment & standby replication protocol audit, `M5.8` zero-drop dynamic mid-generation failover & swarm auto-healing) (**131/131 passed — 100% Green in 200.35s**)
+
 
 ### 📋 Phase 5.5: React 19 Swarm Pipeline Visualizer & Model Sharding Studio UI
 - [ ] Build **Swarm Pipeline & Model Sharding Studio Page** (`network-nebula/src/pages/swarm-studio.tsx`) with interactive node pipeline diagram, layer slice badges, live activation pulse telemetry, and token latency waterfalls

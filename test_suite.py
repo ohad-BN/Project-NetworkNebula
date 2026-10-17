@@ -3727,6 +3727,147 @@ def run_tests():
     except Exception as e:
         suite.record(False, "OpenAI-compatible swarm chat completions & SSE streaming", str(e))
 
+    # =========================================================================
+    # Phase 5.4 (Alpha Milestone 5): Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing
+    # =========================================================================
+    print_header("Phase 5.4 (Alpha Milestone 5): Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing")
+
+    # M5.7 Redundant Layer Shard Assignment & Standby Replication Protocol Audit
+    try:
+        # 1. Create a 4-stage pipeline for Llama-3-70B with 4 primary and 4 standby workers
+        primary_nodes = [f"primary-node-0{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+        standby_nodes = [f"standby-node-0{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+
+        red_pipe_res = requests.post(f"{BASE_URL}/api/v1/swarm/pipelines", json={
+            "model_id": "meta-llama/Llama-3-70B",
+            "num_stages": 4,
+            "quantization": "4bit",
+            "worker_ids": primary_nodes,
+            "standby_worker_ids": standby_nodes,
+            "name": f"redundant-pipe-{uuid.uuid4().hex[:6]}",
+        }, timeout=5).json()
+
+        pipe_data = red_pipe_res.get("pipeline", {})
+        red_pid = pipe_data.get("pipeline_id")
+
+        redundancy_ok = (
+            pipe_data.get("redundancy_level") == "optimal"
+            and pipe_data.get("stages_with_standby") == 4
+            and pipe_data.get("total_standbys") == 4
+            and pipe_data.get("health_score") == 100.0
+        )
+
+        # 2. Query Fault-Tolerance report endpoint
+        ft_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{red_pid}/fault-tolerance", timeout=5).json()
+        ft_data = ft_res.get("fault_tolerance", {})
+
+        ft_report_ok = (
+            ft_res.get("status") == "success"
+            and ft_data.get("redundancy_level") == "optimal"
+            and ft_data.get("stages_with_standby") == 4
+            and len(ft_data.get("stage_breakdown", [])) == 4
+            and all(s.get("has_standby") is True for s in ft_data.get("stage_breakdown", []))
+        )
+
+        # 3. Trigger manual failover on stage 2 (index 2)
+        fo_res = requests.post(
+            f"{BASE_URL}/api/v1/swarm/pipelines/{red_pid}/stages/2/failover",
+            json={"reason": "simulated_host_hardware_fault"},
+            timeout=5,
+        ).json()
+        fo_record = fo_res.get("failover", {})
+
+        expected_promoted = standby_nodes[2]
+        expected_demoted = primary_nodes[2]
+
+        failover_ok = (
+            fo_res.get("status") == "success"
+            and fo_record.get("stage_idx") == 2
+            and fo_record.get("old_primary") == expected_demoted
+            and fo_record.get("new_primary") == expected_promoted
+            and fo_record.get("remaining_standbys") == 0
+        )
+
+        # Verify pipeline state after failover: total_failovers == 1, stage 2 primary == expected_promoted
+        after_pipe_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{red_pid}", timeout=5).json()
+        after_pipe = after_pipe_res.get("pipeline", {})
+        after_stages = after_pipe.get("stages", [])
+        post_state_ok = (
+            after_pipe.get("total_failovers") == 1
+            and len(after_stages) == 4
+            and after_stages[2].get("primary_worker_id") == expected_promoted
+            and expected_demoted in after_stages[2].get("offline_worker_ids", [])
+        )
+
+        m5_7_ok = redundancy_ok and ft_report_ok and failover_ok and post_state_ok
+        suite.record(
+            m5_7_ok,
+            f"Redundant layer shard assignment & standby replication protocol audit verified (pipe: {red_pid}, redundancy: {pipe_data.get('redundancy_level')}, standbys: {pipe_data.get('total_standbys')}, promoted: {expected_promoted}, demoted: {expected_demoted}, failovers: {after_pipe.get('total_failovers')})"
+        )
+    except Exception as e:
+        suite.record(False, "Redundant layer shard assignment & standby replication protocol", str(e))
+
+    # M5.8 Zero-Drop Dynamic Mid-Generation Failover & Swarm Auto-Healing
+    try:
+        # 1. Create a 4-stage pipeline with primary & standby workers
+        p_nodes = [f"autoheal-pri-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+        s_nodes = [f"autoheal-stb-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+
+        heal_pipe_res = requests.post(f"{BASE_URL}/api/v1/swarm/pipelines", json={
+            "model_id": "meta-llama/Llama-3-70B",
+            "num_stages": 4,
+            "quantization": "4bit",
+            "worker_ids": p_nodes,
+            "standby_worker_ids": s_nodes,
+            "name": f"autoheal-test-pipe-{uuid.uuid4().hex[:6]}",
+        }, timeout=5).json()
+        heal_pid = heal_pipe_res.get("pipeline", {}).get("pipeline_id")
+
+        # 2. Simulate node dropout mid-stream (stage 1 drops at step 2 during 6-token generation)
+        drop_payload = {
+            "prompt": "Autonomous swarm self-healing without packet loss",
+            "max_tokens": 6,
+            "drop_stage_idx": 1,
+            "drop_at_step": 2,
+        }
+        sim_res = requests.post(
+            f"{BASE_URL}/api/v1/swarm/pipelines/{heal_pid}/simulate-dropout",
+            json=drop_payload,
+            timeout=15,
+        ).json()
+        sim_data = sim_res.get("simulation", {})
+
+        tokens_generated = sim_data.get("tokens_generated", 0)
+        failovers_handled = sim_data.get("total_failovers_handled", 0)
+        failover_records = sim_data.get("failover_records", [])
+
+        # Verify generation completed fully without token drop and auto-heal succeeded
+        zero_drop = (tokens_generated == 6)
+        auto_healed = (
+            failovers_handled >= 1
+            and len(failover_records) >= 1
+            and failover_records[0].get("stage_idx") == 1
+            and failover_records[0].get("old_primary") == p_nodes[1]
+            and failover_records[0].get("new_primary") == s_nodes[1]
+        )
+
+        # 3. Query fault-tolerance metrics to verify persistent audit trail
+        heal_ft_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{heal_pid}/fault-tolerance", timeout=5).json()
+        heal_ft = heal_ft_res.get("fault_tolerance", {})
+        trail_ok = (
+            heal_ft.get("total_failovers") >= 1
+            and len(heal_ft.get("stage_breakdown", [])) == 4
+            and heal_ft.get("stage_breakdown", [])[1].get("primary_worker_id") == s_nodes[1]
+        )
+
+        m5_8_ok = (sim_res.get("status") == "success") and zero_drop and auto_healed and trail_ok
+        suite.record(
+            m5_8_ok,
+            f"Zero-drop dynamic mid-generation failover & auto-healing verified (tokens: {tokens_generated}/6, failovers handled: {failovers_handled}, promoted: {s_nodes[1]}, total failovers in trail: {heal_ft.get('total_failovers')}, completion length: {len(sim_data.get('completion', ''))})"
+        )
+    except Exception as e:
+        suite.record(False, "Zero-drop dynamic mid-generation failover & swarm auto-healing", str(e))
+
     return suite.summary()
 
 
@@ -3734,6 +3875,7 @@ def run_tests():
 if __name__ == "__main__":
     success = run_tests()
     sys.exit(0 if success else 1)
+
 
 
 

@@ -323,6 +323,31 @@ class KVCacheManager:
                 return True
             return False
 
+    def sync_stage_kv(
+        self,
+        session_id: str,
+        stage_idx: int,
+        target_worker_id: Optional[str] = None,
+        source_worker_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Fast-sync protocol for standby replica promotion:
+        Verifies or deep-copies the stage KV slice so a newly promoted worker node
+        can immediately resume attention computation without reprocessing past tokens.
+        """
+        with self._lock:
+            if session_id not in self._sessions:
+                return False
+            sess = self._sessions[session_id]
+            if stage_idx not in sess.stages:
+                return False
+            stage_slice = sess.stages[stage_idx]
+            if stage_slice.keys is not None and stage_slice.values is not None:
+                stage_slice.keys = stage_slice.keys.copy()
+                stage_slice.values = stage_slice.values.copy()
+            stage_slice.last_accessed = time.time()
+            return True
+
     def clear_all(self):
         with self._lock:
             self._sessions.clear()

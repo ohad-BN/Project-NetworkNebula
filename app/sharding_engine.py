@@ -107,7 +107,9 @@ class PipelineStage:
         self.has_embeddings = has_embeddings
         self.has_lm_head = has_lm_head
         self.primary_worker_id = primary_worker_id
-        self.standby_worker_ids = standby_worker_ids or []
+        self.standby_worker_ids = list(standby_worker_ids or [])
+        self.offline_worker_ids: List[str] = []
+        self.failover_history: List[Dict[str, Any]] = []
         self.status = "ready" if primary_worker_id else "unassigned"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -121,6 +123,8 @@ class PipelineStage:
             "has_lm_head": self.has_lm_head,
             "primary_worker_id": self.primary_worker_id,
             "standby_worker_ids": self.standby_worker_ids,
+            "offline_worker_ids": self.offline_worker_ids,
+            "failover_history": self.failover_history,
             "status": self.status,
             "is_covered": bool(self.primary_worker_id),
             "redundancy_count": len(self.standby_worker_ids) + (1 if self.primary_worker_id else 0),
@@ -177,12 +181,129 @@ class SwarmPipeline:
         return round(score, 1)
 
     @property
+    def redundancy_level(self) -> str:
+        """
+        Redundancy tier across all pipeline stages:
+        - 'optimal': all stages have at least one standby replica
+        - 'degraded': some stages have standbys, but at least one stage lacks a standby
+        - 'none': no stages have standby replicas
+        """
+        if not self.stages:
+            return "none"
+        standby_counts = [len(s.standby_worker_ids) for s in self.stages]
+        if all(c > 0 for c in standby_counts):
+            return "optimal"
+        elif any(c > 0 for c in standby_counts):
+            return "degraded"
+        return "none"
+
+    @property
+    def stages_with_standby(self) -> int:
+        return sum(1 for s in self.stages if len(s.standby_worker_ids) > 0)
+
+    @property
+    def total_standbys(self) -> int:
+        return sum(len(s.standby_worker_ids) for s in self.stages)
+
+    @property
+    def total_failovers(self) -> int:
+        return sum(len(s.failover_history) for s in self.stages)
+
+    @property
     def status(self) -> str:
         if self.is_complete:
             return "ready" if self.health_score >= 100.0 else "degraded_ready"
         if any(s.primary_worker_id for s in self.stages):
             return "partially_assigned"
         return "unassigned"
+
+    def auto_heal_stage(
+        self,
+        stage_idx: int,
+        reason: str = "worker_heartbeat_timeout",
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Promotes the first available standby worker node to primary for the specified stage,
+        marks the failed worker as offline, logs the failover event, and synchronizes KV-cache.
+        """
+        if stage_idx < 0 or stage_idx >= len(self.stages):
+            raise ValueError(f"Invalid stage_idx {stage_idx}. Pipeline has {len(self.stages)} stages.")
+
+        stage = self.stages[stage_idx]
+        if not stage.standby_worker_ids:
+            raise RuntimeError(
+                f"Cannot auto-heal stage {stage_idx}: No standby worker replicas available!"
+            )
+
+        old_primary = stage.primary_worker_id
+        new_primary = stage.standby_worker_ids.pop(0)
+
+        if old_primary:
+            stage.offline_worker_ids.append(old_primary)
+        stage.primary_worker_id = new_primary
+        stage.status = "ready"
+
+        record = {
+            "stage_idx": stage_idx,
+            "old_primary": old_primary,
+            "new_primary": new_primary,
+            "timestamp": time.time(),
+            "iso_time": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "session_id": session_id,
+            "remaining_standbys": len(stage.standby_worker_ids),
+        }
+        stage.failover_history.append(record)
+        self.updated_at = datetime.now(timezone.utc).isoformat()
+
+        # KV-cache synchronization if active session
+        if session_id:
+            try:
+                from app.kv_cache_manager import kv_cache_manager
+                kv_cache_manager.sync_stage_kv(
+                    session_id=session_id,
+                    stage_idx=stage_idx,
+                    target_worker_id=new_primary,
+                    source_worker_id=old_primary,
+                )
+            except Exception as e:
+                logger.error(f"[AUTO-HEAL] Failed to sync KV-cache for stage {stage_idx}: {e}")
+
+        logger.warning(
+            f"[AUTO-HEAL] Pipeline '{self.pipeline_id}' Stage {stage_idx} healed: "
+            f"'{old_primary}' -> '{new_primary}' (Reason: {reason})"
+        )
+        return record
+
+    def get_fault_tolerance_report(self) -> Dict[str, Any]:
+        """Returns deep fault-tolerance diagnostics, standby availability, and failover history."""
+        return {
+            "pipeline_id": self.pipeline_id,
+            "model_id": self.model_id,
+            "name": self.name,
+            "redundancy_level": self.redundancy_level,
+            "stages_with_standby": self.stages_with_standby,
+            "total_stages": len(self.stages),
+            "total_standbys": self.total_standbys,
+            "total_failovers": self.total_failovers,
+            "health_score": self.health_score,
+            "status": self.status,
+            "stage_breakdown": [
+                {
+                    "stage_idx": s.stage_idx,
+                    "start_layer": s.start_layer,
+                    "end_layer": s.end_layer,
+                    "primary_worker_id": s.primary_worker_id,
+                    "standby_worker_ids": s.standby_worker_ids,
+                    "offline_worker_ids": s.offline_worker_ids,
+                    "has_standby": len(s.standby_worker_ids) > 0,
+                    "failover_count": len(s.failover_history),
+                    "last_failover": s.failover_history[-1] if s.failover_history else None,
+                }
+                for s in self.stages
+            ],
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -195,6 +316,10 @@ class SwarmPipeline:
             "status": self.status,
             "is_complete": self.is_complete,
             "health_score": self.health_score,
+            "redundancy_level": self.redundancy_level,
+            "stages_with_standby": self.stages_with_standby,
+            "total_standbys": self.total_standbys,
+            "total_failovers": self.total_failovers,
             "total_vram_budget_gb": self.total_vram_budget_gb,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -442,11 +567,14 @@ class ShardingEngine:
         initial_activations: Optional[Union[np.ndarray, List[float]]] = None,
         session_id: Optional[str] = None,
         step: int = 0,
+        failing_worker_ids: Optional[List[str]] = None,
+        simulate_drop_stage: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Executes a multi-hop sequential forward pass through the sharded pipeline:
         Stage 0 (Embeddings + Blocks) -> Stage 1 (Blocks) -> ... -> Stage K (Blocks + LM Head).
         Streams intermediate activation tensors using binary TensorWireCodec.
+        Auto-heals dropped or failing stages mid-flight via standby replica promotion.
         """
         from app.tensor_stream import TensorWireCodec, LayerBlockExecutor
 
@@ -482,11 +610,24 @@ class ShardingEngine:
                     activations = np.array(initial_activations, dtype=np.float32)
 
             stage_telemetry: List[Dict[str, Any]] = []
+            failovers_handled: List[Dict[str, Any]] = []
             total_wire_bytes = 0
             start_wall = time.time()
             logits: Optional[np.ndarray] = None
 
             for stage in pipeline.stages:
+                # Check for dynamic node drop or worker failure
+                is_simulated_drop = (simulate_drop_stage is not None and stage.stage_idx == simulate_drop_stage)
+                is_worker_failing = bool(failing_worker_ids and stage.primary_worker_id in failing_worker_ids)
+                if is_simulated_drop or is_worker_failing:
+                    drop_reason = "simulated_node_dropout" if is_simulated_drop else f"worker_failure_{stage.primary_worker_id}"
+                    fo_event = pipeline.auto_heal_stage(
+                        stage_idx=stage.stage_idx,
+                        reason=drop_reason,
+                        session_id=sid,
+                    )
+                    failovers_handled.append(fo_event)
+
                 t0 = time.time()
 
                 # 1. Handle Stage 0 embeddings if starting from tokens
@@ -572,6 +713,7 @@ class ShardingEngine:
                 "total_wire_bytes": total_wire_bytes,
                 "total_latency_ms": max(1.0, total_elapsed_ms),
                 "hops_traversed": len(pipeline.stages),
+                "failovers_handled": failovers_handled,
                 "output_tensor_shape": list(activations.shape) if activations is not None else None,
                 "logits_shape": list(logits.shape) if logits is not None else None,
                 "predicted_token_id": predicted_token_id,
@@ -629,6 +771,9 @@ class ShardingEngine:
         max_tokens: int = 20,
         temperature: float = 0.7,
         session_id: Optional[str] = None,
+        simulate_drop_at_step: Optional[int] = None,
+        drop_stage_idx: Optional[int] = None,
+        failing_worker_ids: Optional[List[str]] = None,
     ):
         """
         Continuous auto-regressive generation across the decentralized swarm pipeline
@@ -636,6 +781,7 @@ class ShardingEngine:
         - Step 0 (Prefill): Encodes prompt tokens and initializes stage KV-caches.
         - Steps 1..N (Decode): Propagates 1-token activation slices through stages
           reusing cached attention keys/values for ultra-low step latency (<100ms).
+        - Fault Tolerance: Detects node dropouts mid-stream and auto-heals without token loss.
         """
         from app.kv_cache_manager import kv_cache_manager
 
@@ -678,6 +824,7 @@ class ShardingEngine:
         for step in range(max_tokens):
             step_start = time.time()
             is_decode = (step > 0)
+            sim_drop = drop_stage_idx if (simulate_drop_at_step is not None and step == simulate_drop_at_step) else None
 
             if step == 0:
                 # Step 0: Prefill phase on prompt
@@ -687,6 +834,8 @@ class ShardingEngine:
                     token_ids=prompt_tokens,
                     session_id=sid,
                     step=0,
+                    failing_worker_ids=failing_worker_ids,
+                    simulate_drop_stage=sim_drop,
                 )
             else:
                 # Steps 1..N: Decode phase on 1 new token using cached KV
@@ -695,6 +844,8 @@ class ShardingEngine:
                     token_ids=[current_token_id],
                     session_id=sid,
                     step=step,
+                    failing_worker_ids=failing_worker_ids,
+                    simulate_drop_stage=sim_drop,
                 )
 
             next_token_id = fwd_res.get("predicted_token_id", 0)
@@ -717,6 +868,7 @@ class ShardingEngine:
                 "is_decode": is_decode,
                 "hops": len(pipeline.stages),
                 "wire_bytes": fwd_res.get("total_wire_bytes", 0),
+                "failovers": fwd_res.get("failovers_handled", []),
             }
 
     def generate_swarm_completion(
@@ -727,11 +879,15 @@ class ShardingEngine:
         max_tokens: int = 20,
         temperature: float = 0.7,
         session_id: Optional[str] = None,
+        simulate_drop_at_step: Optional[int] = None,
+        drop_stage_idx: Optional[int] = None,
+        failing_worker_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Non-streaming wrapper over generate_swarm_stream returning aggregated metrics."""
         tokens: List[str] = []
         token_ids: List[int] = []
         steps_telemetry: List[Dict[str, Any]] = []
+        all_failovers: List[Dict[str, Any]] = []
         total_wire_bytes = 0
         sid = session_id
 
@@ -743,10 +899,15 @@ class ShardingEngine:
             max_tokens=max_tokens,
             temperature=temperature,
             session_id=sid,
+            simulate_drop_at_step=simulate_drop_at_step,
+            drop_stage_idx=drop_stage_idx,
+            failing_worker_ids=failing_worker_ids,
         ):
             tokens.append(chunk["token"])
             token_ids.append(chunk["token_id"])
             steps_telemetry.append(chunk)
+            if chunk.get("failovers"):
+                all_failovers.extend(chunk["failovers"])
             total_wire_bytes += chunk.get("wire_bytes", 0)
             sid = chunk["session_id"]
 
@@ -764,8 +925,32 @@ class ShardingEngine:
             "total_latency_ms": total_latency_ms,
             "avg_decode_latency_ms": avg_decode_latency_ms,
             "total_wire_bytes": total_wire_bytes,
+            "total_failovers_handled": len(all_failovers),
+            "failover_records": all_failovers,
             "steps": steps_telemetry,
         }
+
+    def trigger_stage_failover(
+        self,
+        pipeline_id: str,
+        stage_idx: int,
+        reason: str = "manual_trigger",
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Manually trigger or simulate a failover on a specific pipeline stage."""
+        with self._lock:
+            pipeline = self._pipelines.get(pipeline_id)
+            if not pipeline:
+                raise ValueError(f"Pipeline '{pipeline_id}' not found")
+            return pipeline.auto_heal_stage(stage_idx=stage_idx, reason=reason, session_id=session_id)
+
+    def get_fault_tolerance(self, pipeline_id: str) -> Dict[str, Any]:
+        """Retrieve fault tolerance and redundancy report for a pipeline."""
+        with self._lock:
+            pipeline = self._pipelines.get(pipeline_id)
+            if not pipeline:
+                raise ValueError(f"Pipeline '{pipeline_id}' not found")
+            return pipeline.get_fault_tolerance_report()
 
     def get_pipeline(self, pipeline_id: str) -> Optional[SwarmPipeline]:
         with self._lock:
