@@ -300,8 +300,13 @@
 
 ## ⚡ Instant Command Cheatsheet
 
-
 ```powershell
+# 🚀 1-Click Complete System Startup (Docker + Backend + Worker + Frontend + Browser):
+.\start.bat
+
+# 🛑 1-Click Graceful Shutdown:
+.\stop.bat
+
 # Run the single authoritative test suite:
 python test_suite.py
 
@@ -310,15 +315,9 @@ python nebula_worker.py join --vram-pct 80 --once
 python nebula_worker.py set-limit --vram-pct 60
 python nebula_worker.py status
 
-# Start Docker infrastructure (Postgres 5433, Redis 6379, MinIO 9000):
-docker-compose up -d db redis minio
-
-# Start Backend API Orchestrator (port 8000):
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# Start GPU Compute Worker:
-celery -A app.worker.celery_app worker --loglevel=info -P solo
-
-# Start Enterprise Frontend UI (port 5173):
-cd network-nebula && bun run dev
+# Or manually run individual services:
+docker-compose up -d db redis minio                                 # Docker (Postgres 5433, Redis 6379, MinIO 9000)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload            # Backend API (port 8000)
+celery -A app.worker.celery_app worker --loglevel=info -P solo      # Celery Worker
+cd network-nebula && bun run dev                                    # React 19 UI (port 5173)
 ```
