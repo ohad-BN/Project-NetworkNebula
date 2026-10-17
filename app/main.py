@@ -1119,4 +1119,10 @@ from app.speculative_router import router as speculative_router
 
 app.include_router(speculative_router)
 
+# Include P2P Kademlia DHT Swarm Mesh Router (Alpha Milestone 6)
+from app.dht_router import router as dht_router
+
+app.include_router(dht_router)
+
+
 

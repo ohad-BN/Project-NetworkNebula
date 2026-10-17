@@ -1,7 +1,7 @@
 # 🌌 Project NetworkNebula — Enterprise B2B Status & Tasks Checklist
 > **Project Phase:** Alpha Milestone 4 Active — Enterprise Production Hardening, ZK Verification, Staked Node Governance & Production SLA  
 > **Target:** Enterprise B2B Decentralized AI Compute (Model Training & Model Serving)  
-> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**117/117 Passed — 100% Green in 110.56s**)  
+> **Single Source of Testing Truth:** [`test_suite.py`](test_suite.py) (**141/141 Passed — 100% Green in 134.99s**)  
 > **Master Architecture Guide:** [Enterprise Architecture Guide](ARCHITECTURE.md)
 
 
@@ -326,12 +326,12 @@
 - [x] Exposed `POST /api/v1/speculative/draft`, `POST /api/v1/speculative/verify`, `POST /api/v1/speculative/generate`, and `GET /api/v1/speculative/stats` in [`app/speculative_router.py`](app/speculative_router.py) mounted under `/api/v1/speculative`
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 6.2 assertions (`M6.3` Speculative Draft Generation & Parallel Multi-Token Forward Verification, `M6.4` Unbiased Rejection Sampling & $\ge 2.0\times$ Speedup Telemetry) (**139/139 passed — 100% Green in 130.51s**)
 
-### 📋 Phase 6.3: P2P Kademlia Distributed Hash Table (DHT) & Swarm Mesh Discovery
-- [ ] Build `app/kademlia_dht.py` with 160-bit SHA-1 Node IDs, XOR metric distance calculation, and $k$-bucket ($k=20$) LRU routing table
-- [ ] Implement RPC message handlers (`PING`, `STORE`, `FIND_NODE`, `FIND_VALUE`) and provider announcement protocol (`dht_announce_provider`, `dht_find_providers`)
-- [ ] Add DHT discovery client to [`nebula_worker.py`](nebula_worker.py) (`dht-peers`, `dht-find`)
-- [ ] Expose DHT management and routing endpoints at `/api/v1/dht`
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.3 assertions (`M6.5` Kademlia 160-bit XOR Routing Table & $k$-Bucket LRU Eviction Audit, `M6.6` Decentralized Provider Discovery & Multi-Hop DHT Lookup Lifecycle)
+### ✅ Phase 6.3: P2P Kademlia Distributed Hash Table (DHT) & Swarm Mesh Discovery (COMPLETED)
+- [x] Built `app/kademlia_dht.py` with 160-bit SHA-1 Node IDs, XOR metric distance calculation, and $k$-bucket ($k=20$) LRU routing table with replacement cache
+- [x] Implemented RPC message handlers (`PING`, `STORE`, `FIND_NODE`, `FIND_VALUE`) and provider announcement protocol (`dht_announce_provider`, `dht_find_providers`)
+- [x] Add DHT discovery client to [`nebula_worker.py`](nebula_worker.py) (`dht-info`, `dht-peers`, `dht-announce`, `dht-find`)
+- [x] Exposed DHT management and routing endpoints at `/api/v1/dht` in [`app/dht_router.py`](app/dht_router.py) mounted in [`app/main.py`](app/main.py)
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 6.3 assertions (`M6.5` Kademlia 160-bit XOR Routing Table & $k$-Bucket LRU Eviction Audit, `M6.6` Decentralized Provider Discovery & Multi-Hop DHT Lookup Lifecycle) (**141/141 passed — 100% Green in 134.99s**)
 
 ### 📋 Phase 6.4: Real Commercial Monetization: Stripe Checkout & Web3 Micro-Payment Escrow
 - [ ] Build `app/payment_rails.py` integrating Stripe Checkout session creation and webhook signature validation (`POST /api/v1/billing/stripe/create-checkout-session`, `POST /api/v1/billing/stripe/webhook`)

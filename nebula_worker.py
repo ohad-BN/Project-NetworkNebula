@@ -610,6 +610,81 @@ def cmd_work(args: argparse.Namespace) -> int:
         return 0
 
 
+# ==============================================================================
+# DHT Subcommands (Phase 6.3)
+# ==============================================================================
+
+def cmd_dht_info(args) -> int:
+    server = getattr(args, "server", DEFAULT_SERVER_URL)
+    try:
+        res = requests.get(f"{server}/api/v1/dht/node/info", timeout=5).json()
+        if getattr(args, "json", False):
+            print(json.dumps(res))
+        else:
+            print(f"[DHT NODE] Node ID: {res.get('node_id')}")
+            print(f"[DHT NODE] Total Contacts: {res.get('routing_summary', {}).get('total_contacts')}")
+            print(f"[DHT NODE] Active Buckets: {res.get('routing_summary', {}).get('active_buckets')}")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] Failed to query DHT info: {e}")
+        return 1
+
+
+def cmd_dht_peers(args) -> int:
+    server = getattr(args, "server", DEFAULT_SERVER_URL)
+    try:
+        res = requests.get(f"{server}/api/v1/dht/routing-table", timeout=5).json()
+        if getattr(args, "json", False):
+            print(json.dumps(res))
+        else:
+            print(f"[DHT PEERS] Total Peers: {res.get('total_contacts')}")
+            for c in res.get("contacts", []):
+                print(f"  - {c.get('worker_id')} (Node: {c.get('node_id')[:12]}..., Region: {c.get('region')})")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] Failed to list DHT peers: {e}")
+        return 1
+
+
+def cmd_dht_announce(args) -> int:
+    server = getattr(args, "server", DEFAULT_SERVER_URL)
+    key = args.key
+    wid = getattr(args, "worker_id", DEFAULT_WORKER_ID)
+    vram = getattr(args, "vram_gb", 8.0)
+    try:
+        res = requests.post(f"{server}/api/v1/dht/providers/announce", json={
+            "content_key": key,
+            "provider_id": wid,
+            "vram_gb": vram,
+        }, timeout=5).json()
+        if getattr(args, "json", False):
+            print(json.dumps(res))
+        else:
+            print(f"[DHT ANNOUNCE] Successfully announced as provider for key '{key}'. Total providers: {res.get('total_providers_for_key')}")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] Failed to announce to DHT: {e}")
+        return 1
+
+
+def cmd_dht_find(args) -> int:
+    server = getattr(args, "server", DEFAULT_SERVER_URL)
+    key = args.key
+    try:
+        res = requests.get(f"{server}/api/v1/dht/providers/{key}", timeout=5).json()
+        if getattr(args, "json", False):
+            print(json.dumps(res))
+        else:
+            providers = res.get("providers", [])
+            print(f"[DHT FIND] Key: '{key}' | Providers found: {len(providers)}")
+            for p in providers:
+                print(f"  - Provider: {p.get('provider_id')} (Endpoint: {p.get('endpoint')}, VRAM: {p.get('vram_gb')} GB)")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] Failed to lookup key in DHT: {e}")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nebula_worker.py",
@@ -663,6 +738,27 @@ def build_parser() -> argparse.ArgumentParser:
     ping_p.add_argument("--region", default="us-east", help="Geographic compute region")
     ping_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
+    # DHT commands (Phase 6.3)
+    dht_info_p = subparsers.add_parser("dht-info", help="Inspect local Kademlia DHT node identity and metrics")
+    dht_info_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    dht_info_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
+
+    dht_peers_p = subparsers.add_parser("dht-peers", help="List discovered peers in Kademlia routing table")
+    dht_peers_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    dht_peers_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
+
+    dht_ann_p = subparsers.add_parser("dht-announce", help="Announce layer shard or MoE expert to DHT")
+    dht_ann_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    dht_ann_p.add_argument("--key", required=True, help="Content key (e.g. sharded_model:Llama-3-70B:stage:0)")
+    dht_ann_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
+    dht_ann_p.add_argument("--vram-gb", type=float, default=8.0, help="Available GPU VRAM in GB")
+    dht_ann_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
+
+    dht_find_p = subparsers.add_parser("dht-find", help="Lookup providers for a key in DHT")
+    dht_find_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    dht_find_p.add_argument("--key", required=True, help="Content key to resolve")
+    dht_find_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
+
     return parser
 
 
@@ -679,9 +775,18 @@ def main() -> int:
         return cmd_work(args)
     elif args.command == "ping":
         return cmd_ping(args)
+    elif args.command == "dht-info":
+        return cmd_dht_info(args)
+    elif args.command == "dht-peers":
+        return cmd_dht_peers(args)
+    elif args.command == "dht-announce":
+        return cmd_dht_announce(args)
+    elif args.command == "dht-find":
+        return cmd_dht_find(args)
     return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

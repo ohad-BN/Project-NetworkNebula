@@ -4321,7 +4321,123 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Unbiased rejection sampling & >= 2.0x speedup telemetry", str(e))
 
+    # =========================================================================
+    # Phase 6.3 (Alpha Milestone 6): P2P Kademlia Distributed Hash Table (DHT) & Swarm Mesh
+    # =========================================================================
+    print_header("Phase 6.3 (Alpha Milestone 6): P2P Kademlia DHT & Swarm Mesh Discovery")
+
+    # M6.5 Kademlia 160-bit XOR Routing Table & k-Bucket LRU Eviction Audit
+    try:
+        from app.kademlia_dht import (
+            Contact,
+            KBucket,
+            KademliaRoutingTable,
+            generate_node_id,
+            hash_key,
+            int_to_hex,
+            xor_distance,
+        )
+
+        # 1. Verify 160-bit XOR metric properties: d(a,b) == d(b,a), d(a,a) == 0, d(a,b) ^ d(b,c) == d(a,c)
+        id_a = generate_node_id()
+        id_b = generate_node_id()
+        id_c = generate_node_id()
+
+        sym_ok = (xor_distance(id_a, id_b) == xor_distance(id_b, id_a))
+        id_ok = (xor_distance(id_a, id_a) == 0)
+        tri_ok = ((xor_distance(id_a, id_b) ^ xor_distance(id_b, id_c)) == xor_distance(id_a, id_c))
+
+        # 2. Test KBucket LRU capacity (k=20) and refresh ordering
+        bucket = KBucket(capacity=3)
+        c1 = Contact(node_id=1, worker_id="w-1")
+        c2 = Contact(node_id=2, worker_id="w-2")
+        c3 = Contact(node_id=3, worker_id="w-3")
+        c4 = Contact(node_id=4, worker_id="w-4")
+
+        bucket.add_contact(c1)
+        bucket.add_contact(c2)
+        bucket.add_contact(c3)
+        # Touch c1 to move it to most-recently seen
+        bucket.add_contact(c1)
+        # Add c4 when bucket is full -> should go to replacement cache
+        added_c4 = bucket.add_contact(c4)
+
+        bucket_order = [c.node_id for c in bucket.get_contacts()]
+        # Order should be [2, 3, 1] because c1 was touched and moved to tail
+        lru_ok = (bucket_order == [2, 3, 1] and added_c4 is False and len(bucket.replacement_cache) == 1)
+
+        # 3. Test KademliaRoutingTable binary tree indexing & find_closest_nodes
+        local_id = generate_node_id()
+        rt = KademliaRoutingTable(local_id)
+        peers = [Contact(node_id=generate_node_id(), worker_id=f"peer-{i}") for i in range(25)]
+        for p in peers:
+            rt.add_contact(p)
+
+        target_key_int = hash_key("model:Llama-3-70B:layer:0-19")
+        closest_nodes = rt.find_closest_nodes(target_key_int, count=5)
+        # Verify closest nodes are strictly sorted by XOR distance to target
+        distances = [xor_distance(c.node_id, target_key_int) for c in closest_nodes]
+        is_sorted = all(distances[i] <= distances[i + 1] for i in range(len(distances) - 1))
+
+        m6_5_ok = sym_ok and id_ok and tri_ok and lru_ok and is_sorted and len(closest_nodes) == 5
+        suite.record(
+            m6_5_ok,
+            f"Kademlia 160-bit XOR routing table & k-bucket LRU eviction verified (symmetric: {sym_ok}, identity: {id_ok}, LRU order: {bucket_order}, closest peers sorted: {is_sorted}, total contacts: {rt.total_contacts})"
+        )
+    except Exception as e:
+        suite.record(False, "Kademlia 160-bit XOR routing table & k-bucket LRU eviction", str(e))
+
+    # M6.6 Decentralized Provider Discovery & Multi-Hop DHT Lookup Lifecycle
+    try:
+        # 1. Test DHT provider announcement via REST API
+        ann_payload = {
+            "content_key": "sharded_model:meta-llama/Llama-3-70B:stage:0",
+            "provider_id": "test-dht-worker-01",
+            "endpoint": "http://10.200.1.1:8000",
+            "vram_gb": 8.0,
+            "metadata": {"layers": "0-19", "has_embeddings": True},
+        }
+        res_ann = requests.post(f"{BASE_URL}/api/v1/dht/providers/announce", json=ann_payload, timeout=5).json()
+        ann_ok = res_ann.get("rpc") == "STORE_ACK" and res_ann.get("status") == "success"
+
+        # 2. Test provider resolution via REST API
+        res_prov = requests.get(
+            f"{BASE_URL}/api/v1/dht/providers/sharded_model:meta-llama/Llama-3-70B:stage:0",
+            timeout=5,
+        ).json()
+        prov_list = res_prov.get("providers", [])
+        prov_ok = res_prov.get("has_providers") is True and any(p.get("provider_id") == "test-dht-worker-01" for p in prov_list)
+
+        # 3. Test multi-hop iterative lookup converging to key
+        res_lookup = requests.post(f"{BASE_URL}/api/v1/dht/lookup", json={
+            "content_key": "sharded_model:meta-llama/Llama-3-70B:stage:0",
+            "alpha": 3,
+        }, timeout=5).json()
+        look_data = res_lookup.get("lookup", {})
+        look_ok = look_data.get("converged") is True and look_data.get("total_providers_found", 0) >= 1
+
+        # 4. Test nebula_worker.py CLI commands (dht-info, dht-peers, dht-announce, dht-find)
+        cli_info = subprocess.run([sys.executable, "nebula_worker.py", "dht-info", "--json"], capture_output=True, text=True, timeout=10)
+        cli_info_ok = cli_info.returncode == 0 and len(json.loads(cli_info.stdout.strip()).get("node_id", "")) == 40
+
+        cli_find = subprocess.run(
+            [sys.executable, "nebula_worker.py", "dht-find", "--key", "sharded_model:meta-llama/Llama-3-70B:stage:0", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        cli_find_ok = cli_find.returncode == 0 and len(json.loads(cli_find.stdout.strip()).get("providers", [])) >= 1
+
+        m6_6_ok = ann_ok and prov_ok and look_ok and cli_info_ok and cli_find_ok
+        suite.record(
+            m6_6_ok,
+            f"Decentralized provider discovery & multi-hop DHT lookup verified (STORE_ACK: {ann_ok}, providers found: {len(prov_list)}, lookup converged: {look_data.get('converged')}, CLI dht-info: {cli_info_ok}, CLI dht-find: {cli_find_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Decentralized provider discovery & multi-hop DHT lookup lifecycle", str(e))
+
     return suite.summary()
+
 
 
 
