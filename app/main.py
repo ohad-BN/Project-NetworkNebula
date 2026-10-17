@@ -1124,5 +1124,10 @@ from app.dht_router import router as dht_router
 
 app.include_router(dht_router)
 
+# Include Commercial Monetization, Stripe & Web3 Payment Rails Router (Alpha Milestone 6)
+from app.payment_router import router as payment_router
+
+app.include_router(payment_router)
+
 
 

@@ -4436,7 +4436,255 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Decentralized provider discovery & multi-hop DHT lookup lifecycle", str(e))
 
+    # =========================================================================
+    # Phase 6.4 (Alpha Milestone 6): Commercial Payment Rails & Web3 Escrow
+    # =========================================================================
+    print_header("Phase 6.4 (Alpha Milestone 6): Commercial Payment Rails & Web3 Escrow")
+
+    # M6.7 Stripe Checkout Session Generation & Webhook Balance Credit Audit
+    try:
+        from app.payment_rails import (
+            STRIPE_WEBHOOK_SECRET,
+            create_stripe_checkout_session,
+            generate_stripe_webhook_signature,
+            verify_stripe_webhook_signature,
+        )
+
+        # 1. Test Stripe Checkout Session creation via REST API
+        sess_payload = {
+            "amount_usd": 250.0,
+            "customer_email": "enterprise_m6@networknebula.ai",
+            "user_id": "usr-test-enterprise",
+            "metadata": {"tier": "enterprise_growth", "credits": 250},
+        }
+        res_sess = requests.post(f"{BASE_URL}/api/v1/billing/stripe/create-checkout-session", json=sess_payload, timeout=5).json()
+        session_obj = res_sess.get("session", {})
+
+        sess_ok = (
+            res_sess.get("status") == "success"
+            and session_obj.get("id", "").startswith("cs_test_")
+            and session_obj.get("amount_total") == 25000  # $250.00 in cents
+            and session_obj.get("currency") == "usd"
+            and session_obj.get("status") == "open"
+            and session_obj.get("payment_intent", "").startswith("pi_")
+            and "checkout.stripe.com" in session_obj.get("url", "")
+        )
+
+        # 2. Record initial wallet balance
+        init_bal_res = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json()
+        bal_before = init_bal_res.get("balance", 0.0)
+
+        # 3. Construct and cryptographically sign Stripe webhook payload
+        wh_event_id = f"evt_m6_7_stripe_{int(time.time())}"
+        wh_event = {
+            "id": wh_event_id,
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": session_obj.get("id"),
+                    "amount_total": 25000,
+                    "customer_email": "enterprise_m6@networknebula.ai",
+                    "client_reference_id": session_obj.get("client_reference_id"),
+                    "metadata": {"amount_usd": 250.0, "user_id": session_obj.get("client_reference_id")},
+                }
+            },
+        }
+        wh_bytes = json.dumps(wh_event).encode("utf-8")
+        valid_sig = generate_stripe_webhook_signature(wh_bytes, STRIPE_WEBHOOK_SECRET)
+
+        # 4. Invoke Webhook endpoint with valid cryptographic signature
+        res_wh = requests.post(
+            f"{BASE_URL}/api/v1/billing/stripe/webhook",
+            data=wh_bytes,
+            headers={"stripe-signature": valid_sig, "content-type": "application/json"},
+            timeout=5,
+        ).json()
+        wh_ok = (
+            res_wh.get("status") == "completed"
+            and res_wh.get("amount_credited_usd") == 250.0
+            and "transaction_id" in res_wh
+        )
+
+        # 5. Verify user balance was credited exactly +$250.00
+        bal_after_res = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json()
+        bal_after = bal_after_res.get("balance", 0.0)
+        bal_credited = abs((bal_after - bal_before) - 250.0) < 0.05
+
+        # 6. Test Webhook Idempotency: replaying identical webhook event must NOT double-credit
+        res_replay = requests.post(
+            f"{BASE_URL}/api/v1/billing/stripe/webhook",
+            data=wh_bytes,
+            headers={"stripe-signature": valid_sig, "content-type": "application/json"},
+            timeout=5,
+        ).json()
+        idempotent_ok = res_replay.get("status") in ["ignored", "already_credited"]
+        bal_after_replay = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json().get("balance", 0.0)
+        no_double_credit = abs(bal_after_replay - bal_after) < 0.01
+
+        # 7. Test Signature Tampering Rejection
+        tampered_sig = f"t={int(time.time())},v1=bad_hash_tampered_attack_1234567890"
+        res_tampered = requests.post(
+            f"{BASE_URL}/api/v1/billing/stripe/webhook",
+            data=wh_bytes,
+            headers={"stripe-signature": tampered_sig, "content-type": "application/json"},
+            timeout=5,
+        )
+        tamper_rejected = res_tampered.status_code == 400
+
+        m6_7_ok = sess_ok and wh_ok and bal_credited and idempotent_ok and no_double_credit and tamper_rejected
+        suite.record(
+            m6_7_ok,
+            f"Stripe Checkout session & webhook balance credit verified (session: {session_obj.get('id')[:16]}..., credited: +$250.00, idempotent: {idempotent_ok}, tamper reject: {tamper_rejected})"
+        )
+    except Exception as e:
+        suite.record(False, "Stripe Checkout session generation & webhook balance credit audit", str(e))
+
+    # M6.8 Crypto Deposit Verification & Automated Host Worker Withdrawal Settlement
+    try:
+        from app.database import get_db as get_suite_db
+        from app.models import Worker as DBWorker
+        from app.payment_rails import (
+            compute_eip712_deposit_digest,
+            sign_eip712_deposit_payload,
+            verify_payout_receipt_authenticity,
+        )
+
+        # 1. Test Web3 USDC deposit address resolution across supported chains
+        res_dep = requests.get(f"{BASE_URL}/api/v1/billing/crypto/deposit-address?user_id=usr-test-enterprise", timeout=5).json()
+        chains = res_dep.get("supported_chains", {})
+        has_chains = all(c in chains for c in ["base", "ethereum", "arbitrum", "solana"])
+        base_deposit_addr = chains.get("base", {}).get("deposit_address", "")
+        base_usdc_contract = chains.get("base", {}).get("usdc_contract", "")
+
+        # 2. Test EIP-712 structured deposit signature generation and verification
+        nonce_val = int(time.time())
+        tx_hash_val = f"0x{uuid.uuid4().hex}{uuid.uuid4().hex}"
+        sender_addr = "0x8888888888888888888888888888888888888888"
+        eip712_digest = compute_eip712_deposit_digest(
+            sender=sender_addr,
+            recipient=base_deposit_addr,
+            amount_usdc=75.0,
+            nonce=nonce_val,
+            chain_id=8453,
+            verifying_contract=base_usdc_contract,
+        )
+        crypto_sig = sign_eip712_deposit_payload(eip712_digest)
+
+        # Record balance before deposit
+        bal_before_crypto = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json().get("balance", 0.0)
+
+        # Submit cryptographic deposit
+        dep_res = requests.post(
+            f"{BASE_URL}/api/v1/billing/crypto/verify-deposit",
+            json={
+                "chain": "base",
+                "tx_hash": tx_hash_val,
+                "amount_usdc": 75.0,
+                "sender_address": sender_addr,
+                "recipient_address": base_deposit_addr,
+                "signature": crypto_sig,
+                "nonce": nonce_val,
+            },
+            timeout=5,
+        ).json()
+        crypto_ok = dep_res.get("status") == "confirmed" and dep_res.get("amount_usdc") == 75.0
+
+        bal_after_crypto = requests.get(f"{BASE_URL}/api/v1/wallet/balance", timeout=5).json().get("balance", 0.0)
+        bal_crypto_credited = abs((bal_after_crypto - bal_before_crypto) - 75.0) < 0.05
+
+        # 3. Test Replay Attack Prevention (attempting duplicate tx_hash or nonce)
+        replay_res = requests.post(
+            f"{BASE_URL}/api/v1/billing/crypto/verify-deposit",
+            json={
+                "chain": "base",
+                "tx_hash": tx_hash_val,
+                "amount_usdc": 75.0,
+                "sender_address": sender_addr,
+                "recipient_address": base_deposit_addr,
+                "signature": crypto_sig,
+                "nonce": nonce_val,
+            },
+            timeout=5,
+        )
+        replay_rejected = replay_res.status_code == 409
+
+        # 4. Test Automated Host Worker Withdrawal Disbursement Engine
+        db_gen = get_suite_db()
+        test_db = next(db_gen)
+        w_node = test_db.query(DBWorker).first()
+        if not w_node:
+            w_node = DBWorker(
+                id=f"worker-payout-{uuid.uuid4().hex[:8]}",
+                name="RTX 4090 Payout Node",
+                status="online",
+                total_earnings_usd=100.0,
+            )
+            test_db.add(w_node)
+            test_db.commit()
+            test_db.refresh(w_node)
+        else:
+            w_node.total_earnings_usd = max(w_node.total_earnings_usd or 0.0, 100.0)
+            test_db.commit()
+            test_db.refresh(w_node)
+
+        test_worker_id = w_node.id
+        test_db.close()
+
+        # 4a. Attempt sub-threshold withdrawal ($5.00 < $10.00 min) -> Expect HTTP 400
+        sub_res = requests.post(
+            f"{BASE_URL}/api/v1/billing/payouts/process",
+            json={
+                "worker_id": test_worker_id,
+                "amount_usd": 5.0,
+                "payout_method": "usdc_base",
+                "destination_address": "0xHostPayoutDestination99",
+            },
+            timeout=5,
+        )
+        sub_rejected = sub_res.status_code in [400, 422]
+
+        # 4b. Execute valid automated withdrawal ($30.00 >= $10.00)
+        valid_payout_res = requests.post(
+            f"{BASE_URL}/api/v1/billing/payouts/process",
+            json={
+                "worker_id": test_worker_id,
+                "amount_usd": 30.0,
+                "payout_method": "usdc_base",
+                "destination_address": "0xHostPayoutDestination99",
+            },
+            timeout=5,
+        ).json()
+        receipt = valid_payout_res.get("receipt", {})
+        receipt_id = receipt.get("receipt_id", "")
+
+        payout_ok = (
+            valid_payout_res.get("status") == "processed"
+            and receipt_id.startswith("rcpt_")
+            and receipt.get("amount_gross_usd") == 30.0
+            and receipt.get("fee_usd") == 0.25
+            and receipt.get("amount_net_usd") == 29.75
+            and receipt.get("status") == "SETTLED"
+            and len(receipt.get("hmac_signature", "")) == 64
+        )
+
+        # 4c. Verify cryptographic authenticity of disbursement receipt
+        verify_rcpt_res = requests.get(
+            f"{BASE_URL}/api/v1/billing/receipts/disbursement/{receipt_id}",
+            timeout=5,
+        ).json()
+        sig_authentic = verify_rcpt_res.get("is_signature_authentic") is True
+
+        m6_8_ok = has_chains and crypto_ok and bal_crypto_credited and replay_rejected and sub_rejected and payout_ok and sig_authentic
+        suite.record(
+            m6_8_ok,
+            f"Crypto deposit verification & automated host worker withdrawal verified (chains: {len(chains)}, USDC credited: +$75.00, replay reject: {replay_rejected}, min $10 reject: {sub_rejected}, receipt: {receipt_id[:16]}..., authentic sig: {sig_authentic})"
+        )
+    except Exception as e:
+        suite.record(False, "Crypto deposit verification & automated host worker withdrawal settlement", str(e))
+
     return suite.summary()
+
 
 
 
