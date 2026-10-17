@@ -4082,7 +4082,129 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Milestone 5 Production Master Signoff", str(e))
 
+    # =========================================================================
+    # Phase 6.1 (Alpha Milestone 6): Sparse Mixture-of-Experts (MoE) Architecture & Expert Partitioning
+    # =========================================================================
+    print_header("Phase 6.1 (Alpha Milestone 6): Sparse MoE Architecture & Expert Partitioning Engine")
+
+    # M6.1 MoE Expert Partitioning & Worker Memory Budget Allocation
+    try:
+        from app.moe_engine import SUPPORTED_MOE_MODELS, moe_engine
+
+        # 1. Verify MoE catalog specs
+        catalog = moe_engine.get_catalog()
+        has_mixtral = any(m["model_id"] == "mistralai/Mixtral-8x7B-Instruct-v0.1" for m in catalog)
+        has_deepseek = any(m["model_id"] == "deepseek-ai/DeepSeek-V2-Lite" for m in catalog)
+        has_qwen = any(m["model_id"] == "Qwen/Qwen1.5-MoE-A2.7B" for m in catalog)
+
+        mixtral_spec = SUPPORTED_MOE_MODELS["mistralai/Mixtral-8x7B-Instruct-v0.1"]
+        # Mixtral 8x7B has 8 experts, top-2 active, 46.7B total params, 12.9B active
+        spec_ok = (
+            mixtral_spec["total_experts"] == 8
+            and mixtral_spec["top_k_experts"] == 2
+            and mixtral_spec["total_params_b"] == 46.7
+            and mixtral_spec["active_params_b"] == 12.9
+            and mixtral_spec["expert_vram_gb"]["4bit"] <= 4.0  # Fits easily in consumer GPU
+        )
+
+        # 2. Instantiate pipeline and test VRAM budget enforcement
+        test_pipe = moe_engine.create_pipeline(
+            model_id="mistralai/Mixtral-8x7B-Instruct-v0.1",
+            quantization="4bit",
+            name="test-moe-budget-pipe",
+        )
+        # Assign 4 workers with expert pairs: [0, 1], [2, 3], [4, 5], [6, 7]
+        # Each pair requires ~5.6 GB VRAM, fitting under 8.0 GB ceiling
+        for i, pair in enumerate([[0, 1], [2, 3], [4, 5], [6, 7]]):
+            test_pipe.assign_worker_expert_pair(
+                expert_ids=pair,
+                worker_id=f"budget-worker-{i+1}",
+                is_standby=False,
+                vram_ceiling_gb=8.0,
+            )
+
+        # Verify exceeding ceiling raises ValueError
+        ceiling_caught = False
+        try:
+            # 4 experts in a single worker requires > 11 GB VRAM > 8.0 GB ceiling
+            test_pipe.assign_worker_expert_pair(
+                expert_ids=[0, 1, 2, 3],
+                worker_id="greedy-worker",
+                vram_ceiling_gb=8.0,
+            )
+        except ValueError:
+            ceiling_caught = True
+
+        m6_1_ok = (
+            has_mixtral
+            and has_deepseek
+            and has_qwen
+            and spec_ok
+            and test_pipe.coverage_pct == 100.0
+            and test_pipe.is_operational is True
+            and ceiling_caught
+        )
+        suite.record(
+            m6_1_ok,
+            f"MoE expert partitioning & worker memory budget allocation verified (catalog: {len(catalog)} models, Mixtral 8x7B: 8 experts/top-2, 4-worker 8GB pairing coverage: {test_pipe.coverage_pct}%, VRAM ceiling clamp: {ceiling_caught})"
+        )
+    except Exception as e:
+        suite.record(False, "MoE expert partitioning & worker memory budget allocation", str(e))
+
+    # M6.2 Dynamic Router Gating & Sparse Activation Forwarding
+    try:
+        # 1. Test via REST API: create MoE pipeline
+        res_create = requests.post(f"{BASE_URL}/api/v1/moe/pipelines", json={
+            "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            "quantization": "4bit",
+            "name": f"rest-moe-pipe-{uuid.uuid4().hex[:6]}",
+        }, timeout=5).json()
+        rest_pid = res_create.get("pipeline", {}).get("pipeline_id")
+
+        # 2. Assign worker pairs via REST API
+        for i, pair in enumerate([[0, 1], [2, 3], [4, 5], [6, 7]]):
+            requests.post(f"{BASE_URL}/api/v1/moe/workers/assign-pair", json={
+                "pipeline_id": rest_pid,
+                "worker_id": f"rest-node-{i+1}",
+                "expert_ids": pair,
+                "vram_ceiling_gb": 8.0,
+            }, timeout=5)
+
+        # 3. Route 8 activations through top-2 gating router
+        route_resp = requests.post(f"{BASE_URL}/api/v1/moe/pipelines/{rest_pid}/route-tokens", json={
+            "token_count": 8,
+        }, timeout=10).json()
+
+        # Verify mathematical properties: top-2 indices and normalized weights summing to 1.0 per token
+        top_k_indices = route_resp.get("top_k_indices", [])
+        top_k_weights = route_resp.get("top_k_weights", [])
+        weights_sum_to_one = all(
+            abs(sum(w) - 1.0) < 1e-3 for w in top_k_weights
+        ) and len(top_k_weights) == 8
+
+        # 4. Telemetry and entropy
+        tel_resp = requests.get(f"{BASE_URL}/api/v1/moe/pipelines/{rest_pid}/telemetry", timeout=5).json()
+        tel_data = tel_resp.get("telemetry", {})
+        tokens_per_expert = tel_data.get("tokens_per_expert", {})
+
+        m6_2_ok = (
+            route_resp.get("status") == "success"
+            and route_resp.get("top_k") == 2
+            and len(top_k_indices) == 8
+            and weights_sum_to_one
+            and route_resp.get("diversity_score", 0.0) > 0.8
+            and tel_data.get("total_tokens_routed") == 8
+            and sum(tokens_per_expert.values()) == 16  # 8 tokens * 2 experts = 16 expert routing hits
+        )
+        suite.record(
+            m6_2_ok,
+            f"Dynamic router gating & sparse activation forwarding verified (pipe: {rest_pid}, tokens: 8, top-k: 2, weights sum: 1.0, diversity: {route_resp.get('diversity_score')}, entropy: {route_resp.get('entropy')}, expert hits: {sum(tokens_per_expert.values())})"
+        )
+    except Exception as e:
+        suite.record(False, "Dynamic router gating & sparse activation forwarding", str(e))
+
     return suite.summary()
+
 
 
 

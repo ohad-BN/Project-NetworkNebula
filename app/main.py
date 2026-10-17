@@ -41,7 +41,7 @@ from app.models import (
 )
 from app.worker import celery_app, render_image, run_batch_inference, train_model
 
-app = FastAPI(title=settings.APP_NAME, version="1.9.0")
+app = FastAPI(title=settings.APP_NAME, version="1.9.1")
 
 # CORS middleware - allow frontend on port 5173 to communicate with API on port 8000
 app.add_middleware(
@@ -1108,3 +1108,9 @@ app.include_router(metrics_router)
 from app.sharding_router import router as sharding_router
 
 app.include_router(sharding_router)
+
+# Include Sparse Mixture-of-Experts (MoE) Router (Alpha Milestone 6)
+from app.moe_router import router as moe_router
+
+app.include_router(moe_router)
+
