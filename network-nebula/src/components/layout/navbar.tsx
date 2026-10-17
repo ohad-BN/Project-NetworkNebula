@@ -34,6 +34,7 @@ export function Navbar({ user, onLogout }: NavbarProps) {
   const navLinks = [
     { href: "/training", label: "Training Studio" },
     { href: "/inference", label: "Model Serving" },
+    { href: "/swarm", label: "Swarm Studio" },
     { href: "/api-tokens", label: "API Tokens" },
     { href: "/cluster", label: "GPU Fleet" },
     { href: "/worker", label: "Worker Node" },

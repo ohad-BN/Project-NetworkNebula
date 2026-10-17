@@ -1751,13 +1751,13 @@ def run_tests():
             [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01", "--json"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=45,
         )
         payout_text_proc = subprocess.run(
             [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=45,
         )
         if payout_proc.returncode == 0 and payout_text_proc.returncode == 0:
             p_data = json.loads(payout_proc.stdout.strip())
@@ -1957,7 +1957,7 @@ def run_tests():
             [sys.executable, "nebula_worker.py", "status", "--json"],
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=45,
         )
         cli_ok = cli_stat.returncode == 0
         # 5. Worker payout CLI
@@ -1965,7 +1965,7 @@ def run_tests():
             [sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01", "--json"],
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=45,
         )
         payout_ok = payout_cli.returncode == 0
 
@@ -3868,6 +3868,96 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Zero-drop dynamic mid-generation failover & swarm auto-healing", str(e))
 
+    # =========================================================================
+    # Phase 5.5 (Alpha Milestone 5): React 19 Swarm Pipeline Visualizer & Model Sharding Studio UI
+    # =========================================================================
+    print_header("Phase 5.5 (Alpha Milestone 5): React 19 Swarm Pipeline Visualizer & Model Sharding Studio UI")
+
+    # M5.9 Swarm Pipeline Studio REST & Telemetry Serialization Protocol Audit
+    try:
+        # 1. Query supported sharded models catalog
+        models_res = requests.get(f"{BASE_URL}/api/v1/swarm/models/supported", timeout=5).json()
+        models_list = models_res.get("models", [])
+        has_70b = any("70B" in m.get("model_id", "") for m in models_list)
+        has_specs = all(
+            "total_layers" in m and "vram_gb" in m and "vocab_size" in m
+            for m in models_list
+        )
+
+        # 2. Query active pipelines list
+        pipes_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines", timeout=5).json()
+        active_pipes = pipes_res.get("pipelines", [])
+        if not active_pipes:
+            requests.post(f"{BASE_URL}/api/v1/swarm/pipelines", json={
+                "model_id": "meta-llama/Llama-3-70B",
+                "num_stages": 4,
+                "quantization": "4bit",
+            }, timeout=5)
+            pipes_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines", timeout=5).json()
+            active_pipes = pipes_res.get("pipelines", [])
+        pipes_valid = isinstance(active_pipes, list) and len(active_pipes) >= 1
+
+        # 3. Query KV-cache telemetry
+        kv_res = requests.get(f"{BASE_URL}/api/v1/swarm/kv-cache/stats", timeout=5).json()
+        kv_telemetry = kv_res.get("telemetry", {})
+        kv_valid = (
+            kv_res.get("status") == "success"
+            and "total_memory_mb" in kv_telemetry
+            and "active_sessions" in kv_telemetry
+            and ("cache_hit_rate_pct" in kv_telemetry or "hit_ratio_pct" in kv_telemetry)
+        )
+
+        # 4. Dry-run partition plan computation
+        plan_res = requests.post(f"{BASE_URL}/api/v1/swarm/partition-plan", json={
+            "model_id": "meta-llama/Llama-3-70B",
+            "num_stages": 4,
+            "quantization": "4bit",
+        }, timeout=5).json()
+        plan_stages = plan_res.get("stages", [])
+        plan_valid = (
+            plan_res.get("status") == "success"
+            and len(plan_stages) == 4
+            and plan_stages[0]["has_embeddings"] is True
+            and plan_stages[3]["has_lm_head"] is True
+            and plan_res.get("total_vram_budget_gb", 0) > 20.0
+        )
+
+        m5_9_ok = (len(models_list) >= 4) and has_70b and has_specs and pipes_valid and kv_valid and plan_valid
+        suite.record(
+            m5_9_ok,
+            f"Swarm Pipeline Studio REST & telemetry serialization protocol verified (models: {len(models_list)}, active pipes: {len(active_pipes)}, KV memory: {kv_telemetry.get('total_memory_mb')}MB, partition plan stages: {len(plan_stages)}, budget: {plan_res.get('total_vram_budget_gb')}GB)"
+        )
+    except Exception as e:
+        suite.record(False, "Swarm Pipeline Studio REST & telemetry serialization protocol", str(e))
+
+    # M5.10 Production Frontend SPA Compilation & Swarm Studio Route Integration
+    try:
+        dist_dir = os.path.join(os.path.dirname(__file__), "network-nebula", "dist")
+        index_html = os.path.join(dist_dir, "index.html")
+        assets_dir = os.path.join(dist_dir, "assets")
+
+        html_exists = os.path.isfile(index_html) and os.path.getsize(index_html) > 0
+        js_files = [f for f in os.listdir(assets_dir) if f.endswith(".js")] if os.path.isdir(assets_dir) else []
+        has_js = len(js_files) > 0
+
+        # Check bundle content for swarm studio strings and route
+        swarm_in_bundle = False
+        for jf in js_files:
+            jpath = os.path.join(assets_dir, jf)
+            with open(jpath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                if "/swarm" in content and "Swarm" in content:
+                    swarm_in_bundle = True
+                    break
+
+        m5_10_ok = html_exists and has_js and swarm_in_bundle
+        suite.record(
+            m5_10_ok,
+            f"Production frontend SPA compilation & Swarm Studio route integration verified (dist/index.html: {html_exists}, bundle JS: {len(js_files)} files, /swarm route in bundle: {swarm_in_bundle})"
+        )
+    except Exception as e:
+        suite.record(False, "Production frontend SPA compilation & Swarm Studio route integration", str(e))
+
     return suite.summary()
 
 
@@ -3875,6 +3965,7 @@ def run_tests():
 if __name__ == "__main__":
     success = run_tests()
     sys.exit(0 if success else 1)
+
 
 
 

@@ -401,13 +401,16 @@ class KVCacheManager:
             return {
                 "active_sessions": total_sessions,
                 "total_cached_tokens": total_tokens,
+                "total_tokens_cached": total_tokens,
                 "total_memory_mb": total_mem_mb,
                 "max_memory_mb": self.max_memory_mb,
                 "memory_utilization_pct": round((total_mem_mb / max(1.0, self.max_memory_mb)) * 100, 2),
                 "cache_hits": self._cache_hits,
                 "cache_misses": self._cache_misses,
                 "hit_ratio_pct": hit_ratio,
+                "cache_hit_rate_pct": hit_ratio,
                 "eviction_count": self._eviction_count,
+                "ttl_seconds": self.ttl_seconds,
                 "recent_sessions": sessions_summary,
             }
 
