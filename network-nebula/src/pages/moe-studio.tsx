@@ -365,12 +365,12 @@ export function MoeStudioPage() {
             <div className="text-2xl font-bold text-foreground">
               {activePipeline ? `${activePipeline.active_experts} / ${activePipeline.total_experts} Active` : "2 / 8 Active"}
             </div>
-            <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+            <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
               <Badge variant="outline" className="text-[10px] bg-purple-500/10 text-purple-400 border-purple-500/30">
                 75% VRAM Reduction
               </Badge>
               <span>Pairing on 8GB GPUs</span>
-            </p>
+            </div>
           </CardContent>
         </Card>
 
@@ -386,12 +386,12 @@ export function MoeStudioPage() {
             <div className="text-2xl font-bold text-foreground">
               {specResult ? `${specResult.effective_speedup_factor}x Speedup` : "3.8x Speedup"}
             </div>
-            <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+            <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
               <Badge variant="outline" className="text-[10px] bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
                 {specResult ? `${specResult.savings_pct}% Round-Trips Saved` : "75.0% WAN Saved"}
               </Badge>
               <span>Parallel $K=4$ verify</span>
-            </p>
+            </div>
           </CardContent>
         </Card>
 
@@ -407,12 +407,12 @@ export function MoeStudioPage() {
             <div className="text-2xl font-bold text-foreground">
               {dhtNodeInfo ? `${dhtNodeInfo.total_contacts} Contacts` : "25 Peers"}
             </div>
-            <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+            <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
               <Badge variant="outline" className="text-[10px] bg-blue-500/10 text-blue-400 border-blue-500/30">
                 $k=20$ LRU Buckets
               </Badge>
               <span>XOR metric topology</span>
-            </p>
+            </div>
           </CardContent>
         </Card>
 
@@ -428,12 +428,12 @@ export function MoeStudioPage() {
             <div className="text-2xl font-bold text-foreground">
               Stripe & USDC
             </div>
-            <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+            <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
               <Badge variant="outline" className="text-[10px] bg-amber-500/10 text-amber-400 border-amber-500/30">
                 {billingStats ? billingStats.settlement_frequency : "EIP-712 Verified"}
               </Badge>
               <span>Base, ETH, SOL</span>
-            </p>
+            </div>
           </CardContent>
         </Card>
       </div>
