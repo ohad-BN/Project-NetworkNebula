@@ -38,4 +38,4 @@ echo ===================================================================
 echo  ALL NETWORK NEBULA SERVICES HAVE BEEN STOPPED CLEANLY.
 echo ===================================================================
 echo.
-timeout /t 3 /nobreak >nul
+pause
