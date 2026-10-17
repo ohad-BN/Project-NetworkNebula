@@ -257,6 +257,42 @@
 
 ---
 
+## 🚀 Alpha Milestone 5: Decentralized Tensor & Pipeline Parallelism, Large Model Sharding (Petals-Style) & P2P Swarm Networking
+
+### 📋 Phase 5.1: Transformer Layer Sharding Protocol & Pipeline Topology Engine
+- [ ] Build model partitioner in `app/sharding_engine.py` decomposing 70B+ models into contiguous layer block slices (`[start_layer, end_layer]`) mapped to worker VRAM ceilings
+- [ ] Implement Swarm Topology Registry and REST endpoints (`POST /api/v1/swarm/pipelines`, `GET /api/v1/swarm/pipelines/{id}`, `POST /api/v1/swarm/workers/assign-shard`) in `app/sharding_router.py`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.1 assertions (`M5.1`, `M5.2`) and verify 100% green pass
+
+### 📋 Phase 5.2: Direct P2P Activation Tensor Streaming & Pipeline Forward Pass
+- [ ] Implement binary float16/float32 tensor buffer wire serialization in `app/tensor_stream.py`
+- [ ] Add `--shard-layers` and P2P tensor forward pass handler in [`nebula_worker.py`](nebula_worker.py)
+- [ ] Implement sequential forward pass orchestration (`Node 1 -> Node 2 -> ... -> Node K`) in `app/sharding_engine.py` and endpoint `POST /api/v1/swarm/pipelines/{id}/forward`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.2 assertions (`M5.3`, `M5.4`) and verify 100% green pass
+
+### 📋 Phase 5.3: Distributed KV-Cache Coordination & Continuous Swarm Inference
+- [ ] Build layer-specific attention KV-cache manager with LRU eviction and memory bounds in `app/kv_cache_manager.py`
+- [ ] Wire `/v1/chat/completions` in [`app/openai_inference_router.py`](app/openai_inference_router.py) to automatically route 70B+ sharded models through active swarm pipelines with token-by-token streaming
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.3 assertions (`M5.5`, `M5.6`) and verify 100% green pass
+
+### 📋 Phase 5.4: Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing
+- [ ] Implement redundant layer shard assignment (primary + standby replica per layer block) in `app/sharding_engine.py`
+- [ ] Implement dynamic dropout detection and zero-loss mid-generation activation rerouting with fast standby KV-cache sync
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.4 assertions (`M5.7`, `M5.8`) and verify 100% green pass
+
+### 📋 Phase 5.5: React 19 Swarm Pipeline Visualizer & Model Sharding Studio UI
+- [ ] Build **Swarm Pipeline & Model Sharding Studio Page** (`network-nebula/src/pages/swarm-studio.tsx`) with interactive node pipeline diagram, layer slice badges, live activation pulse telemetry, and token latency waterfalls
+- [ ] Implement API client in `network-nebula/src/services/api/swarm.ts` and add `/swarm` route & navbar link in [`network-nebula/src/App.tsx`](network-nebula/src/App.tsx) and [`network-nebula/src/components/layout/navbar.tsx`](network-nebula/src/components/layout/navbar.tsx)
+- [ ] Verify production bundle compilation (`bun run build`) with zero TypeScript errors
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.5 assertions (`M5.9`, `M5.10`) and verify 100% green pass
+
+### 📋 Phase 5.6: Master Test Suite Expansion & Milestone 5 Production Signoff
+- [ ] Incorporate Phase 5.6 master validation tests into [`test_suite.py`](test_suite.py) (`M5.11` 70B sharding stress test under load with dynamic dropout, `M5.12` Milestone 5 Production Master Signoff)
+- [ ] Verify clean production frontend compilation (`bun run build`) with zero TypeScript errors
+- [ ] Run `python test_suite.py` achieving 100% green pass across all 135+ automated tests and sign off Alpha Milestone 5
+
+---
+
 ## ⚡ Instant Command Cheatsheet
 
 
