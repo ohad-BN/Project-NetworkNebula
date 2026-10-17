@@ -47,6 +47,13 @@ class PartitionModelRequest(BaseModel):
     quantization: Optional[str] = Field(default="4bit")
 
 
+class PipelineForwardRequest(BaseModel):
+    prompt: Optional[str] = Field(default=None, description="Input text prompt to tokenize and process")
+    token_ids: Optional[List[int]] = Field(default=None, description="Direct token IDs list")
+    session_id: Optional[str] = Field(default=None, description="Active swarm session ID")
+    step: Optional[int] = Field(default=0, ge=0, description="Autoregressive generation step")
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -186,6 +193,32 @@ def get_pipeline_route(pipeline_id: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/pipelines/{pipeline_id}/forward", summary="Execute Sequential P2P Pipeline Forward Pass")
+def execute_pipeline_forward(pipeline_id: str, payload: PipelineForwardRequest):
+    """
+    Executes a multi-hop sequential forward pass across the pipeline stages:
+    Stage 0 (Embeddings + Blocks) -> Stage 1 (Blocks) -> ... -> Stage K (Blocks + LM Head).
+    Transfers intermediate activation tensors via high-performance binary TensorWireCodec.
+    """
+    try:
+        result = sharding_engine.execute_pipeline_forward_pass(
+            pipeline_id=pipeline_id,
+            prompt=payload.prompt,
+            token_ids=payload.token_ids,
+            session_id=payload.session_id,
+            step=payload.step or 0,
+        )
+        return {
+            "status": "success",
+            "forward_result": result,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Pipeline forward error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/pipelines/{pipeline_id}", summary="Delete Swarm Pipeline")

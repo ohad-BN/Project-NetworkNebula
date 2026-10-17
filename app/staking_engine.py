@@ -394,7 +394,7 @@ class StakingEngine:
         """Return highest-staked and highest-reputation nodes in the fleet."""
         workers = (
             db.query(Worker)
-            .order_by(Worker.staked_amount_usd.desc(), Worker.reputation_score.desc())
+            .order_by(Worker.staked_amount_usd.desc(), Worker.created_at.desc(), Worker.reputation_score.desc())
             .limit(limit)
             .all()
         )

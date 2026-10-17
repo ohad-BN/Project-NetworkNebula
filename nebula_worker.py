@@ -428,6 +428,23 @@ def cmd_work(args: argparse.Namespace) -> int:
     tasks_completed = 0
     total_earnings = 0.0
     max_tasks = args.max_tasks
+    shard_layers = getattr(args, "shard_layers", None)
+    pipeline_id = getattr(args, "pipeline_id", None)
+
+    if shard_layers and pipeline_id:
+        try:
+            requests.post(
+                f"{server_url}/api/v1/swarm/workers/assign-shard",
+                json={
+                    "pipeline_id": pipeline_id,
+                    "stage_idx": 0,
+                    "worker_id": worker_id,
+                    "is_standby": False,
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
 
     if getattr(args, "tunnel", False):
         # WebSocket Tunnel Execution Mode
@@ -497,6 +514,7 @@ def cmd_work(args: argparse.Namespace) -> int:
                 "total_earnings_usd": round(total_earnings, 4),
                 "vram_allocation_pct": vram_pct,
                 "cuda_fraction_enforced": limit_info["cuda_enforced"],
+                "shard_layers": shard_layers,
             }
 
         try:
@@ -583,6 +601,7 @@ def cmd_work(args: argparse.Namespace) -> int:
             "total_earnings_usd": round(total_earnings, 4),
             "vram_allocation_pct": vram_pct,
             "cuda_fraction_enforced": limit_info["cuda_enforced"],
+            "shard_layers": shard_layers,
         }
         if args.json:
             print(json.dumps(summary))
@@ -634,6 +653,8 @@ def build_parser() -> argparse.ArgumentParser:
     work_p.add_argument("--max-tasks", type=int, default=1, help="Max tasks to complete before exiting (0 for infinite)")
     work_p.add_argument("--interval", type=float, default=0.5, help="Polling interval in seconds")
     work_p.add_argument("--tunnel", action="store_true", help="Execute tasks over persistent WebSocket tunnel")
+    work_p.add_argument("--shard-layers", default=None, help="Layer slice range to host for swarm sharding, e.g. 0:19")
+    work_p.add_argument("--pipeline-id", default=None, help="Active swarm pipeline ID to bind to")
     work_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # ping command (Phase 4.3)

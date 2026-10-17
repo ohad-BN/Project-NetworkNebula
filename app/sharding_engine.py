@@ -12,7 +12,9 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 logger = logging.getLogger("sharding_engine")
 
@@ -431,6 +433,148 @@ class ShardingEngine:
                     "estimated_hop_latency_ms": 12.5,
                 })
             return hops
+
+    def execute_pipeline_forward_pass(
+        self,
+        pipeline_id: str,
+        prompt: Optional[str] = None,
+        token_ids: Optional[List[int]] = None,
+        initial_activations: Optional[Union[np.ndarray, List[float]]] = None,
+        session_id: Optional[str] = None,
+        step: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Executes a multi-hop sequential forward pass through the sharded pipeline:
+        Stage 0 (Embeddings + Blocks) -> Stage 1 (Blocks) -> ... -> Stage K (Blocks + LM Head).
+        Streams intermediate activation tensors using binary TensorWireCodec.
+        """
+        from app.tensor_stream import TensorWireCodec, LayerBlockExecutor
+
+        with self._lock:
+            pipeline = self._pipelines.get(pipeline_id)
+            if not pipeline:
+                raise ValueError(f"Pipeline '{pipeline_id}' not found")
+
+            if not pipeline.is_complete:
+                raise ValueError(
+                    f"Pipeline '{pipeline_id}' is not complete (status={pipeline.status}). "
+                    f"Ensure all {len(pipeline.stages)} stages have primary workers assigned."
+                )
+
+            spec = SUPPORTED_SHARDED_MODELS.get(pipeline.model_id, {})
+            hidden_dim = spec.get("hidden_size", 8192)
+            vocab_size = spec.get("vocab_size", 128256)
+
+            sid = session_id or f"sess-{uuid.uuid4().hex[:8]}"
+
+            # Determine input tokens
+            if token_ids is None:
+                text_input = prompt or "Hello, Network Nebula decentralized swarm!"
+                token_ids = [ord(c) % vocab_size for c in text_input]
+                if not token_ids:
+                    token_ids = [1, 2, 3]
+
+            activations: Optional[np.ndarray] = None
+            if initial_activations is not None:
+                if isinstance(initial_activations, np.ndarray):
+                    activations = initial_activations
+                else:
+                    activations = np.array(initial_activations, dtype=np.float32)
+
+            stage_telemetry: List[Dict[str, Any]] = []
+            total_wire_bytes = 0
+            start_wall = time.time()
+            logits: Optional[np.ndarray] = None
+
+            for stage in pipeline.stages:
+                t0 = time.time()
+
+                # 1. Handle Stage 0 embeddings if starting from tokens
+                if stage.has_embeddings and activations is None:
+                    activations = LayerBlockExecutor.embed_tokens(
+                        token_ids=token_ids,
+                        hidden_dim=hidden_dim,
+                        vocab_size=vocab_size,
+                    )
+
+                if activations is None:
+                    # Fallback initialize if missing
+                    activations = np.zeros((1, len(token_ids), hidden_dim), dtype=np.float32)
+
+                # 2. Compute transformer forward pass across stage's layer block slice
+                activations = LayerBlockExecutor.forward_layer_slice(
+                    activations=activations,
+                    start_layer=stage.start_layer,
+                    end_layer=stage.end_layer,
+                    hidden_dim=hidden_dim,
+                    stage_idx=stage.stage_idx,
+                )
+
+                # 3. Simulate wire serialization and CRC32 verification down the P2P pipe
+                wire_packet = TensorWireCodec.pack(
+                    tensor=activations,
+                    session_id=sid,
+                    stage_idx=stage.stage_idx,
+                    step=step,
+                    dtype="float32",
+                )
+                packet_size = len(wire_packet)
+                total_wire_bytes += packet_size
+
+                # Roundtrip unpack to verify exact wire integrity
+                activations, header = TensorWireCodec.unpack(wire_packet)
+
+                # 4. Handle terminal stage LM Head logits projection
+                if stage.has_lm_head:
+                    logits = LayerBlockExecutor.project_lm_head(
+                        activations=activations,
+                        vocab_size=vocab_size,
+                    )
+
+                stage_elapsed_ms = round((time.time() - t0) * 1000, 2)
+                stage_telemetry.append({
+                    "stage_idx": stage.stage_idx,
+                    "worker_id": stage.primary_worker_id,
+                    "start_layer": stage.start_layer,
+                    "end_layer": stage.end_layer,
+                    "layers_processed": stage.layer_count,
+                    "has_embeddings": stage.has_embeddings,
+                    "has_lm_head": stage.has_lm_head,
+                    "tensor_shape": list(activations.shape),
+                    "wire_bytes_transferred": packet_size,
+                    "latency_ms": max(0.5, stage_elapsed_ms),
+                    "activation_norm": round(float(np.linalg.norm(activations)), 4),
+                })
+
+            total_elapsed_ms = round((time.time() - start_wall) * 1000, 2)
+
+            # Compute prediction metrics from final logits
+            predicted_token_id = None
+            top_candidates = []
+            if logits is not None:
+                top_indices = np.argsort(logits[0])[-5:][::-1].tolist()
+                predicted_token_id = int(top_indices[0])
+                top_candidates = [
+                    {"token_id": int(tid), "logit": round(float(logits[0, tid]), 4)}
+                    for tid in top_indices
+                ]
+
+            return {
+                "pipeline_id": pipeline.pipeline_id,
+                "model_id": pipeline.model_id,
+                "session_id": sid,
+                "step": step,
+                "prompt": prompt,
+                "token_count": len(token_ids),
+                "total_wire_bytes": total_wire_bytes,
+                "total_latency_ms": max(1.0, total_elapsed_ms),
+                "hops_traversed": len(pipeline.stages),
+                "output_tensor_shape": list(activations.shape) if activations is not None else None,
+                "logits_shape": list(logits.shape) if logits is not None else None,
+                "predicted_token_id": predicted_token_id,
+                "top_candidates": top_candidates,
+                "stage_telemetry": stage_telemetry,
+            }
 
     def get_pipeline(self, pipeline_id: str) -> Optional[SwarmPipeline]:
         with self._lock:

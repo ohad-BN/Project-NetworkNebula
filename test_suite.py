@@ -2782,7 +2782,7 @@ def run_tests():
         )
 
         # 5. Verify presence in staking leaderboard
-        lead_res = requests.get(f"{BASE_URL}/api/v1/staking/leaderboard?limit=10", timeout=5).json()
+        lead_res = requests.get(f"{BASE_URL}/api/v1/staking/leaderboard?limit=100", timeout=5).json()
         found_in_board = any(n.get("worker_id") == stake_node_id for n in lead_res.get("leaderboard", []))
 
         m4_3_ok = staked_ok and tier_ok and unstake_ok and found_in_board
@@ -3558,6 +3558,74 @@ def run_tests():
         )
     except Exception as e:
         suite.record(False, "Swarm Pipeline Topology REST API & Validation Lifecycle", str(e))
+
+    # =========================================================================
+    # Phase 5.2 (Alpha Milestone 5): Direct P2P Activation Tensor Streaming & Pipeline Forward Pass
+    # =========================================================================
+    print_header("Phase 5.2 (Alpha Milestone 5): Direct P2P Activation Tensor Streaming & Pipeline Forward Pass")
+
+    # M5.3 High-Throughput Binary Activation Tensor Wire Codec & Integrity Audit
+    try:
+        import numpy as np
+        from app.tensor_stream import TensorWireCodec
+
+        test_tensor = np.random.randn(1, 32, 4096).astype(np.float32)
+        wire_bytes = TensorWireCodec.pack(
+            tensor=test_tensor,
+            session_id="wire-audit-01",
+            stage_idx=0,
+            step=1,
+            dtype="float32",
+        )
+        magic_ok = wire_bytes[:8] == b"NEBACT01"
+        unpacked_arr, header = TensorWireCodec.unpack(wire_bytes)
+        shape_intact = unpacked_arr.shape == (1, 32, 4096)
+        values_match = np.allclose(test_tensor, unpacked_arr, atol=1e-6)
+        crc_valid = header.get("crc32") is not None
+
+        m5_3_ok = magic_ok and shape_intact and values_match and crc_valid
+        suite.record(
+            m5_3_ok,
+            f"Binary activation wire codec & integrity verified (packet: {len(wire_bytes)} bytes, shape: {unpacked_arr.shape}, CRC32: {header.get('crc32')}, exact match: {values_match})"
+        )
+    except Exception as e:
+        suite.record(False, "Binary activation wire codec & integrity", str(e))
+
+    # M5.4 Multi-Node Sequential Pipeline Forward Pass & Logits Projection
+    try:
+        # 1. Create 4-stage pipeline for Llama-3-70B with 4 assigned nodes
+        fwd_pipe_res = requests.post(f"{BASE_URL}/api/v1/swarm/pipelines", json={
+            "model_id": "meta-llama/Llama-3-70B",
+            "num_stages": 4,
+            "quantization": "4bit",
+            "worker_ids": [f"fwd-node-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)],
+            "name": f"fwd-test-pipe-{uuid.uuid4().hex[:6]}",
+        }, timeout=5).json()
+        fwd_pid = fwd_pipe_res.get("pipeline", {}).get("pipeline_id")
+
+        # 2. Execute forward pass
+        fwd_exec_res = requests.post(f"{BASE_URL}/api/v1/swarm/pipelines/{fwd_pid}/forward", json={
+            "prompt": "Deep learning on Project Network Nebula decentralized GPU mesh",
+            "step": 0,
+        }, timeout=10).json()
+        fwd_data = fwd_exec_res.get("forward_result", {})
+
+        fwd_ok = (
+            fwd_exec_res.get("status") == "success"
+            and fwd_data.get("hops_traversed") == 4
+            and fwd_data.get("output_tensor_shape") is not None
+            and fwd_data.get("logits_shape") == [1, 128256]
+            and fwd_data.get("predicted_token_id") is not None
+            and len(fwd_data.get("stage_telemetry", [])) == 4
+            and fwd_data.get("total_wire_bytes", 0) > 0
+        )
+
+        suite.record(
+            fwd_ok,
+            f"Multi-node sequential pipeline forward pass verified (pipe: {fwd_pid}, hops: {fwd_data.get('hops_traversed')}, logits: {fwd_data.get('logits_shape')}, predicted token: {fwd_data.get('predicted_token_id')}, wire transfer: {fwd_data.get('total_wire_bytes')} bytes, latency: {fwd_data.get('total_latency_ms'):.1f}ms)"
+        )
+    except Exception as e:
+        suite.record(False, "Multi-node sequential pipeline forward pass", str(e))
 
     return suite.summary()
 

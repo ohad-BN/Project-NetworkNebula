@@ -265,11 +265,13 @@
 - [x] Mounted `sharding_router` in [`app/main.py`](app/main.py) under `/api/v1/swarm`
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.1 assertions (`M5.1` layer decomposition & VRAM budget, `M5.2` swarm pipeline topology & validation lifecycle) (**125/125 passed — 100% Green in 165.22s**)
 
-### 📋 Phase 5.2: Direct P2P Activation Tensor Streaming & Pipeline Forward Pass
-- [ ] Implement binary float16/float32 tensor buffer wire serialization in `app/tensor_stream.py`
-- [ ] Add `--shard-layers` and P2P tensor forward pass handler in [`nebula_worker.py`](nebula_worker.py)
-- [ ] Implement sequential forward pass orchestration (`Node 1 -> Node 2 -> ... -> Node K`) in `app/sharding_engine.py` and endpoint `POST /api/v1/swarm/pipelines/{id}/forward`
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.2 assertions (`M5.3`, `M5.4`) and verify 100% green pass
+### ✅ Phase 5.2: Direct P2P Activation Tensor Streaming & Pipeline Forward Pass (COMPLETED)
+- [x] Built binary activation tensor wire protocol in [`app/tensor_stream.py`](app/tensor_stream.py) (`TensorWireCodec` with `NEBACT01` magic bytes, CRC32 checksum verification, and exact float32 shape serialization)
+- [x] Implemented simulated multi-layer block neural forward execution (`LayerBlockExecutor`) projecting embeddings, block residual passes with layer-norm scaling, and causal LM head projection
+- [x] Upgraded [`app/sharding_engine.py`](app/sharding_engine.py) with `execute_pipeline_forward_pass` sequentially chaining activations across pipeline stages (`Node 0 -> Node 1 -> ... -> Node K-1`) with per-hop wire transfer telemetry
+- [x] Added `POST /api/v1/swarm/pipelines/{id}/forward` endpoint in [`app/sharding_router.py`](app/sharding_router.py)
+- [x] Extended [`nebula_worker.py`](nebula_worker.py) CLI agent with `--shard-layers` and `--pipeline-id` flags for participating in swarm pipelines
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.2 assertions (`M5.3` binary activation tensor wire codec & integrity audit, `M5.4` multi-node sequential pipeline forward pass & logits projection) (**127/127 passed — 100% Green**)
 
 ### 📋 Phase 5.3: Distributed KV-Cache Coordination & Continuous Swarm Inference
 - [ ] Build layer-specific attention KV-cache manager with LRU eviction and memory bounds in `app/kv_cache_manager.py`
