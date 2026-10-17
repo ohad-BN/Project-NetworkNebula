@@ -259,10 +259,11 @@
 
 ## 🚀 Alpha Milestone 5: Decentralized Tensor & Pipeline Parallelism, Large Model Sharding (Petals-Style) & P2P Swarm Networking
 
-### 📋 Phase 5.1: Transformer Layer Sharding Protocol & Pipeline Topology Engine
-- [ ] Build model partitioner in `app/sharding_engine.py` decomposing 70B+ models into contiguous layer block slices (`[start_layer, end_layer]`) mapped to worker VRAM ceilings
-- [ ] Implement Swarm Topology Registry and REST endpoints (`POST /api/v1/swarm/pipelines`, `GET /api/v1/swarm/pipelines/{id}`, `POST /api/v1/swarm/workers/assign-shard`) in `app/sharding_router.py`
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.1 assertions (`M5.1`, `M5.2`) and verify 100% green pass
+### ✅ Phase 5.1: Transformer Layer Sharding Protocol & Pipeline Topology Engine (COMPLETED)
+- [x] Built model partitioner in [`app/sharding_engine.py`](app/sharding_engine.py) decomposing 70B+ models (`meta-llama/Llama-3-70B`, `Qwen/Qwen2.5-72B-Instruct`, `deepseek-ai/DeepSeek-Coder-33B-Instruct`) into contiguous layer block slices (`[start_layer, end_layer]`) mapped to worker VRAM ceilings
+- [x] Implemented Swarm Topology Registry, validation diagnostics, route simulation, and REST endpoints (`POST /api/v1/swarm/pipelines`, `GET /api/v1/swarm/pipelines/{id}`, `POST /api/v1/swarm/workers/assign-shard`, `GET /api/v1/swarm/pipelines/{id}/validate`, `GET /api/v1/swarm/pipelines/{id}/route`, `GET /api/v1/swarm/models/supported`) in [`app/sharding_router.py`](app/sharding_router.py)
+- [x] Mounted `sharding_router` in [`app/main.py`](app/main.py) under `/api/v1/swarm`
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.1 assertions (`M5.1` layer decomposition & VRAM budget, `M5.2` swarm pipeline topology & validation lifecycle) (**125/125 passed — 100% Green in 165.22s**)
 
 ### 📋 Phase 5.2: Direct P2P Activation Tensor Streaming & Pipeline Forward Pass
 - [ ] Implement binary float16/float32 tensor buffer wire serialization in `app/tensor_stream.py`

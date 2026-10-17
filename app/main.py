@@ -1103,3 +1103,8 @@ app.include_router(staking_router)
 from app.metrics_router import router as metrics_router
 
 app.include_router(metrics_router)
+
+# Include Swarm Model Sharding & Pipeline Topology Router (Alpha Milestone 5)
+from app.sharding_router import router as sharding_router
+
+app.include_router(sharding_router)

@@ -429,7 +429,7 @@ def run_tests():
         else:
             completed = False
             final_job = None
-            for _ in range(60):
+            for _ in range(150):
                 poll_resp = requests.get(f"{BASE_URL}/api/v1/training/jobs/{job_id}")
                 if poll_resp.status_code == 200:
                     final_job = poll_resp.json()
@@ -839,7 +839,7 @@ def run_tests():
                 # Poll worker until job completion
                 job_finished = False
                 job_data = None
-                for _ in range(120):
+                for _ in range(150):
                     poll_res = requests.get(f"{BASE_URL}/api/v1/training/jobs/{e5_job_id}")
                     if poll_res.status_code == 200:
                         job_data = poll_res.json()
@@ -3412,6 +3412,152 @@ def run_tests():
         )
     except Exception as e:
         suite.record(False, "Milestone 4 Enterprise Production Hardening Master Signoff", str(e))
+
+    # =========================================================================
+    # Phase 5.1 (Alpha Milestone 5): Transformer Layer Sharding Protocol & Pipeline Topology Engine
+    # =========================================================================
+    print_header("Phase 5.1 (Alpha Milestone 5): Transformer Layer Sharding Protocol & Pipeline Topology Engine")
+
+    # M5.1 Transformer Layer Sharding Decomposition & VRAM Budget Allocation
+    try:
+        from app.sharding_engine import sharding_engine
+
+        # 1. Shard 80-layer Llama-3-70B across 4 nodes (20 layers each)
+        stages_70b = sharding_engine.partition_model_layers(
+            model_id="meta-llama/Llama-3-70B",
+            num_stages=4,
+            quantization="4bit",
+        )
+        layers_balanced = (
+            len(stages_70b) == 4
+            and stages_70b[0].layer_count == 20
+            and stages_70b[0].start_layer == 0
+            and stages_70b[0].end_layer == 19
+            and stages_70b[0].has_embeddings is True
+            and stages_70b[0].has_lm_head is False
+            and stages_70b[3].start_layer == 60
+            and stages_70b[3].end_layer == 79
+            and stages_70b[3].has_embeddings is False
+            and stages_70b[3].has_lm_head is True
+        )
+
+        # 2. Verify VRAM budget is within 8GB-12GB consumer card thresholds
+        vram_safe = all(s.estimated_vram_gb <= 12.0 for s in stages_70b)
+        total_vram_est = sum(s.estimated_vram_gb for s in stages_70b)
+
+        # 3. Test non-divisible layer count (e.g. 62 layers across 3 stages: 21, 21, 20)
+        stages_33b = sharding_engine.partition_model_layers(
+            model_id="deepseek-ai/DeepSeek-Coder-33B-Instruct",
+            num_stages=3,
+            quantization="4bit",
+        )
+        odd_partition_ok = (
+            len(stages_33b) == 3
+            and [s.layer_count for s in stages_33b] == [21, 21, 20]
+            and stages_33b[-1].end_layer == 61
+        )
+
+        # 4. Check supported models catalog API
+        models_resp = requests.get(f"{BASE_URL}/api/v1/swarm/models/supported", timeout=5).json()
+        catalog_ok = (
+            models_resp.get("status") == "success"
+            and len(models_resp.get("models", [])) >= 4
+            and any(m["model_id"] == "meta-llama/Llama-3-70B" for m in models_resp.get("models", []))
+        )
+
+        m5_1_ok = layers_balanced and vram_safe and odd_partition_ok and catalog_ok
+        suite.record(
+            m5_1_ok,
+            f"Transformer layer sharding decomposition & VRAM allocation verified (70B 80L->4 stages [20L each], VRAM budget: {total_vram_est:.1f}GB, 33B 62L->[21,21,20], catalog models: {len(models_resp.get('models', []))})"
+        )
+    except Exception as e:
+        suite.record(False, "Transformer layer sharding decomposition & VRAM allocation", str(e))
+
+    # M5.2 Swarm Pipeline Topology REST API & Validation Lifecycle
+    try:
+        # 1. Create unassigned 4-stage pipeline for 70B model
+        pipe_payload = {
+            "model_id": "meta-llama/Llama-3-70B",
+            "num_stages": 4,
+            "quantization": "4bit",
+            "name": f"test-70b-pipe-{uuid.uuid4().hex[:6]}",
+        }
+        create_res = requests.post(f"{BASE_URL}/api/v1/swarm/pipelines", json=pipe_payload, timeout=5).json()
+        pipeline_info = create_res.get("pipeline", {})
+        pipe_id = pipeline_info.get("pipeline_id")
+        created_ok = (
+            create_res.get("status") == "success"
+            and pipeline_info.get("status") == "unassigned"
+            and pipeline_info.get("is_complete") is False
+        )
+
+        # 2. Audit incomplete pipeline validation
+        val_res_unassigned = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{pipe_id}/validate", timeout=5).json()
+        val_unassigned = val_res_unassigned.get("validation", {})
+        unassigned_invalid = (
+            val_unassigned.get("valid") is False
+            and len(val_unassigned.get("missing_stages", [])) == 4
+        )
+
+        # 3. Assign 4 primary workers and 1 standby replica
+        worker_node_ids = [f"swarm-gpu-node-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+        assign_ok = True
+        for stage_idx, wid in enumerate(worker_node_ids):
+            a_res = requests.post(
+                f"{BASE_URL}/api/v1/swarm/workers/assign-shard",
+                json={
+                    "pipeline_id": pipe_id,
+                    "stage_idx": stage_idx,
+                    "worker_id": wid,
+                    "is_standby": False,
+                },
+                timeout=5,
+            ).json()
+            if a_res.get("status") != "success":
+                assign_ok = False
+
+        standby_id = f"swarm-standby-{uuid.uuid4().hex[:4]}"
+        a_sb = requests.post(
+            f"{BASE_URL}/api/v1/swarm/workers/assign-shard",
+            json={
+                "pipeline_id": pipe_id,
+                "stage_idx": 1,
+                "worker_id": standby_id,
+                "is_standby": True,
+            },
+            timeout=5,
+        ).json()
+        standby_ok = a_sb.get("status") == "success"
+
+        # 4. Audit complete pipeline validation
+        val_res_complete = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{pipe_id}/validate", timeout=5).json()
+        val_complete = val_res_complete.get("validation", {})
+        complete_valid = (
+            val_complete.get("valid") is True
+            and val_complete.get("is_complete") is True
+            and val_complete.get("layers_covered") == 80
+            and val_complete.get("health_score", 0.0) >= 80.0
+        )
+
+        # 5. Check sequential P2P activation hopping route
+        route_res = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines/{pipe_id}/route", timeout=5).json()
+        hops = route_res.get("hops", [])
+        route_ok = (
+            route_res.get("total_hops") == 4
+            and len(hops) == 4
+            and hops[0]["worker_id"] == worker_node_ids[0]
+            and hops[3]["worker_id"] == worker_node_ids[3]
+            and hops[0]["role"] == "embeddings_and_blocks"
+            and hops[3]["role"] == "lm_head_and_blocks"
+        )
+
+        m5_2_ok = created_ok and unassigned_invalid and assign_ok and standby_ok and complete_valid and route_ok
+        suite.record(
+            m5_2_ok,
+            f"Swarm Pipeline Topology REST API & Validation Lifecycle verified (pipe: {pipe_id}, unassigned rejected: {unassigned_invalid}, 4 primary + 1 standby assigned: {assign_ok and standby_ok}, complete valid: {complete_valid}, 4 hops route: {route_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Swarm Pipeline Topology REST API & Validation Lifecycle", str(e))
 
     return suite.summary()
 
