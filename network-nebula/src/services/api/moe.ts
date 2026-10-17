@@ -357,7 +357,7 @@ class MoeApiService {
 
   async getMoETelemetry(pipelineId: string): Promise<MoeTelemetry> {
     const res = await apiClient.get(`/api/v1/moe/pipelines/${pipelineId}/telemetry`);
-    return res.data;
+    return res.data?.telemetry || res.data;
   }
 
   // ----------------------------------------------------------------------------

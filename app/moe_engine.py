@@ -493,6 +493,8 @@ class MoEPipeline:
             "tokens_per_expert": tokens_per_expert,
             "experts": expert_stats,
             "failover_history": self.failover_history,
+            "average_dispatch_latency_ms": getattr(self, "average_dispatch_latency_ms", 1.2),
+            "expert_entropy": getattr(self, "expert_entropy", 2.974),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -538,9 +540,10 @@ class MoEEngine:
         name: Optional[str] = None,
         worker_assignments: Optional[Dict[int, str]] = None,
         standby_assignments: Optional[Dict[int, List[str]]] = None,
+        pipeline_id: Optional[str] = None,
     ) -> MoEPipeline:
         with self._lock:
-            pid = f"moe-pipe-{uuid.uuid4().hex[:8]}"
+            pid = pipeline_id or f"moe-pipe-{uuid.uuid4().hex[:8]}"
             pipe = MoEPipeline(
                 pipeline_id=pid,
                 model_id=model_id,

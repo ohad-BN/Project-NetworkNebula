@@ -608,9 +608,9 @@ export function MoeStudioPage() {
                   {routeResult && (
                     <div className="p-4 rounded-xl border bg-muted/20 space-y-3">
                       <div className="flex items-center justify-between text-xs border-b pb-2">
-                        <span className="text-muted-foreground">Tokens Routed: <strong className="text-foreground">{routeResult.total_tokens}</strong></span>
-                        <span className="text-muted-foreground">Entropy: <strong className="text-foreground">{routeResult.entropy.toFixed(3)}</strong></span>
-                        <span className="text-muted-foreground">Diversity: <strong className="text-foreground">{(routeResult.diversity_score * 100).toFixed(1)}%</strong></span>
+                        <span className="text-muted-foreground">Tokens Routed: <strong className="text-foreground">{routeResult.total_tokens ?? 0}</strong></span>
+                        <span className="text-muted-foreground">Entropy: <strong className="text-foreground">{(routeResult.entropy ?? 0).toFixed(3)}</strong></span>
+                        <span className="text-muted-foreground">Diversity: <strong className="text-foreground">{((routeResult.diversity_score ?? 0) * 100).toFixed(1)}%</strong></span>
                       </div>
 
                       <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
@@ -681,19 +681,25 @@ export function MoeStudioPage() {
                   <div className="flex justify-between items-center text-xs">
                     <span className="text-muted-foreground">Tokens Routed:</span>
                     <span className="font-mono font-bold text-foreground">
-                      {pipelineTelemetry ? pipelineTelemetry.total_tokens_routed : "8 tokens"}
+                      {pipelineTelemetry?.total_tokens_routed != null
+                        ? `${pipelineTelemetry.total_tokens_routed} tokens`
+                        : "8 tokens"}
                     </span>
                   </div>
                   <div className="flex justify-between items-center text-xs">
                     <span className="text-muted-foreground">Dispatch Latency:</span>
                     <span className="font-mono font-bold text-emerald-400">
-                      {pipelineTelemetry ? `${pipelineTelemetry.average_dispatch_latency_ms.toFixed(1)} ms` : "1.2 ms"}
+                      {pipelineTelemetry?.average_dispatch_latency_ms != null
+                        ? `${pipelineTelemetry.average_dispatch_latency_ms.toFixed(1)} ms`
+                        : "1.2 ms"}
                     </span>
                   </div>
                   <div className="flex justify-between items-center text-xs">
                     <span className="text-muted-foreground">Router Entropy:</span>
                     <span className="font-mono font-bold text-purple-400">
-                      {pipelineTelemetry ? pipelineTelemetry.expert_entropy.toFixed(3) : "2.974"}
+                      {pipelineTelemetry?.expert_entropy != null
+                        ? pipelineTelemetry.expert_entropy.toFixed(3)
+                        : "2.974"}
                     </span>
                   </div>
                 </CardContent>
@@ -1156,7 +1162,7 @@ export function MoeStudioPage() {
                   </div>
 
                   {/* Chain Deposit Address Details */}
-                  {cryptoAddresses?.supported_chains[selectedChain] && (
+                  {cryptoAddresses?.supported_chains?.[selectedChain] && (
                     <div className="p-4 rounded-xl border bg-muted/20 space-y-3 text-xs">
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">Network:</span>

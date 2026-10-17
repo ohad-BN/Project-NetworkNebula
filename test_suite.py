@@ -4762,6 +4762,206 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Production frontend SPA compilation & MoE/Speculative route integration", str(e))
 
+    # =========================================================================
+    # Phase 6.6 (Alpha Milestone 6): Master Test Suite Expansion & Milestone 6 Production Signoff
+    # =========================================================================
+    print_header("Phase 6.6 (Alpha Milestone 6): Master MoE, Speculative & DHT Stress Audit & Milestone 6 Signoff")
+
+    # M6.11 MoE Sharding Stress Audit with Speculative Decoding & Churn
+    try:
+        from app.moe_engine import moe_engine
+        from app.speculative_engine import speculative_engine
+        from app.kademlia_dht import dht_node
+
+        # 1. Setup a dedicated 8-expert MoE pipeline with 4 worker pairs
+        stress_pipe_id = f"moe-stress-{uuid.uuid4().hex[:8]}"
+        stress_pipe = moe_engine.create_pipeline(
+            name=f"Stress-Mixtral-{uuid.uuid4().hex[:4]}",
+            model_id="mistralai/Mixtral-8x7B-Instruct-v0.1",
+            quantization="4bit",
+            pipeline_id=stress_pipe_id,
+        )
+        primary_workers = [f"moe-pri-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+        standby_workers = [f"moe-stb-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(4)]
+        pairs = [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+        for i, pair in enumerate(pairs):
+            stress_pipe.assign_worker_expert_pair(
+                expert_ids=pair,
+                worker_id=primary_workers[i],
+                is_standby=False,
+                vram_ceiling_gb=8.0,
+            )
+            stress_pipe.assign_worker_expert_pair(
+                expert_ids=pair,
+                worker_id=standby_workers[i],
+                is_standby=True,
+                vram_ceiling_gb=8.0,
+            )
+
+        pipe_ready = (
+            stress_pipe.is_operational
+            and stress_pipe.active_expert_count == 8
+            and stress_pipe.coverage_pct == 100.0
+            and stress_pipe.redundancy_level == "optimal"
+        )
+
+        # 2. Stress route high-entropy multi-token sequence (32 tokens)
+        token_sequence = [100 + i * 37 for i in range(32)]
+        routing_res = moe_engine.route_tokens(
+            pipeline_id=stress_pipe_id,
+            token_count=32,
+        )
+        routing_data = routing_res.get("routing", {})
+        total_routed = routing_data.get("num_tokens", 0)
+        entropy = routing_data.get("entropy", 0.0)
+        diversity = routing_data.get("diversity_score", 0.0)
+
+        # 3. Parallel forward pass with simulated mid-generation node dropout on worker #2 (hosting experts [4, 5])
+        test_act = np.random.randn(8, stress_pipe.hidden_size).astype(np.float32)
+        dropped_worker = primary_workers[2]
+        expected_promoted = standby_workers[2]
+
+        fwd_res = stress_pipe.route_and_execute(
+            activations=test_act,
+            failing_worker_ids=[dropped_worker],
+        )
+
+        failover_count = stress_pipe.total_failovers
+        failover_logged = any(
+            fo.get("failed_worker") == dropped_worker and fo.get("promoted_worker") == expected_promoted
+            for fo in stress_pipe.failover_history
+        )
+        exp4 = stress_pipe.experts.get(4)
+        exp5 = stress_pipe.experts.get(5)
+        experts_healed = (
+            exp4 is not None
+            and exp5 is not None
+            and exp4.primary_worker_id == expected_promoted
+            and exp5.primary_worker_id == expected_promoted
+            and dropped_worker in exp4.offline_worker_ids
+            and dropped_worker in exp5.offline_worker_ids
+        )
+
+        # 4. P2P DHT Mesh Announce & Discovery for the auto-healed expert slice
+        dht_key = f"moe_expert:{stress_pipe_id}:slice:2"
+        dht_node.handle_store_provider(
+            content_key=dht_key,
+            provider_id=expected_promoted,
+            endpoint=f"http://{expected_promoted}.nebula.internal:8000/moe",
+            vram_gb=8.0,
+        )
+        dht_lookup = dht_node.iterative_lookup(dht_key)
+        dht_found = any(p.get("provider_id") == expected_promoted for p in dht_lookup.get("providers", []))
+
+        # 5. Speculative Decoding execution under load
+        spec_res = speculative_engine.execute_speculative_generation(
+            prompt="Decentralized MoE sharding with parallel speculative decoding verification",
+            max_tokens=16,
+            draft_k=4,
+            temperature=0.7,
+        )
+        tokens_gen = spec_res.get("tokens_generated", 0)
+        speedup = spec_res.get("effective_speedup_factor", 0.0)
+        savings_pct = spec_res.get("savings_pct", spec_res.get("round_trip_savings_pct", 0.0))
+        steps = spec_res.get("step_details", spec_res.get("window_telemetry", []))
+        spec_ok = (
+            tokens_gen >= 12
+            and speedup >= 2.0
+            and savings_pct >= 50.0
+            and len(steps) > 0
+        )
+
+        m6_11_ok = (
+            pipe_ready
+            and total_routed == 32
+            and entropy > 2.0
+            and failover_count >= 1
+            and failover_logged
+            and experts_healed
+            and dht_found
+            and spec_ok
+        )
+        suite.record(
+            m6_11_ok,
+            f"MoE Sharding Stress Audit with Speculative Decoding & Churn verified (experts: 8/8, entropy: {entropy:.3f}, diversity: {diversity*100:.1f}%, failovers: {failover_count}, promoted: {dropped_worker}->{expected_promoted}, DHT recovered: {dht_found}, spec tokens: {tokens_gen}, speedup: {speedup}x, round-trips saved: {savings_pct}%)"
+        )
+    except Exception as e:
+        suite.record(False, "MoE Sharding Stress Audit with Speculative Decoding & Churn", str(e))
+
+    # M6.12 Alpha Milestone 6 Master System Signoff
+    try:
+        # Subsystem 1: Sparse MoE Catalog & Model Specifications
+        sub1_res = requests.get(f"{BASE_URL}/api/v1/moe/models/supported", timeout=5).json()
+        sub1_models = sub1_res.get("models", [])
+        sub1_ok = (
+            sub1_res.get("status") == "success"
+            and len(sub1_models) >= 3
+            and any("Mixtral" in m.get("name", "") for m in sub1_models)
+            and any("DeepSeek" in m.get("name", "") for m in sub1_models)
+        )
+
+        # Subsystem 2: Dynamic Top-k Router Gating & Sparse Dispatch
+        sub2_pipes = requests.get(f"{BASE_URL}/api/v1/moe/pipelines", timeout=5).json().get("pipelines", [])
+        sub2_ok = len(sub2_pipes) >= 1 and any(p.get("coverage_pct", 0) >= 50.0 for p in sub2_pipes)
+
+        # Subsystem 3: Decentralized Speculative Decoding (DSD) Engine
+        sub3_stats = requests.get(f"{BASE_URL}/api/v1/speculative/stats", timeout=5).json()
+        sub3_draft = requests.post(
+            f"{BASE_URL}/api/v1/speculative/draft",
+            json={"prompt": "System signoff check", "max_draft_tokens": 4},
+            timeout=5,
+        ).json()
+        sub3_ok = (
+            sub3_stats.get("status") in ["operational", "success"]
+            and len(sub3_draft.get("draft_tokens", [])) == 4
+        )
+
+        # Subsystem 4: P2P Kademlia 160-bit SHA-1 DHT Mesh
+        sub4_node = requests.get(f"{BASE_URL}/api/v1/dht/node/info", timeout=5).json()
+        sub4_rt = requests.get(f"{BASE_URL}/api/v1/dht/routing-table", timeout=5).json()
+        sub4_ok = (
+            len(sub4_node.get("node_id", "")) == 40
+            and sub4_node.get("status") in ["operational", "success"]
+            and "contacts" in sub4_rt
+            and sub4_rt.get("status") == "success"
+        )
+
+        # Subsystem 5: Commercial Payment Rails & Web3 Escrow
+        sub5_bill = requests.get(f"{BASE_URL}/api/v1/billing/stats", timeout=5).json()
+        sub5_crypto = requests.get(f"{BASE_URL}/api/v1/billing/crypto/deposit-address?user_id=signoff_test", timeout=5).json()
+        sub5_ok = (
+            sub5_bill.get("status") == "operational"
+            and "base" in sub5_crypto.get("supported_chains", {})
+            and "ethereum" in sub5_crypto.get("supported_chains", {})
+        )
+
+        # Subsystem 6: OpenAI Compatible Chat Gateway with Swarm Streaming
+        sub6_oa = requests.post(
+            f"{BASE_URL}/v1/chat/completions",
+            json={
+                "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "messages": [{"role": "user", "content": "Alpha Milestone 6 Master System Signoff verification"}],
+                "stream": False,
+                "max_tokens": 4,
+            },
+            timeout=10,
+        ).json()
+        sub6_ok = sub6_oa.get("object") == "chat.completion" and len(sub6_oa.get("choices", [])) > 0
+
+        # Subsystem 7: Production Frontend SPA Bundle & MoE Studio Route
+        dist_dir = os.path.join(os.path.dirname(__file__), "network-nebula", "dist")
+        html_file = os.path.join(dist_dir, "index.html")
+        sub7_ok = os.path.isfile(html_file) and os.path.getsize(html_file) > 100
+
+        milestone6_signed_off = sub1_ok and sub2_ok and sub3_ok and sub4_ok and sub5_ok and sub6_ok and sub7_ok
+        suite.record(
+            milestone6_signed_off,
+            f"Alpha Milestone 6 Master System Signoff Verified (MoE Catalog: {sub1_ok}, Router Gating: {sub2_ok}, Speculative Decoding: {sub3_ok}, Kademlia DHT: {sub4_ok}, Payment Rails: {sub5_ok}, OpenAI Swarm Gateway: {sub6_ok}, Frontend MoE Studio: {sub7_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Alpha Milestone 6 Master System Signoff", str(e))
+
     return suite.summary()
 
 

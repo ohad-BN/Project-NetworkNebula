@@ -231,11 +231,14 @@ class SpeculativeDecodingEngine:
         target_model_id: str = "meta-llama/Llama-3-70B",
         temperature: float = 0.7,
         seed: Optional[int] = 42,
+        max_new_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Executes continuous speculative decoding loop until max_tokens reached.
         Amortizes target model WAN network round-trips by a factor of 2.5x - 4x.
         """
+        if max_new_tokens is not None:
+            max_tokens = max_new_tokens
         t0 = time.time()
         VOCAB_WORDS = [
             " Decentralized", " speculative", " decoding", " multiplies", " token", " generation",
@@ -337,11 +340,15 @@ class SpeculativeDecodingEngine:
             "baseline_passes_required": baseline_passes,
             "round_trips_saved": round_trips_saved,
             "round_trip_savings_pct": round_trip_savings_pct,
+            "savings_pct": round_trip_savings_pct,
             "tokens_per_pass": tokens_per_pass,
             "effective_speedup_factor": round(effective_speedup, 2),
             "elapsed_ms": elapsed_ms,
             "window_telemetry": window_telemetry,
+            "step_details": window_telemetry,
         }
+
+    execute_speculative_generation = generate_completion
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns aggregate speculative decoding efficiency statistics."""
