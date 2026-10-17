@@ -36,9 +36,9 @@ export function Navbar({ user, onLogout }: NavbarProps) {
     { href: "/inference", label: "Model Serving" },
     { href: "/api-tokens", label: "API Tokens" },
     { href: "/cluster", label: "GPU Fleet" },
+    { href: "/worker", label: "Worker Node" },
     { href: "/governance", label: "Governance & SLA" },
     { href: "/jobs", label: "History" },
-    ...(user?.role === "worker" ? [{ href: "/worker", label: "Worker" }] : []),
   ];
 
   const isActive = (href: string) => location.pathname === href;

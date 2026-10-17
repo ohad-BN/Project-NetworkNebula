@@ -50,39 +50,11 @@ function App() {
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/register/worker" element={<RegisterWorkerPage />} />
-          <Route
-            path="/create-job"
-            element={
-              <ProtectedRouteWrapper allowedRoles={["creator"]}>
-                <CreateJobPage />
-              </ProtectedRouteWrapper>
-            }
-          />
+          <Route path="/create-job" element={<CreateJobPage />} />
           <Route path="/job-status/:taskId" element={<JobStatusPage />} />
-          <Route
-            path="/jobs"
-            element={
-              <ProtectedRouteWrapper allowedRoles={["creator"]}>
-                <JobHistoryPage />
-              </ProtectedRouteWrapper>
-            }
-          />
-          <Route
-            path="/worker"
-            element={
-              <ProtectedRouteWrapper allowedRoles={["worker"]}>
-                <WorkerDashboardPage />
-              </ProtectedRouteWrapper>
-            }
-          />
-          <Route
-            path="/worker/earnings"
-            element={
-              <ProtectedRouteWrapper allowedRoles={["worker"]}>
-                <WorkerEarningsPage />
-              </ProtectedRouteWrapper>
-            }
-          />
+          <Route path="/jobs" element={<JobHistoryPage />} />
+          <Route path="/worker" element={<WorkerDashboardPage />} />
+          <Route path="/worker/earnings" element={<WorkerEarningsPage />} />
           <Route
             path="/wallet"
             element={
