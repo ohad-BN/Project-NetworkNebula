@@ -7,10 +7,12 @@ transformer layer blocks to worker nodes, and verifying pipeline topology.
 Mounted under /api/v1/swarm.
 """
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.sharding_engine import sharding_engine
@@ -52,6 +54,14 @@ class PipelineForwardRequest(BaseModel):
     token_ids: Optional[List[int]] = Field(default=None, description="Direct token IDs list")
     session_id: Optional[str] = Field(default=None, description="Active swarm session ID")
     step: Optional[int] = Field(default=0, ge=0, description="Autoregressive generation step")
+
+
+class PipelineGenerateRequest(BaseModel):
+    prompt: Optional[str] = Field(default="NetworkNebula decentralized swarm computing", description="Prompt text")
+    max_tokens: Optional[int] = Field(default=16, ge=1, le=512, description="Maximum tokens to generate")
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    session_id: Optional[str] = Field(default=None, description="Optional persistent session ID for KV-cache reuse")
+    stream: Optional[bool] = Field(default=False, description="Whether to stream tokens via SSE")
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +242,111 @@ def delete_swarm_pipeline(pipeline_id: str):
         "pipeline_id": pipeline_id,
         "message": "Pipeline deleted successfully",
     }
+
+
+# ---------------------------------------------------------------------------
+# KV-Cache Coordination & Continuous Generation Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/kv-cache/stats", summary="Get Distributed KV-Cache Memory & Hit Telemetry")
+def get_kv_cache_telemetry():
+    """Returns active session counts, total memory footprint, hit/miss ratios, and recent sessions."""
+    from app.kv_cache_manager import kv_cache_manager
+    return {
+        "status": "success",
+        "telemetry": kv_cache_manager.get_stats(),
+    }
+
+
+@router.delete("/kv-cache/sessions/{session_id}", summary="Evict Session KV-Cache")
+def evict_kv_cache_session(session_id: str):
+    """Manually evicts a specific session's attention KV cache to free host VRAM."""
+    from app.kv_cache_manager import kv_cache_manager
+    evicted = kv_cache_manager.evict_session(session_id)
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "evicted": evicted,
+    }
+
+
+@router.post("/pipelines/{pipeline_id}/generate", summary="Continuous Swarm Auto-Regressive Generation")
+def generate_pipeline_completion(pipeline_id: str, payload: PipelineGenerateRequest):
+    """
+    Executes continuous auto-regressive generation across a sharded model pipeline
+    with stateful attention KV-cache coordination:
+    - Step 0 (Prefill): encodes prompt and populates stage KV caches.
+    - Steps 1..N (Decode): accelerates token-by-token decoding reusing cached keys/values.
+    """
+    try:
+        if payload.stream:
+            def event_generator():
+                for chunk in sharding_engine.generate_swarm_stream(
+                    pipeline_id=pipeline_id,
+                    prompt=payload.prompt or "",
+                    max_tokens=payload.max_tokens or 16,
+                    temperature=payload.temperature or 0.7,
+                    session_id=payload.session_id,
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+        else:
+            result = sharding_engine.generate_swarm_completion(
+                pipeline_id=pipeline_id,
+                prompt=payload.prompt or "",
+                max_tokens=payload.max_tokens or 16,
+                temperature=payload.temperature or 0.7,
+                session_id=payload.session_id,
+            )
+            return {
+                "status": "success",
+                "generation": result,
+            }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Pipeline generate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate", summary="Continuous Swarm Generation by Model ID")
+def generate_by_model(
+    payload: PipelineGenerateRequest,
+    model_id: str = Query(default="meta-llama/Llama-3-70B"),
+):
+    """
+    Convenience endpoint to generate completions directly for any sharded foundation model ID.
+    Auto-provisions or reuses an active multi-node swarm pipeline.
+    """
+    try:
+        if payload.stream:
+            def event_generator():
+                for chunk in sharding_engine.generate_swarm_stream(
+                    model_id=model_id,
+                    prompt=payload.prompt or "",
+                    max_tokens=payload.max_tokens or 16,
+                    temperature=payload.temperature or 0.7,
+                    session_id=payload.session_id,
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+        else:
+            result = sharding_engine.generate_swarm_completion(
+                model_id=model_id,
+                prompt=payload.prompt or "",
+                max_tokens=payload.max_tokens or 16,
+                temperature=payload.temperature or 0.7,
+                session_id=payload.session_id,
+            )
+            return {
+                "status": "success",
+                "generation": result,
+            }
+    except Exception as e:
+        logger.error(f"Swarm model generate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

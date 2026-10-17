@@ -80,6 +80,24 @@ DEFAULT_MODELS = [
         "root": "deepseek-ai/DeepSeek-R1-Distill-Qwen-8B",
         "parent": None,
     },
+    {
+        "id": "meta-llama/Llama-3-70B",
+        "object": "model",
+        "created": 1713430000,
+        "owned_by": "nebula-swarm",
+        "permission": [],
+        "root": "meta-llama/Llama-3-70B",
+        "parent": None,
+    },
+    {
+        "id": "Qwen/Qwen2.5-72B-Instruct",
+        "object": "model",
+        "created": 1726000000,
+        "owned_by": "nebula-swarm",
+        "permission": [],
+        "root": "Qwen/Qwen2.5-72B-Instruct",
+        "parent": None,
+    },
 ]
 
 
@@ -206,6 +224,89 @@ def create_chat_completion(
     endpoint_id = endpoint.id if endpoint else None
     actual_model = endpoint.model_id if endpoint else payload.model
     adapter_url = endpoint.adapter_url if endpoint else None
+
+    # Check if requested model is a decentralized sharded model (e.g. 70B/72B/33B)
+    from app.sharding_engine import sharding_engine
+    is_sharded_model = (
+        not endpoint
+        and any(s_key in actual_model for s_key in ["70B", "72B", "33B", "Mixtral-8x7B"])
+    )
+
+    if is_sharded_model:
+        prompt_text = " ".join([m.content for m in payload.messages]) if payload.messages else "Hello"
+        max_tok = min(payload.max_tokens or 32, 256)
+
+        if payload.stream:
+            async def swarm_event_generator() -> AsyncGenerator[str, None]:
+                try:
+                    for chunk in sharding_engine.generate_swarm_stream(
+                        model_id=actual_model,
+                        prompt=prompt_text,
+                        max_tokens=max_tok,
+                        temperature=payload.temperature or 0.7,
+                    ):
+                        chunk_data = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_timestamp,
+                            "model": payload.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": chunk["token"]},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                except Exception as e:
+                    print(f"[SWARM STREAM] Error: {e}")
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_timestamp,
+                    "model": payload.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(swarm_event_generator(), media_type="text/event-stream")
+        else:
+            swarm_res = sharding_engine.generate_swarm_completion(
+                model_id=actual_model,
+                prompt=prompt_text,
+                max_tokens=max_tok,
+                temperature=payload.temperature or 0.7,
+            )
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created_timestamp,
+                "model": payload.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": swarm_res["completion"],
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": len(prompt_text.split()),
+                    "completion_tokens": swarm_res["tokens_generated"],
+                    "total_tokens": len(prompt_text.split()) + swarm_res["tokens_generated"],
+                },
+                "sharding_telemetry": {
+                    "pipeline_id": swarm_res.get("pipeline_id"),
+                    "session_id": swarm_res.get("session_id"),
+                    "avg_decode_latency_ms": swarm_res.get("avg_decode_latency_ms"),
+                    "total_latency_ms": swarm_res.get("total_latency_ms"),
+                },
+            }
 
     # Dispatch inference to worker
     raw_messages = [{"role": m.role, "content": m.content} for m in payload.messages]

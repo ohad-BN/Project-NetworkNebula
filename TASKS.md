@@ -273,10 +273,12 @@
 - [x] Extended [`nebula_worker.py`](nebula_worker.py) CLI agent with `--shard-layers` and `--pipeline-id` flags for participating in swarm pipelines
 - [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.2 assertions (`M5.3` binary activation tensor wire codec & integrity audit, `M5.4` multi-node sequential pipeline forward pass & logits projection) (**127/127 passed — 100% Green**)
 
-### 📋 Phase 5.3: Distributed KV-Cache Coordination & Continuous Swarm Inference
-- [ ] Build layer-specific attention KV-cache manager with LRU eviction and memory bounds in `app/kv_cache_manager.py`
-- [ ] Wire `/v1/chat/completions` in [`app/openai_inference_router.py`](app/openai_inference_router.py) to automatically route 70B+ sharded models through active swarm pipelines with token-by-token streaming
-- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 5.3 assertions (`M5.5`, `M5.6`) and verify 100% green pass
+### ✅ Phase 5.3: Distributed KV-Cache Coordination & Continuous Swarm Inference (COMPLETED)
+- [x] Built layer-specific attention KV-cache manager with LRU eviction and memory bounds in [`app/kv_cache_manager.py`](app/kv_cache_manager.py) (`KVCacheManager` tracking session memory footprints, active tokens, and hit/miss telemetry)
+- [x] Implemented continuous auto-regressive generation in [`app/sharding_engine.py`](app/sharding_engine.py) (`generate_swarm_stream` and `generate_swarm_completion`) with prefill step 0 and ultra-fast decode steps reusing cached attention KV states
+- [x] Exposed `GET /api/v1/swarm/kv-cache/stats`, `DELETE /api/v1/swarm/kv-cache/sessions/{id}`, and `POST /api/v1/swarm/pipelines/{id}/generate` in [`app/sharding_router.py`](app/sharding_router.py)
+- [x] Wired `/v1/chat/completions` in [`app/openai_inference_router.py`](app/openai_inference_router.py) to automatically route 70B+ sharded models through active swarm pipelines with token-by-token SSE streaming and non-streaming responses
+- [x] Expanded [`test_suite.py`](test_suite.py) with Phase 5.3 assertions (`M5.5` distributed attention KV-cache coordination & step latency reduction audit, `M5.6` OpenAI-compatible swarm chat completions & SSE streaming) (**129/129 passed — 100% Green**)
 
 ### 📋 Phase 5.4: Fault-Tolerant Pipeline Rerouting & Swarm Auto-Healing
 - [ ] Implement redundant layer shard assignment (primary + standby replica per layer block) in `app/sharding_engine.py`

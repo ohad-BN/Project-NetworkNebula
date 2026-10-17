@@ -3627,6 +3627,106 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Multi-node sequential pipeline forward pass", str(e))
 
+    # =========================================================================
+    # Phase 5.3 (Alpha Milestone 5): Distributed KV-Cache Coordination & Continuous Swarm Inference
+    # =========================================================================
+    print_header("Phase 5.3 (Alpha Milestone 5): Distributed KV-Cache Coordination & Continuous Swarm Inference")
+
+    # M5.5 Distributed Attention KV-Cache Coordination & Step Latency Reduction Audit
+    try:
+        from app.kv_cache_manager import KVCacheManager
+        from app.sharding_engine import sharding_engine
+
+        # 1. Verify KVCacheManager LRU eviction and memory tracking
+        test_mgr = KVCacheManager(max_memory_mb=100.0, max_sessions=3, ttl_seconds=60)
+        test_mgr.get_or_create_session("sess-a", "meta-llama/Llama-3-70B")
+        test_mgr.get_or_create_session("sess-b", "meta-llama/Llama-3-70B")
+        test_mgr.get_or_create_session("sess-c", "meta-llama/Llama-3-70B")
+        test_mgr.store_stage_kv("sess-a", stage_idx=0, start_layer=0, end_layer=19, seq_len=16)
+        test_mgr.append_stage_token("sess-a", stage_idx=0, start_layer=0, end_layer=19)
+
+        # Trigger LRU eviction by adding sess-d (sess-b was least recently accessed)
+        test_mgr.get_or_create_session("sess-d", "meta-llama/Llama-3-70B")
+        lru_ok = (
+            not test_mgr.has_session("sess-b")
+            and test_mgr.has_session("sess-a")
+            and test_mgr.has_session("sess-d")
+            and test_mgr.get_stats()["active_sessions"] == 3
+        )
+
+        # 2. Continuous swarm auto-regressive generation across pipeline with KV-cache
+        gen_out = sharding_engine.generate_swarm_completion(
+            model_id="meta-llama/Llama-3-70B",
+            prompt="Decentralized KV-cache acceleration on Project Network Nebula",
+            max_tokens=6,
+        )
+        gen_ok = (
+            gen_out.get("tokens_generated") == 6
+            and len(gen_out.get("completion", "")) > 0
+            and gen_out.get("avg_decode_latency_ms", 999.0) < 300.0
+            and gen_out.get("total_wire_bytes", 0) > 0
+        )
+
+        # 3. Verify REST KV-cache telemetry endpoint
+        kv_stats_resp = requests.get(f"{BASE_URL}/api/v1/swarm/kv-cache/stats", timeout=5).json()
+        stats_ok = kv_stats_resp.get("status") == "success" and "telemetry" in kv_stats_resp
+
+        m5_5_ok = lru_ok and gen_ok and stats_ok
+        suite.record(
+            m5_5_ok,
+            f"Distributed attention KV-cache coordination verified (LRU evicted: True, tokens: {gen_out.get('tokens_generated')}, avg decode: {gen_out.get('avg_decode_latency_ms'):.1f}ms, telemetry status: {kv_stats_resp.get('status')})"
+        )
+    except Exception as e:
+        suite.record(False, "Distributed attention KV-cache coordination", str(e))
+
+    # M5.6 OpenAI-Compatible Swarm Chat Completions & Live SSE Token Streaming
+    try:
+        # 1. Query /v1/chat/completions with 70B sharded model and stream=True
+        stream_payload = {
+            "model": "meta-llama/Llama-3-70B",
+            "messages": [{"role": "user", "content": "Explain swarm layer sharding on consumer GPUs"}],
+            "stream": True,
+            "max_tokens": 8,
+        }
+        res_stream = requests.post(f"{BASE_URL}/v1/chat/completions", json=stream_payload, stream=True, timeout=10)
+        chunks = []
+        has_stop = False
+        has_done = False
+        if res_stream.status_code == 200:
+            for line in res_stream.iter_lines():
+                if line:
+                    l_str = line.decode("utf-8")
+                    if l_str == "data: [DONE]":
+                        has_done = True
+                        break
+                    if l_str.startswith("data: "):
+                        c_data = json.loads(l_str[6:])
+                        chunks.append(c_data)
+                        if c_data.get("choices", [{}])[0].get("finish_reason") == "stop":
+                            has_stop = True
+
+        stream_compliant = len(chunks) >= 4 and has_stop and has_done and "id" in chunks[0]
+
+        # 2. Query /v1/chat/completions with stream=False
+        non_stream_payload = {
+            "model": "meta-llama/Llama-3-70B",
+            "messages": [{"role": "user", "content": "Overview of NetworkNebula"}],
+            "stream": False,
+            "max_tokens": 6,
+        }
+        res_non = requests.post(f"{BASE_URL}/v1/chat/completions", json=non_stream_payload, timeout=10).json()
+        content = res_non.get("choices", [{}])[0].get("message", {}).get("content")
+        has_telemetry = "sharding_telemetry" in res_non
+        non_stream_ok = res_non.get("object") == "chat.completion" and bool(content) and has_telemetry
+
+        m5_6_ok = stream_compliant and non_stream_ok
+        suite.record(
+            m5_6_ok,
+            f"OpenAI-compatible swarm chat completions & SSE streaming verified (70B model, {len(chunks)} chunks, data: [DONE], finish_reason='stop', non-stream content length: {len(content or '')})"
+        )
+    except Exception as e:
+        suite.record(False, "OpenAI-compatible swarm chat completions & SSE streaming", str(e))
+
     return suite.summary()
 
 

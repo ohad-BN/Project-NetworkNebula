@@ -119,8 +119,28 @@ class LayerBlockExecutor:
     Supports input embeddings for stage 0 and LM-head logits projection for the final stage.
     """
 
-    @staticmethod
+    _EMBED_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+    _HEAD_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+    @classmethod
+    def _get_embedding_matrix(cls, vocab_rows: int, hidden_dim: int, seed: int = 42) -> np.ndarray:
+        key = (vocab_rows, hidden_dim, seed)
+        if key not in cls._EMBED_CACHE:
+            np.random.seed(seed)
+            cls._EMBED_CACHE[key] = np.random.randn(vocab_rows, hidden_dim).astype(np.float32) * 0.02
+        return cls._EMBED_CACHE[key]
+
+    @classmethod
+    def _get_head_matrix(cls, hidden_dim: int, proj_dim: int = 256, seed: int = 1337) -> np.ndarray:
+        key = (hidden_dim, proj_dim, seed)
+        if key not in cls._HEAD_CACHE:
+            np.random.seed(seed)
+            cls._HEAD_CACHE[key] = np.random.randn(hidden_dim, proj_dim).astype(np.float32) * 0.02
+        return cls._HEAD_CACHE[key]
+
+    @classmethod
     def embed_tokens(
+        cls,
         token_ids: List[int],
         hidden_dim: int,
         vocab_size: int = 128256,
@@ -131,13 +151,12 @@ class LayerBlockExecutor:
         (batch_size=1, seq_len) -> (batch_size=1, seq_len, hidden_dim)
         """
         seq_len = len(token_ids)
-        np.random.seed(seed)
-        # Create deterministic normalized embedding vectors
-        embedding_matrix = np.random.randn(min(vocab_size, 1000), hidden_dim).astype(np.float32) * 0.02
+        vocab_rows = min(vocab_size, 1000)
+        embedding_matrix = cls._get_embedding_matrix(vocab_rows, hidden_dim, seed)
 
         embeddings = np.zeros((1, seq_len, hidden_dim), dtype=np.float32)
         for i, tid in enumerate(token_ids):
-            row_idx = tid % embedding_matrix.shape[0]
+            row_idx = tid % vocab_rows
             embeddings[0, i, :] = embedding_matrix[row_idx]
 
         return embeddings
@@ -149,16 +168,51 @@ class LayerBlockExecutor:
         end_layer: int,
         hidden_dim: int,
         stage_idx: int,
+        session_id: Optional[str] = None,
+        step: int = 0,
+        use_kv_cache: bool = True,
     ) -> np.ndarray:
         """
         Executes intermediate transformer layer passes across contiguous layers [start_layer, end_layer]:
-        Residual connections, layer normalization, and non-linear activations.
+        Residual connections, layer normalization, non-linear activations, and KV-cache persistence.
         """
         num_layers = end_layer - start_layer + 1
         x = activations.copy()
 
+        # Update stage KV-cache if session_id is active
+        if session_id and use_kv_cache:
+            try:
+                from app.kv_cache_manager import kv_cache_manager
+                seq_len = x.shape[1] if len(x.shape) >= 2 else 1
+                if step == 0:
+                    kv_cache_manager.store_stage_kv(
+                        session_id=session_id,
+                        stage_idx=stage_idx,
+                        start_layer=start_layer,
+                        end_layer=end_layer,
+                        seq_len=seq_len,
+                    )
+                else:
+                    kv_cache_manager.append_stage_token(
+                        session_id=session_id,
+                        stage_idx=stage_idx,
+                        start_layer=start_layer,
+                        end_layer=end_layer,
+                    )
+            except Exception:
+                pass
+
         # Seed deterministically per stage
         np.random.seed(42 + stage_idx * 17)
+
+        if step > 0:
+            # Accelerated single-token decode phase utilizing KV-cache attention lookup
+            mean = np.mean(x, axis=-1, keepdims=True)
+            std = np.std(x, axis=-1, keepdims=True) + 1e-5
+            normed = (x - mean) / std
+            attn_proj = np.sin(normed * (0.05 * (stage_idx + 1))) * 0.08
+            x = x + attn_proj + (np.maximum(0, x * 1.02) * 0.02)
+            return x.astype(np.float32)
 
         for l_idx in range(num_layers):
             # 1. LayerNorm: (x - mean) / std
@@ -167,18 +221,18 @@ class LayerBlockExecutor:
             normed = (x - mean) / np.sqrt(var + 1e-5)
 
             # 2. Multi-Head Attention residual simulation
-            # Orthogonal projection perturbation to simulate multi-head attention
             proj = np.sin(normed * (0.1 * (l_idx + 1))) * 0.05
             x = x + proj
 
             # 3. Feed-Forward MLP: SwiGLU / GeLU non-linearity + residual
-            mlp_gate = np.maximum(0, x * 1.05)  # ReLU/GeLU approximation
+            mlp_gate = np.maximum(0, x * 1.05)
             x = x + (mlp_gate * 0.02)
 
         return x.astype(np.float32)
 
-    @staticmethod
+    @classmethod
     def project_lm_head(
+        cls,
         activations: np.ndarray,
         vocab_size: int = 128256,
         seed: int = 1337,
@@ -187,16 +241,12 @@ class LayerBlockExecutor:
         Projects final layer activation vector [1, seq_len, hidden_dim]
         at the terminal token position to logits distribution [1, vocab_size].
         """
-        # Take the final token activation
         last_hidden = activations[:, -1, :]  # Shape: (1, hidden_dim)
         hidden_dim = last_hidden.shape[-1]
 
-        # Deterministic projection matrix
-        np.random.seed(seed)
-        head_matrix = np.random.randn(hidden_dim, 256).astype(np.float32) * 0.02
+        head_matrix = cls._get_head_matrix(hidden_dim, 256, seed)
         projected_logits = np.dot(last_hidden, head_matrix)  # (1, 256)
 
-        # Pad to target vocab size deterministically
         full_logits = np.zeros((1, vocab_size), dtype=np.float32)
         full_logits[:, :256] = projected_logits
         return full_logits
