@@ -309,6 +309,49 @@
 
 ---
 
+## 🚀 Alpha Milestone 6: Sparse Mixture-of-Experts (MoE) Dynamic Sharding, Decentralized Speculative Decoding (DSD) & P2P Kademlia DHT Mesh
+
+### 📋 Phase 6.1: Sparse Mixture-of-Experts (MoE) Architecture & Expert Partitioning Engine
+- [ ] Build `app/moe_engine.py` with MoE model catalog support (`Mixtral-8x7B-Instruct`, `DeepSeek-V2-Lite`, `Qwen1.5-MoE-A2.7B`)
+- [ ] Implement dynamic Top-$k$ gating router ($k=2$) calculating routing logits and dispatching activations to worker expert slices
+- [ ] Implement expert memory estimator and worker assignment manager mapping expert pairs to consumer 8GB GPUs
+- [ ] Build `app/moe_router.py` mounted at `/api/v1/moe` (`POST /models`, `GET /models/{id}/experts`, `POST /workers/assign-expert`, `POST /pipelines/{id}/route-tokens`)
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.1 assertions (`M6.1` MoE Expert Partitioning & Worker Memory Budget Allocation, `M6.2` Dynamic Router Gating & Sparse Activation Forwarding)
+
+### 📋 Phase 6.2: Decentralized Speculative Decoding (DSD) Engine
+- [ ] Build `app/speculative_engine.py` managing draft model generation (Qwen2.5-0.5B draft window $K=4$) and batched swarm verification
+- [ ] Implement single-pass multi-token pipeline forward pass verifying all $K$ candidates in parallel to eliminate WAN latency penalties
+- [ ] Implement unbiased speculative rejection sampling with residual distribution correction
+- [ ] Wire speculative execution option into `/v1/chat/completions` and `generate_swarm_stream`
+- [ ] Expose `POST /api/v1/speculative/draft`, `POST /api/v1/speculative/verify`, and speedup telemetry
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.2 assertions (`M6.3` Speculative Draft Generation & Parallel Multi-Token Forward Verification, `M6.4` Unbiased Rejection Sampling & $\ge 2.0\times$ Speedup Telemetry)
+
+### 📋 Phase 6.3: P2P Kademlia Distributed Hash Table (DHT) & Swarm Mesh Discovery
+- [ ] Build `app/kademlia_dht.py` with 160-bit SHA-1 Node IDs, XOR metric distance calculation, and $k$-bucket ($k=20$) LRU routing table
+- [ ] Implement RPC message handlers (`PING`, `STORE`, `FIND_NODE`, `FIND_VALUE`) and provider announcement protocol (`dht_announce_provider`, `dht_find_providers`)
+- [ ] Add DHT discovery client to [`nebula_worker.py`](nebula_worker.py) (`dht-peers`, `dht-find`)
+- [ ] Expose DHT management and routing endpoints at `/api/v1/dht`
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.3 assertions (`M6.5` Kademlia 160-bit XOR Routing Table & $k$-Bucket LRU Eviction Audit, `M6.6` Decentralized Provider Discovery & Multi-Hop DHT Lookup Lifecycle)
+
+### 📋 Phase 6.4: Real Commercial Monetization: Stripe Checkout & Web3 Micro-Payment Escrow
+- [ ] Build `app/payment_rails.py` integrating Stripe Checkout session creation and webhook signature validation (`POST /api/v1/billing/stripe/create-checkout-session`, `POST /api/v1/billing/stripe/webhook`)
+- [ ] Implement Web3 USDC deposit address generation, EIP-712 cryptographic signature verification, and instant ledger credit (`POST /api/v1/billing/crypto/verify-deposit`)
+- [ ] Implement automated host worker withdrawal disbursement engine with cryptographically signed receipts (`POST /api/v1/billing/payouts/process`)
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.4 assertions (`M6.7` Stripe Checkout Session Generation & Webhook Balance Credit Audit, `M6.8` Crypto Deposit Verification & Automated Host Worker Withdrawal Settlement)
+
+### 📋 Phase 6.5: React 19 MoE Visualizer, Speculative Decoding Dashboard & Payment Center
+- [ ] Build **MoE & Speculative Studio Page** ([`network-nebula/src/pages/moe-studio.tsx`](network-nebula/src/pages/moe-studio.tsx)) featuring 8-expert sharding matrix, live speculative decoding waterfall ($K=4$, $2.5\times$ speedup), P2P Kademlia mesh visualizer, and Stripe/USDC payment center
+- [ ] Implement TypeScript API client in `network-nebula/src/services/api/moe.ts` and add `/moe` navigation route
+- [ ] Verify clean production frontend compilation (`bun run build`) with zero TypeScript errors
+- [ ] Expand [`test_suite.py`](test_suite.py) with Phase 6.5 assertions (`M6.9` MoE & Speculative Decoding REST Telemetry Serialization Protocol Audit, `M6.10` Production Frontend SPA Compilation & MoE/Speculative Route Integration)
+
+### 📋 Phase 6.6: Master Test Suite Expansion & Milestone 6 Production Signoff
+- [ ] Incorporate Phase 6.6 master validation tests into [`test_suite.py`](test_suite.py) (`M6.11` MoE Sharding Stress Audit with Speculative Decoding & Churn, `M6.12` Milestone 6 Master Production Signoff)
+- [ ] Run `python test_suite.py` achieving 100% green pass across all 147 automated tests and sign off Alpha Milestone 6
+- [ ] Verify clean production frontend compilation (`bun run build`) with zero TypeScript errors
+
+---
+
 ## ⚡ Instant Command Cheatsheet
 
 ```powershell
