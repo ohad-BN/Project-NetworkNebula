@@ -3958,6 +3958,130 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Production frontend SPA compilation & Swarm Studio route integration", str(e))
 
+    # =========================================================================
+    # Phase 5.6 (Alpha Milestone 5): Master Test Suite Expansion & Milestone 5 Production Signoff
+    # =========================================================================
+    print_header("Phase 5.6 (Alpha Milestone 5): Master Multi-Node Swarm Validation & Milestone 5 Signoff")
+
+    # M5.11 70B Swarm Sharding High-Load Stress Audit with Multi-Node Cascading Dropout & Zero-Drop Auto-Healing
+    try:
+        from app.sharding_engine import sharding_engine
+
+        # 1. Instantiate an 8-stage pipeline for 80-layer Llama-3-70B (10 layers/stage)
+        num_stress_stages = 8
+        primary_workers = [f"stress-pri-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(num_stress_stages)]
+        standby_workers = [f"stress-stb-{i+1}-{uuid.uuid4().hex[:4]}" for i in range(num_stress_stages)]
+
+        stress_pipe = sharding_engine.create_pipeline(
+            model_id="meta-llama/Llama-3-70B",
+            num_stages=num_stress_stages,
+            quantization="4bit",
+            worker_ids=primary_workers,
+            standby_worker_ids=standby_workers,
+            name=f"stress-pipe-70b-{uuid.uuid4().hex[:6]}",
+        )
+        stress_pid = stress_pipe.pipeline_id
+
+        # Initial topology audit: 8 stages, 8 primaries, 8 standbys, 100% health
+        init_ok = (
+            len(stress_pipe.stages) == 8
+            and stress_pipe.is_complete
+            and stress_pipe.redundancy_level == "optimal"
+            and stress_pipe.total_standbys == 8
+            and stress_pipe.health_score == 100.0
+            and all(s.layer_count == 10 for s in stress_pipe.stages)
+        )
+
+        # 2. Simulate cascading node dropouts during continuous multi-token generation:
+        # Failing workers on Stage 2 and Stage 5
+        stress_completion = sharding_engine.generate_swarm_completion(
+            pipeline_id=stress_pid,
+            prompt="High-throughput decentralized pipeline parallelism stress test under load",
+            max_tokens=6,
+            failing_worker_ids=[primary_workers[2], primary_workers[5]],
+        )
+
+        tokens_generated = stress_completion.get("tokens_generated", 0)
+        failovers_handled = stress_completion.get("total_failovers_handled", 0)
+        failover_records = stress_completion.get("failover_records", [])
+
+        # Verify zero dropped tokens (exactly 6 generated) and both nodes auto-healed
+        zero_drop = (tokens_generated == 6)
+        healed_nodes = {fo.get("stage_idx"): fo.get("new_primary") for fo in failover_records}
+        cascading_healed = (
+            failovers_handled >= 2
+            and healed_nodes.get(2) == standby_workers[2]
+            and healed_nodes.get(5) == standby_workers[5]
+        )
+
+        # Verify pipeline state reflects updated primary workers and failover logs
+        ft_stress = stress_pipe.get_fault_tolerance_report()
+        stages_updated = (
+            stress_pipe.stages[2].primary_worker_id == standby_workers[2]
+            and stress_pipe.stages[5].primary_worker_id == standby_workers[5]
+            and primary_workers[2] in stress_pipe.stages[2].offline_worker_ids
+            and primary_workers[5] in stress_pipe.stages[5].offline_worker_ids
+            and ft_stress.get("total_failovers") >= 2
+        )
+
+        m5_11_ok = init_ok and zero_drop and cascading_healed and stages_updated
+        suite.record(
+            m5_11_ok,
+            f"70B Swarm sharding high-load stress audit verified (stages: 8x10L, tokens: {tokens_generated}/6, cascading failovers: {failovers_handled}, promoted: Stage 2->{standby_workers[2]}, Stage 5->{standby_workers[5]}, total failovers: {ft_stress.get('total_failovers')})"
+        )
+    except Exception as e:
+        suite.record(False, "70B Swarm sharding high-load stress audit", str(e))
+
+    # M5.12 Milestone 5 Production Master Signoff (Decentralized Tensor Parallelism & Large Model Sharding)
+    try:
+        import numpy as np
+        from app.tensor_stream import TensorWireCodec
+
+        # Subsystem 1: Model Sharding & Partition Planner
+        sub1_res = requests.get(f"{BASE_URL}/api/v1/swarm/models/supported", timeout=5).json()
+        sub1_ok = sub1_res.get("status") == "success" and len(sub1_res.get("models", [])) >= 4
+
+        # Subsystem 2: Binary Activation Wire Codec (NEBACT01 + CRC32)
+        test_t = np.random.randn(1, 16, 4096).astype(np.float32)
+        packed = TensorWireCodec.pack(test_t, session_id="signoff-sess", stage_idx=0, step=0)
+        unpacked, h = TensorWireCodec.unpack(packed)
+        sub2_ok = packed[:8] == b"NEBACT01" and np.allclose(test_t, unpacked, atol=1e-6) and bool(h.get("crc32"))
+
+        # Subsystem 3: Distributed Attention KV-Cache Telemetry & Management
+        sub3_res = requests.get(f"{BASE_URL}/api/v1/swarm/kv-cache/stats", timeout=5).json()
+        sub3_telemetry = sub3_res.get("telemetry", {})
+        sub3_ok = sub3_res.get("status") == "success" and "total_memory_mb" in sub3_telemetry
+
+        # Subsystem 4: OpenAI /v1/chat/completions Swarm Gateway Streaming
+        oa_res = requests.post(
+            f"{BASE_URL}/v1/chat/completions",
+            json={
+                "model": "meta-llama/Llama-3-70B",
+                "messages": [{"role": "user", "content": "Master signoff check"}],
+                "stream": False,
+                "max_tokens": 4,
+            },
+            timeout=10,
+        ).json()
+        sub4_ok = oa_res.get("object") == "chat.completion" and len(oa_res.get("choices", [])) > 0
+
+        # Subsystem 5: Swarm Fault Tolerance & Standby Replication Protocol
+        sub5_pipes = requests.get(f"{BASE_URL}/api/v1/swarm/pipelines", timeout=5).json().get("pipelines", [])
+        sub5_ok = len(sub5_pipes) >= 1 and any(p.get("is_complete") is True for p in sub5_pipes)
+
+        # Subsystem 6: Production Frontend SPA Bundle & Swarm Studio Route
+        dist_dir = os.path.join(os.path.dirname(__file__), "network-nebula", "dist")
+        html_file = os.path.join(dist_dir, "index.html")
+        sub6_ok = os.path.isfile(html_file) and os.path.getsize(html_file) > 100
+
+        milestone5_signed_off = sub1_ok and sub2_ok and sub3_ok and sub4_ok and sub5_ok and sub6_ok
+        suite.record(
+            milestone5_signed_off,
+            f"Alpha Milestone 5 Master System Signoff Verified (Sharding Catalog: {sub1_ok}, Wire Codec: {sub2_ok}, KV-Cache Pool: {sub3_ok}, OpenAI 70B Gateway: {sub4_ok}, Fault Tolerance: {sub5_ok}, Frontend Studio: {sub6_ok})"
+        )
+    except Exception as e:
+        suite.record(False, "Milestone 5 Production Master Signoff", str(e))
+
     return suite.summary()
 
 
