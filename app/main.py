@@ -245,9 +245,10 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
     db.commit()
 
     # Dispatch verification email (non-blocking)
+    email_delivered = False
     try:
         from app.email_service import send_verification_email
-        send_verification_email(user.email, otp)
+        email_delivered = bool(send_verification_email(user.email, otp))
     except Exception as exc:
         import logging
         logging.getLogger("main").warning(f"Failed to dispatch verification email: {exc}")
@@ -268,8 +269,8 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
         },
         "api_key": api_key,
         "api_secret": api_secret,
-        "dev_otp": otp if not has_mailer else None,
-        "mailer_active": has_mailer,
+        "dev_otp": None if email_delivered else otp,
+        "mailer_active": email_delivered or has_mailer,
         "message": "Account registered. Please enter the 6-digit verification OTP sent to your email.",
     }
 

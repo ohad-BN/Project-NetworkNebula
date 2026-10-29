@@ -18,7 +18,11 @@ from typing import Optional
 import dotenv
 import requests
 
-logger = logging.getLogger("email_service")
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 
 def get_resend_api_key() -> Optional[str]:
@@ -115,14 +119,23 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
             )
             if resp.status_code in [200, 201]:
                 logger.info(f"[RESEND] Verification email sent to {email} (ID: {resp.json().get('id')})")
-                print(f"  ✅ [RESEND API] Live email delivered to {email}!")
+                try:
+                    print(f"  ✅ [RESEND API] Live email delivered to {email}!")
+                except Exception:
+                    print(f"  [RESEND API] Live email delivered to {email}!")
                 return True
             else:
                 logger.warning(f"[RESEND] Failed status {resp.status_code}: {resp.text}")
-                print(f"  ⚠️ [RESEND API Warning] Status {resp.status_code}: {resp.text}")
+                try:
+                    print(f"  ⚠️ [RESEND API Warning] Status {resp.status_code}: {resp.text}")
+                except Exception:
+                    print(f"  [RESEND API Warning] Status {resp.status_code}")
         except Exception as e:
             logger.error(f"[RESEND] Error sending verification email: {e}")
-            print(f"  ❌ [RESEND API Error] {e}")
+            try:
+                print(f"  ❌ [RESEND API Error] {e}")
+            except Exception:
+                print(f"  [RESEND API Error] {e}")
 
     # 2. Try SMTP if configured
     if smtp_host and smtp_user and smtp_password:
@@ -139,19 +152,25 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
                 server.login(smtp_user, smtp_password)
                 server.sendmail(smtp_from, [email], msg.as_string())
             logger.info(f"[SMTP] Verification email sent to {email}")
-            print(f"  ✅ [SMTP] Live email delivered to {email}!")
+            try:
+                print(f"  ✅ [SMTP] Live email delivered to {email}!")
+            except Exception:
+                print(f"  [SMTP] Live email delivered to {email}!")
             return True
         except Exception as e:
             logger.error(f"[SMTP] Error sending email: {e}")
-            print(f"  ❌ [SMTP Error] {e}")
+            try:
+                print(f"  ❌ [SMTP Error] {e}")
+            except Exception:
+                print(f"  [SMTP Error] {e}")
 
     # 3. Development / Local Fallback Mode (Console Output)
     print("\n" + "=" * 76)
-    print(f"  ✉️  [NEBULA AUTH DISPATCH] VERIFICATION EMAIL (DEV SIMULATION)")
+    print(f"  [NEBULA AUTH DISPATCH] VERIFICATION EMAIL (DEV SIMULATION)")
     print("=" * 76)
     print(f"  Recipient          : {email}")
     print(f"  Verification Code  : {code}")
     print(f"  Validity           : 15 Minutes")
     print(f"  Alpha Grant        : +${initial_credits:.2f} Free Compute Credits")
     print("=" * 76 + "\n")
-    return True
+    return False

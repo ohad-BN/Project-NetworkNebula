@@ -21,8 +21,18 @@ class Settings(BaseSettings):
     SD_MODEL_ID: str = "runwayml/stable-diffusion-v1-5"
     FAST_POC_MODE: bool = True
 
+    # Resend & Email
+    RESEND_API_KEY: str = ""
+    RESEND_FROM_EMAIL: str = "NetworkNebula <onboarding@resend.dev>"
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "noreply@networknebula.org"
+
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
