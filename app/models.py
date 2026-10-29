@@ -129,6 +129,7 @@ class Worker(Base):
     reputation_score = Column(Float, default=100.0)
     min_stake_required = Column(Float, default=50.0)
     slash_history = Column(Text, default="[]")
+    gpus_json = Column(Text, default="[]", nullable=True)
     region = Column(String(64), default="us-east", nullable=False)
     latency_ping_ms = Column(Float, default=15.0, nullable=False)
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())

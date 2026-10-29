@@ -15,8 +15,6 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Cpu,
-  DollarSign,
-  Radio,
   Sliders,
   Copy,
   Check,
@@ -27,8 +25,6 @@ import {
   Trash2,
   Laptop,
   Monitor,
-  Server,
-  Globe,
 } from "lucide-react";
 import {
   workersService,
@@ -41,9 +37,7 @@ export function WorkerDashboardPage() {
   const { apiKey: storeApiKey } = useAuthStore();
   const apiKey = storeApiKey || localStorage.getItem("api_key") || "YOUR_API_KEY";
 
-  const [activeTab, setActiveTab] = useState<"my_fleet" | "global_mesh">("my_fleet");
   const [myNodes, setMyNodes] = useState<ClusterNodeTelemetry[]>([]);
-  const [globalNodes, setGlobalNodes] = useState<ClusterNodeTelemetry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isUpdating, setIsUpdating] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
@@ -52,16 +46,9 @@ export function WorkerDashboardPage() {
 
   const loadWorkerData = useCallback(async () => {
     try {
-      // 1. Load user's private fleet
       const userFleet = await workersService.getUserWorkers();
       const userNodes = userFleet.nodes || [];
       setMyNodes(userNodes);
-
-      // 2. Load global cluster telemetry
-      const globalFleet = await workersService.getClusterTelemetry();
-      const allClusterNodes = globalFleet.nodes || [];
-      setGlobalNodes(allClusterNodes);
-
       setLastHeartbeat(new Date());
     } catch (err) {
       console.error("Failed to load worker telemetry:", err);
@@ -76,28 +63,45 @@ export function WorkerDashboardPage() {
     return () => clearInterval(interval);
   }, [loadWorkerData]);
 
-  // Handle remote slider adjustment for a specific machine
-  const handleSliderChange = async (targetWorkerId: string, newPct: number) => {
+  // Handle remote slider adjustment for a specific GPU on a specific machine
+  const handleSliderChange = async (targetWorkerId: string, newPct: number, gpuIndex?: number) => {
     // Optimistic update
     setMyNodes((prev) =>
-      prev.map((n) =>
-        (n.node_id === targetWorkerId || n.id === targetWorkerId)
-          ? {
-              ...n,
-              vram_allocation_pct: newPct,
-              vram_allocated_gb: Number(((n.vram_total_gb * newPct) / 100).toFixed(2)),
+      prev.map((n) => {
+        if (n.node_id === targetWorkerId || n.id === targetWorkerId) {
+          const updatedGpus = (n.gpus || []).map((g, idx) => {
+            if (gpuIndex === undefined || g.index === gpuIndex || idx === gpuIndex) {
+              return {
+                ...g,
+                vram_allocation_pct: newPct,
+                vram_allocated_gb: Number(((g.vram_total_gb * newPct) / 100).toFixed(2)),
+              };
             }
-          : n
-      )
+            return g;
+          });
+          const totalAlloc = updatedGpus.length > 0
+            ? updatedGpus.reduce((acc, g) => acc + g.vram_allocated_gb, 0)
+            : Number(((n.vram_total_gb * newPct) / 100).toFixed(2));
+
+          return {
+            ...n,
+            vram_allocation_pct: newPct,
+            vram_allocated_gb: Number(totalAlloc.toFixed(2)),
+            gpus: updatedGpus.length > 0 ? updatedGpus : n.gpus,
+          };
+        }
+        return n;
+      })
     );
 
     try {
       setIsUpdating(true);
-      const res = await workersService.updateConfig(targetWorkerId, {
+      await workersService.updateConfig(targetWorkerId, {
         vram_allocation_pct: newPct,
+        gpu_index: gpuIndex,
       });
       toast.success(
-        `Adjusted ${targetWorkerId} to ${newPct}% (${res.vram_allocated_gb} GB VRAM allocated)`
+        `Adjusted ${targetWorkerId}${gpuIndex !== undefined ? ` (GPU ${gpuIndex})` : ""} to ${newPct}% VRAM`
       );
     } catch (err) {
       console.error("Failed to update contribution slider:", err);
@@ -115,10 +119,10 @@ export function WorkerDashboardPage() {
       await workersService.updateConfig(targetWorkerId, {
         is_available: !currentAvailable,
       });
-      toast.success(currentAvailable ? "Worker paused (offline for compute)" : "Worker resumed & accepting compute jobs");
+      toast.success(currentAvailable ? "Machine paused (offline for compute)" : "Machine resumed & accepting compute jobs");
       await loadWorkerData();
     } catch {
-      toast.error("Failed to update node status");
+      toast.error("Failed to update machine status");
     } finally {
       setIsUpdating(false);
     }
@@ -126,13 +130,13 @@ export function WorkerDashboardPage() {
 
   // Handle Deregister
   const handleDeregister = async (targetWorkerId: string) => {
-    if (!confirm(`Are you sure you want to remove worker node '${targetWorkerId}' from your account?`)) return;
+    if (!confirm(`Are you sure you want to remove machine '${targetWorkerId}' from your account?`)) return;
     try {
       await workersService.deregister(targetWorkerId);
-      toast.success("Worker node removed");
+      toast.success("Machine removed from fleet");
       await loadWorkerData();
     } catch {
-      toast.error("Failed to remove worker node");
+      toast.error("Failed to remove machine");
     }
   };
 
@@ -149,6 +153,7 @@ export function WorkerDashboardPage() {
   const totalUserEarnings = myNodes.reduce((acc, n) => acc + (n.total_earnings_usd || 0), 0);
   const activeNodesCount = myNodes.filter((n) => n.status === "online" && n.is_available).length;
   const combinedHourlyRate = myNodes.reduce((acc, n) => acc + (n.hourly_rate_usd || 0.45), 0);
+  const totalGpusCount = myNodes.reduce((acc, n) => acc + (n.gpus?.length || 1), 0);
 
   // Connection commands
   const originUrl = window.location.origin.includes("localhost:5173")
@@ -170,14 +175,14 @@ export function WorkerDashboardPage() {
             <div className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" />
               <span className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
-                Decentralized Compute Host Portal
+                Host Provider Console
               </span>
             </div>
             <h1 className="text-3xl font-extrabold tracking-tight mt-1">
-              GPU Fleet & Host Provider Console
+              GPU Fleet & Host Provider Dashboard
             </h1>
             <p className="text-sm text-muted-foreground mt-0.5">
-              Contribute GPU compute from your Windows PCs, Apple Silicon Macs, or cloud rigs to earn compute credits & USDC.
+              Contribute GPU compute from your physical workstations, Apple Silicon Macs, or multi-GPU rigs to earn compute credits & USDC.
             </p>
           </div>
 
@@ -204,14 +209,14 @@ export function WorkerDashboardPage() {
                   Connect Machine / Add GPU
                 </Button>
               </DialogTrigger>
-              <DialogContent className="sm:max-w-2xl w-full bg-[#181920] border-[#2e303a] p-6 shadow-2xl overflow-hidden text-card-foreground">
-                <DialogHeader className="space-y-1.5">
-                  <DialogTitle className="flex items-center gap-2.5 text-xl font-bold">
+              <DialogContent className="w-[94vw] max-w-xl sm:max-w-2xl bg-[#181920] border-[#2e303a] p-5 sm:p-6 shadow-2xl text-card-foreground">
+                <DialogHeader className="space-y-1.5 text-left">
+                  <DialogTitle className="flex items-center gap-2.5 text-lg sm:text-xl font-bold">
                     <Cpu className="h-5 w-5 text-emerald-400" />
                     Connect GPU Hardware to Your Fleet
                   </DialogTitle>
                   <DialogDescription className="text-xs text-muted-foreground leading-relaxed">
-                    Launch the lightweight agent on any Windows PC, Apple Silicon Mac, or Linux machine.
+                    Launch the lightweight agent on any Windows PC, Apple Silicon Mac, or Linux server.
                     It links automatically to your account and appears in your dashboard in real time.
                   </DialogDescription>
                 </DialogHeader>
@@ -247,28 +252,32 @@ export function WorkerDashboardPage() {
                         <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Pre-authenticated</span>
                       </div>
 
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-xs border border-slate-800 gap-3 min-w-0 overflow-hidden">
-                        <span className="truncate select-all min-w-0 flex-1 text-emerald-400 font-mono text-[11px]">
+                      {/* Non-bursting wrapping code container */}
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-2">
+                        <div className="flex items-center justify-between text-[11px] text-muted-foreground pb-1 border-b border-slate-800/80">
+                          <span className="font-mono text-emerald-400">PowerShell 1-Click</span>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-xs gap-1.5 font-sans text-slate-300 hover:text-white"
+                            onClick={() => copyToClipboard(powershellBootstrapper, "ps-boot")}
+                          >
+                            {copiedCmd === "ps-boot" ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                            <span>{copiedCmd === "ps-boot" ? "Copied!" : "Copy Command"}</span>
+                          </Button>
+                        </div>
+                        <pre className="font-mono text-xs text-emerald-400 whitespace-pre-wrap break-all select-all leading-relaxed m-0 p-0">
                           {powershellBootstrapper}
-                        </span>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="h-7 px-2.5 text-xs shrink-0 gap-1.5 font-sans font-medium"
-                          onClick={() => copyToClipboard(powershellBootstrapper, "ps-boot")}
-                        >
-                          {copiedCmd === "ps-boot" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                          <span>{copiedCmd === "ps-boot" ? "Copied" : "Copy"}</span>
-                        </Button>
+                        </pre>
                       </div>
                     </div>
 
                     <div className="pt-2 border-t space-y-1.5">
-                      <span className="text-muted-foreground text-[11px] block">Or if already inside the project directory:</span>
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2 rounded-lg font-mono text-[11px] border border-slate-800 gap-3 min-w-0 overflow-hidden">
-                        <span className="truncate select-all min-w-0 flex-1 text-slate-300">
+                      <span className="text-muted-foreground text-[11px] block">Or if already inside this project repository directory:</span>
+                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between gap-2">
+                        <code className="font-mono text-[11px] text-slate-300 whitespace-pre-wrap break-all flex-1 select-all">
                           {powershellLocalCmd}
-                        </span>
+                        </code>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -302,28 +311,32 @@ export function WorkerDashboardPage() {
                         <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Pre-authenticated</span>
                       </div>
 
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-xs border border-slate-800 gap-3 min-w-0 overflow-hidden">
-                        <span className="truncate select-all min-w-0 flex-1 text-emerald-400 font-mono text-[11px]">
+                      {/* Non-bursting wrapping code container */}
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-2">
+                        <div className="flex items-center justify-between text-[11px] text-muted-foreground pb-1 border-b border-slate-800/80">
+                          <span className="font-mono text-emerald-400">Bash 1-Click</span>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-xs gap-1.5 font-sans text-slate-300 hover:text-white"
+                            onClick={() => copyToClipboard(bashBootstrapper, "sh-boot")}
+                          >
+                            {copiedCmd === "sh-boot" ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                            <span>{copiedCmd === "sh-boot" ? "Copied!" : "Copy Command"}</span>
+                          </Button>
+                        </div>
+                        <pre className="font-mono text-xs text-emerald-400 whitespace-pre-wrap break-all select-all leading-relaxed m-0 p-0">
                           {bashBootstrapper}
-                        </span>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="h-7 px-2.5 text-xs shrink-0 gap-1.5 font-sans font-medium"
-                          onClick={() => copyToClipboard(bashBootstrapper, "sh-boot")}
-                        >
-                          {copiedCmd === "sh-boot" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                          <span>{copiedCmd === "sh-boot" ? "Copied" : "Copy"}</span>
-                        </Button>
+                        </pre>
                       </div>
                     </div>
 
                     <div className="pt-2 border-t space-y-1.5">
-                      <span className="text-muted-foreground text-[11px] block">Or if already inside the project directory:</span>
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2 rounded-lg font-mono text-[11px] border border-slate-800 gap-3 min-w-0 overflow-hidden">
-                        <span className="truncate select-all min-w-0 flex-1 text-slate-300">
+                      <span className="text-muted-foreground text-[11px] block">Or if already inside this project repository directory:</span>
+                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between gap-2">
+                        <code className="font-mono text-[11px] text-slate-300 whitespace-pre-wrap break-all flex-1 select-all">
                           {bashLocalCmd}
-                        </span>
+                        </code>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -341,376 +354,260 @@ export function WorkerDashboardPage() {
           </div>
         </div>
 
-        {/* View Switcher: My Connected Machines vs Global Network Mesh */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/80 pb-3">
-          <div className="flex items-center gap-2 bg-muted/60 p-1 rounded-lg border text-xs font-medium">
-            <button
-              onClick={() => setActiveTab("my_fleet")}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-all ${
-                activeTab === "my_fleet"
-                  ? "bg-background text-foreground shadow-sm font-semibold border border-emerald-500/30 text-emerald-400"
-                  : "text-muted-foreground hover:text-foreground hover:bg-background/40"
-              }`}
-            >
-              <Server className="h-3.5 w-3.5" />
-              <span>My Connected Machines ({myNodes.length})</span>
-            </button>
-            <button
-              onClick={() => setActiveTab("global_mesh")}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-all ${
-                activeTab === "global_mesh"
-                  ? "bg-background text-foreground shadow-sm font-semibold border border-primary/30 text-primary"
-                  : "text-muted-foreground hover:text-foreground hover:bg-background/40"
-              }`}
-            >
-              <Radio className="h-3.5 w-3.5" />
-              <span>Global Network Mesh ({globalNodes.length})</span>
-            </button>
-          </div>
+        {/* Fleet Metrics Strip */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <Card>
+            <CardHeader className="p-4 sm:p-5 pb-2">
+              <CardDescription className="text-xs">Connected Systems</CardDescription>
+              <CardTitle className="text-2xl font-bold flex items-center justify-between">
+                <span>{myNodes.length}</span>
+                <Badge variant="outline" className="text-emerald-400 border-emerald-500/30 font-mono text-[10px]">
+                  {activeNodesCount} Online
+                </Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
+              Host machines
+            </CardContent>
+          </Card>
 
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            {activeTab === "my_fleet" ? (
-              <span className="text-[11px] text-muted-foreground hidden md:inline">
-                Your personal hardware pool • Any PC or Mac you connect appears here
-              </span>
-            ) : (
-              <span className="text-[11px] text-muted-foreground hidden md:inline">
-                Entire public network • All community host nodes across the globe
-              </span>
-            )}
-            {lastHeartbeat && (
-              <span className="font-mono text-[10px] text-muted-foreground border-l pl-3 hidden sm:inline">
-                Synced {lastHeartbeat.toLocaleTimeString()}
-              </span>
-            )}
-          </div>
+          <Card>
+            <CardHeader className="p-4 sm:p-5 pb-2">
+              <CardDescription className="text-xs">Physical GPUs</CardDescription>
+              <CardTitle className="text-2xl font-bold font-mono text-primary flex items-center justify-between">
+                <span>{totalGpusCount}</span>
+                <Badge variant="outline" className="text-primary border-primary/30 font-mono text-[10px]">
+                  {totalGpusCount} Active
+                </Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
+              GPU compute accelerators
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="p-4 sm:p-5 pb-2">
+              <CardDescription className="text-xs">Contributed VRAM</CardDescription>
+              <CardTitle className="text-2xl font-bold text-primary font-mono">
+                {allocatedUserVram.toFixed(1)} <span className="text-sm font-normal text-muted-foreground">/ {totalUserVram.toFixed(1)} GB</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
+              Active allocation ceiling
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="p-4 sm:p-5 pb-2">
+              <CardDescription className="text-xs">Fleet Hourly Rate</CardDescription>
+              <CardTitle className="text-2xl font-bold font-mono">
+                ${combinedHourlyRate.toFixed(2)}
+                <span className="text-xs font-normal text-muted-foreground">/hr</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
+              Combined compute revenue
+            </CardContent>
+          </Card>
+
+          <Card className="col-span-2 md:col-span-1">
+            <CardHeader className="p-4 sm:p-5 pb-2">
+              <CardDescription className="text-xs">Total Accrued Earnings</CardDescription>
+              <CardTitle className="text-2xl font-bold font-mono text-emerald-400">
+                ${totalUserEarnings.toFixed(4)}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground flex justify-between items-center">
+              <span>SLA balance</span>
+              <Link to="/wallet" className="text-emerald-400 hover:underline">Wallet</Link>
+            </CardContent>
+          </Card>
         </div>
 
-        {/* TAB 1: MY HARDWARE FLEET */}
-        {activeTab === "my_fleet" && (
-          <div className="space-y-6">
-            
-            {/* Top Metric Strip */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <Card>
-                <CardHeader className="p-4 sm:p-5 pb-2">
-                  <CardDescription className="text-xs">Connected Machines</CardDescription>
-                  <CardTitle className="text-2xl font-bold flex items-center justify-between">
-                    <span>{myNodes.length}</span>
-                    <Badge variant="outline" className="text-emerald-400 border-emerald-500/30 font-mono text-[10px]">
-                      {activeNodesCount} Online
-                    </Badge>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
-                  Linked to your account
-                </CardContent>
-              </Card>
+        {/* Section Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 border-b border-border/80 pb-3">
+          <div>
+            <h2 className="text-base font-bold flex items-center gap-2">
+              <Laptop className="h-4 w-4 text-emerald-400" />
+              Connected Compute Systems ({myNodes.length})
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Each system groups its hardware and GPU cards. Manage VRAM allocation per GPU card remotely.
+            </p>
+          </div>
+          {lastHeartbeat && (
+            <span className="font-mono text-[10px] text-muted-foreground">
+              Telemetry synced {lastHeartbeat.toLocaleTimeString()}
+            </span>
+          )}
+        </div>
 
-              <Card>
-                <CardHeader className="p-4 sm:p-5 pb-2">
-                  <CardDescription className="text-xs">Contributed VRAM</CardDescription>
-                  <CardTitle className="text-2xl font-bold text-primary font-mono">
-                    {allocatedUserVram.toFixed(1)} <span className="text-sm font-normal text-muted-foreground">/ {totalUserVram.toFixed(1)} GB</span>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
-                  Active allocation ceiling
-                </CardContent>
-              </Card>
+        {/* EMPTY STATE */}
+        {myNodes.length === 0 && !isLoading && (
+          <Card className="border-dashed border-2 py-12 text-center">
+            <CardContent className="flex flex-col items-center justify-center max-w-md mx-auto space-y-4">
+              <div className="h-16 w-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 mb-2">
+                <Cpu className="h-8 w-8" />
+              </div>
+              <h3 className="text-lg font-bold">No Physical GPUs Connected Yet</h3>
+              <p className="text-xs text-muted-foreground">
+                Click <strong>"Connect Machine / Add GPU"</strong> above to launch the lightweight agent on your Windows PC, Mac, or server.
+              </p>
+            </CardContent>
+          </Card>
+        )}
 
-              <Card>
-                <CardHeader className="p-4 sm:p-5 pb-2">
-                  <CardDescription className="text-xs">Fleet Hourly Rate</CardDescription>
-                  <CardTitle className="text-2xl font-bold font-mono">
-                    ${combinedHourlyRate.toFixed(2)}
-                    <span className="text-xs font-normal text-muted-foreground">/hr</span>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
-                  Combined compute revenue
-                </CardContent>
-              </Card>
+        {/* HIERARCHICAL SYSTEM & MULTI-GPU CARDS */}
+        <div className="space-y-6">
+          {myNodes.map((w) => {
+            const isOnline = w.status === "online" && w.is_available;
+            const systemGpus = w.gpus && w.gpus.length > 0
+              ? w.gpus
+              : [{
+                  index: 0,
+                  name: w.gpu_model || "GPU Accelerator",
+                  vram_total_gb: w.gpu_memory_gb || w.vram_total_gb || 8.0,
+                  vram_allocated_gb: w.vram_allocated_gb || 6.4,
+                  vram_used_gb: w.vram_used_gb || 0.95,
+                  vram_allocation_pct: w.vram_allocation_pct || 80,
+                  gpu_utilization_pct: w.gpu_utilization_pct || 11.9,
+                  status: w.status,
+                  is_available: w.is_available,
+                }];
 
-              <Card>
-                <CardHeader className="p-4 sm:p-5 pb-2">
-                  <CardDescription className="text-xs">Total Accrued Earnings</CardDescription>
-                  <CardTitle className="text-2xl font-bold font-mono text-emerald-400">
-                    ${totalUserEarnings.toFixed(4)}
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground flex justify-between items-center">
-                  <span>SLA credited balance</span>
-                  <Link to="/wallet" className="text-emerald-400 hover:underline">Wallet</Link>
-                </CardContent>
-              </Card>
-            </div>
+            return (
+              <Card key={w.node_id || w.id} className="border-border/80 bg-card/80 backdrop-blur-sm relative overflow-hidden shadow-sm">
+                {/* Status accent bar */}
+                <div className={`h-1.5 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
 
-            {/* EMPTY STATE (If 0 machines connected) */}
-            {myNodes.length === 0 && (
-              <Card className="border-dashed border-2 py-12 text-center">
-                <CardContent className="flex flex-col items-center justify-center max-w-md mx-auto space-y-4">
-                  <div className="h-16 w-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 mb-2">
-                    <Cpu className="h-8 w-8" />
+                {/* System Header */}
+                <CardHeader className="p-4 sm:p-5 pb-3 border-b bg-muted/20">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2.5">
+                        <span className={`h-3 w-3 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
+                        <CardTitle className="text-lg font-bold text-foreground">
+                          {w.system_name || w.name}
+                        </CardTitle>
+                        <Badge variant="outline" className="font-mono text-[10px] uppercase">
+                          {systemGpus.length} GPU{systemGpus.length === 1 ? "" : "s"}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground font-mono">
+                        Node ID: {w.node_id || w.id} • {w.cpu_cores} CPU Cores • {w.memory_gb} GB System RAM • {w.cuda_version || "Metal / MPS"} • {w.region || "us-east"} ({w.latency_ping_ms ?? 12.0}ms)
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      <Badge variant={isOnline ? "default" : "secondary"} className={isOnline ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-xs" : "text-xs"}>
+                        {isOnline ? "Online • Active" : "Paused • Offline"}
+                      </Badge>
+
+                      {/* Remote Pause / Resume Toggle */}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 w-8 p-0"
+                        title={isOnline ? "Pause System (Stop receiving tasks)" : "Resume System (Start accepting tasks)"}
+                        onClick={() => handleToggleAvailability(w.node_id || w.id, w.is_available)}
+                        disabled={isUpdating}
+                      >
+                        {isOnline ? <Pause className="h-4 w-4 text-amber-400" /> : <Play className="h-4 w-4 text-emerald-400" />}
+                      </Button>
+
+                      {/* Deregister Node */}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                        title="Remove / Unlink Machine"
+                        onClick={() => handleDeregister(w.node_id || w.id)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
                   </div>
-                  <div className="space-y-1.5">
-                    <h3 className="text-lg font-bold">No GPU Hardware Connected Yet</h3>
-                    <p className="text-xs text-muted-foreground leading-relaxed">
-                      Connect your Windows desktop, gaming laptop, or Apple Silicon Mac to begin contributing compute to the network and earning rewards.
-                    </p>
+                </CardHeader>
+
+                {/* Individual GPU Cards Section */}
+                <CardContent className="p-4 sm:p-5 space-y-4">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span className="font-semibold uppercase tracking-wider text-[11px] text-foreground flex items-center gap-1.5">
+                      <Cpu className="h-3.5 w-3.5 text-primary" />
+                      Installed GPU Accelerators & VRAM Allocation Controls
+                    </span>
+                    <span className="font-mono text-[11px]">
+                      Combined Rate: ${(w.hourly_rate_usd || 0.45).toFixed(2)}/hr • Accrued: ${(w.total_earnings_usd || 0).toFixed(4)}
+                    </span>
                   </div>
-                  <Button
-                    onClick={() => setIsConnectModalOpen(true)}
-                    className="gap-2 bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-semibold text-xs shadow-md"
-                  >
-                    <Plus className="h-4 w-4" />
-                    Connect Your First Machine
-                  </Button>
-                </CardContent>
-              </Card>
-            )}
 
-            {/* GRID OF INDIVIDUAL CONNECTED MACHINES */}
-            {myNodes.length > 0 && (
-              <div className="space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-                  <div>
-                    <h2 className="text-base font-bold flex items-center gap-2">
-                      <Laptop className="h-4 w-4 text-emerald-400" />
-                      Active Physical Hardware Nodes
-                    </h2>
-                    <p className="text-xs text-muted-foreground">
-                      All computers and GPUs linked to your account. Control settings remotely from any device.
-                    </p>
-                  </div>
-                  <span className="text-xs text-muted-foreground font-mono">
-                    {myNodes.length} machine{myNodes.length === 1 ? "" : "s"} configured
-                  </span>
-                </div>
+                  <div className={`grid grid-cols-1 ${systemGpus.length > 1 ? "md:grid-cols-2" : "grid-cols-1"} gap-4`}>
+                    {systemGpus.map((gpu) => {
+                      const vramAlloc = gpu.vram_allocated_gb || (gpu.vram_total_gb * (gpu.vram_allocation_pct || 80)) / 100;
 
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  {myNodes.map((w) => {
-                    const isOnline = w.status === "online" && w.is_available;
-                    const vramAlloc = w.vram_allocated_gb || ((w.gpu_memory_gb || 8.0) * (w.vram_allocation_pct || 80)) / 100;
-                    const vramTotal = w.gpu_memory_gb || w.vram_total_gb || 8.0;
-
-                    return (
-                      <Card key={w.node_id || w.id} className="border-border/80 bg-card/70 backdrop-blur-sm relative overflow-hidden">
-                        {/* Top highlight bar based on status */}
-                        <div className={`h-1 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
-
-                        <CardHeader className="pb-3">
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="space-y-1 min-w-0">
+                      return (
+                        <div
+                          key={`gpu-${gpu.index}`}
+                          className="bg-muted/30 border rounded-lg p-4 space-y-3.5"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
                               <div className="flex items-center gap-2">
-                                <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
-                                <CardTitle className="text-base font-bold text-foreground">
-                                  {w.name || w.gpu_model}
-                                </CardTitle>
+                                <Badge className="bg-primary/20 text-primary border-primary/30 text-[10px] font-mono">
+                                  GPU {gpu.index}
+                                </Badge>
+                                <span className="font-bold text-sm text-foreground">
+                                  {gpu.name}
+                                </span>
                               </div>
-                              <p className="text-xs text-muted-foreground font-mono">
-                                Node ID: {w.node_id || w.id}
-                              </p>
+                              <span className="text-[11px] text-muted-foreground font-mono mt-0.5 block">
+                                {gpu.gpu_utilization_pct || 10}% utilization • {gpu.vram_total_gb} GB Total VRAM
+                              </span>
                             </div>
 
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              <Badge variant={isOnline ? "default" : "secondary"} className={isOnline ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]" : "text-[10px]"}>
-                                {isOnline ? "Online • Active" : "Paused • Offline"}
-                              </Badge>
-
-                              {/* Remote Pause / Resume Toggle */}
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-7 w-7 p-0"
-                                title={isOnline ? "Pause Node (Stop receiving tasks)" : "Resume Node (Start accepting tasks)"}
-                                onClick={() => handleToggleAvailability(w.node_id || w.id, w.is_available)}
-                                disabled={isUpdating}
-                              >
-                                {isOnline ? <Pause className="h-3.5 w-3.5 text-amber-400" /> : <Play className="h-3.5 w-3.5 text-emerald-400" />}
-                              </Button>
-
-                              {/* Deregister Node */}
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
-                                title="Remove / Unlink Machine"
-                                onClick={() => handleDeregister(w.node_id || w.id)}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          </div>
-                        </CardHeader>
-
-                        <CardContent className="space-y-4">
-                          {/* Hardware Specs Grid - 2x2 spacious responsive layout */}
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs bg-muted/30 p-3.5 rounded-lg border font-mono">
-                            <div className="space-y-0.5">
-                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
-                                GPU Accelerator
-                              </span>
-                              <span className="font-semibold text-foreground flex items-center gap-1.5">
-                                <Cpu className="h-3.5 w-3.5 text-primary shrink-0" />
-                                {w.gpu_model || w.gpu_info}
-                              </span>
-                            </div>
-                            <div className="space-y-0.5">
-                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
-                                CUDA / Framework
-                              </span>
-                              <span className="font-semibold text-foreground">
-                                {w.cuda_version || "Metal / MPS"}
-                              </span>
-                            </div>
-                            <div className="space-y-0.5">
-                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
-                                CPU & System RAM
-                              </span>
-                              <span className="font-semibold text-foreground">
-                                {w.cpu_cores} Cores • {w.memory_gb} GB RAM
-                              </span>
-                            </div>
-                            <div className="space-y-0.5">
-                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
-                                Region & Ping Latency
-                              </span>
-                              <span className="font-semibold text-foreground flex items-center gap-1.5">
-                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
-                                {w.region || "us-east"} • {w.latency_ping_ms ?? 12.0}ms
-                              </span>
-                            </div>
+                            <span className="font-mono font-bold text-sm text-primary">
+                              {gpu.vram_allocation_pct || 80}%
+                            </span>
                           </div>
 
-                          {/* Remote VRAM Allocation Slider */}
-                          <div className="space-y-2 pt-1">
+                          {/* Dedicated Slider per GPU */}
+                          <div className="space-y-1.5 pt-1">
                             <div className="flex items-center justify-between text-xs">
-                              <span className="font-medium text-foreground flex items-center gap-1.5">
-                                <Sliders className="h-3.5 w-3.5 text-primary" />
-                                Remote VRAM Contribution Ceiling
+                              <span className="text-muted-foreground flex items-center gap-1 text-[11px]">
+                                <Sliders className="h-3 w-3 text-primary" />
+                                VRAM Allocation Ceiling
                               </span>
-                              <span className="font-mono font-bold text-primary">
-                                {w.vram_allocation_pct || 80}% ({vramAlloc.toFixed(1)} / {vramTotal.toFixed(1)} GB)
+                              <span className="font-mono text-xs font-semibold text-foreground">
+                                {vramAlloc.toFixed(1)} / {gpu.vram_total_gb.toFixed(1)} GB
                               </span>
                             </div>
 
                             <Slider
-                              value={w.vram_allocation_pct || 80}
+                              value={gpu.vram_allocation_pct || 80}
                               min={10}
                               max={100}
                               step={5}
                               disabled={isUpdating || !isOnline}
-                              onValueChange={(val) => handleSliderChange(w.node_id || w.id, val)}
+                              onValueChange={(val) => handleSliderChange(w.node_id || w.id, val, gpu.index)}
                             />
 
                             <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
-                              <span>10% (Low impact)</span>
+                              <span>10% (Low)</span>
                               <span>50% (Balanced)</span>
                               <span>100% (Dedicated)</span>
                             </div>
                           </div>
-
-                          {/* Machine Earnings & Telemetry footer */}
-                          <div className="flex items-center justify-between pt-2 border-t text-xs">
-                            <div className="flex items-center gap-2">
-                              <DollarSign className="h-4 w-4 text-emerald-400" />
-                              <span className="text-muted-foreground">Accrued:</span>
-                              <span className="font-mono font-bold text-emerald-400">
-                                ${(w.total_earnings_usd || 0).toFixed(4)}
-                              </span>
-                            </div>
-
-                            <div className="flex items-center gap-2 text-muted-foreground">
-                              <span>Rate:</span>
-                              <span className="font-mono font-semibold text-foreground">${(w.hourly_rate_usd || 0.45).toFixed(2)}/hr</span>
-                              <span>•</span>
-                              <span>Tasks:</span>
-                              <span className="font-mono font-semibold text-foreground">{w.total_tasks_completed || 0}</span>
-                            </div>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 2: GLOBAL NETWORK MESH (Cluster-Wide Telemetry) */}
-        {activeTab === "global_mesh" && (
-          <div className="space-y-6">
-            <div className="bg-primary/10 border border-primary/20 rounded-lg p-4 flex items-start gap-3">
-              <Globe className="h-5 w-5 text-primary shrink-0 mt-0.5" />
-              <div className="text-xs space-y-1">
-                <p className="font-semibold text-foreground text-sm">Public Decentralized Network Mesh</p>
-                <p className="text-muted-foreground leading-relaxed">
-                  This table displays all verified compute host nodes and peer shards operating across the entire decentralized NetworkNebula network (including public community hosts worldwide).
-                  To view and remotely manage <strong>your own connected computers & GPUs</strong>, switch to the <strong>"My Connected Machines"</strong> tab above.
-                </p>
-              </div>
-            </div>
-
-            <div className="border rounded-lg overflow-hidden bg-card">
-              <div className="p-4 bg-muted/40 border-b flex items-center justify-between">
-                <div>
-                  <h3 className="font-bold text-sm">Decentralized P2P Cluster Mesh Telemetry</h3>
-                  <p className="text-xs text-muted-foreground">Aggregated peer nodes actively providing compute across all geographic regions</p>
-                </div>
-                <Badge variant="outline" className="font-mono text-xs">
-                  {globalNodes.length} Verified Nodes
-                </Badge>
-              </div>
-
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs text-left">
-                  <thead className="bg-muted/60 text-muted-foreground border-b uppercase font-mono text-[10px]">
-                    <tr>
-                      <th className="p-3">Worker Node</th>
-                      <th className="p-3">Region & Latency</th>
-                      <th className="p-3">GPU Hardware</th>
-                      <th className="p-3">VRAM Ceiling</th>
-                      <th className="p-3">Rate</th>
-                      <th className="p-3">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-border">
-                    {globalNodes.map((n) => (
-                      <tr key={n.node_id || n.id} className="hover:bg-muted/20">
-                        <td className="p-3 font-semibold font-mono text-foreground">
-                          {n.name || n.node_id}
-                        </td>
-                        <td className="p-3 font-mono">
-                          {n.region || "us-east"} ({n.latency_ping_ms ?? 15.0}ms)
-                        </td>
-                        <td className="p-3">
-                          {n.gpu_model || n.gpu_info}
-                        </td>
-                        <td className="p-3 font-mono">
-                          {n.vram_allocated_gb?.toFixed(1) || ((n.gpu_memory_gb || 8) * 0.8).toFixed(1)} / {n.gpu_memory_gb || 8} GB ({n.vram_allocation_pct || 80}%)
-                        </td>
-                        <td className="p-3 font-mono text-emerald-400">
-                          ${(n.hourly_rate_usd || 0.45).toFixed(2)}/hr
-                        </td>
-                        <td className="p-3">
-                          <Badge variant="outline" className={n.status === "online" ? "text-emerald-400 border-emerald-500/30" : ""}>
-                            {n.status}
-                          </Badge>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
+                        </div>
+                      );
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
       </main>
     </div>
   );
 }
-
-export default WorkerDashboardPage;

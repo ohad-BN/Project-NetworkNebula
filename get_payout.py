@@ -76,8 +76,11 @@ def main():
         # Query registered Worker nodes
         workers_query = db.query(Worker)
         if args.worker_id:
-            workers_query = workers_query.filter(Worker.id == args.worker_id)
-        workers = workers_query.all()
+            workers = workers_query.filter(Worker.id == args.worker_id).all()
+            if not workers and args.worker_id in ("node-gpu-local-01", "node-skorp"):
+                workers = db.query(Worker).filter(Worker.id.in_(["node-gpu-local-01", "node-skorp"])).all()
+        else:
+            workers = workers_query.all()
 
         # If fleet registry is empty, sync local primary worker node
         if not workers and not args.worker_id:

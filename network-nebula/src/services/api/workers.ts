@@ -5,14 +5,29 @@ import type {
   HeartbeatResponse,
 } from "@/types";
 
+export interface GpuCardTelemetry {
+  index: number;
+  name: string;
+  vram_total_gb: number;
+  vram_allocated_gb: number;
+  vram_used_gb: number;
+  vram_allocation_pct: number;
+  gpu_utilization_pct: number;
+  status?: string;
+  is_available?: boolean;
+}
+
 export interface ClusterNodeTelemetry {
   id: string;
   node_id: string;
   worker_id: string;
   user_id: string | null;
   name: string;
+  system_name?: string;
   gpu_model: string;
   gpu_info: string;
+  gpu_count?: number;
+  gpus?: GpuCardTelemetry[];
   vram_total_gb: number;
   gpu_memory_gb: number;
   vram_allocated_gb: number;
@@ -120,6 +135,7 @@ export const workersService = {
     workerId: string,
     config: {
       vram_allocation_pct?: number;
+      gpu_index?: number;
       is_available?: boolean;
       hourly_rate_usd?: number;
     }

@@ -90,26 +90,48 @@ def discover_hardware() -> Dict[str, Any]:
     except Exception:
         pass
 
+    gpus_list = []
     try:
         import torch
 
         if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            total_gb = round(props.total_memory / (1024**3), 2)
-            alloc_gb = torch.cuda.memory_allocated(0) / (1024**3)
-            res_gb = torch.cuda.memory_reserved(0) / (1024**3)
-            used_gb = round(max(alloc_gb, res_gb, 0.95), 2)
+            dev_count = torch.cuda.device_count()
             pt_ver = torch.__version__.split("+")[0]
             cuda_ver = f"{torch.version.cuda or '12.8'} / PyTorch {pt_ver}"
-            util_pct = round(min(100.0, max(8.0, (used_gb / max(total_gb, 0.1)) * 100.0)), 1)
+
+            for i in range(dev_count):
+                props = torch.cuda.get_device_properties(i)
+                total_gb = round(props.total_memory / (1024**3), 2)
+                alloc_gb = torch.cuda.memory_allocated(i) / (1024**3)
+                res_gb = torch.cuda.memory_reserved(i) / (1024**3)
+                used_gb = round(max(alloc_gb, res_gb, 0.95), 2)
+                util_pct = round(min(100.0, max(8.0, (used_gb / max(total_gb, 0.1)) * 100.0)), 1)
+                gpus_list.append({
+                    "index": i,
+                    "name": torch.cuda.get_device_name(i),
+                    "vram_total_gb": total_gb,
+                    "vram_allocated_gb": round(total_gb * 0.8, 2),
+                    "vram_used_gb": used_gb,
+                    "vram_allocation_pct": 80,
+                    "gpu_utilization_pct": util_pct,
+                    "status": "online",
+                    "is_available": True,
+                })
+
+            primary_name = gpus_list[0]["name"]
+            gpu_display_name = primary_name if dev_count == 1 else f"{dev_count}x {primary_name}"
+            total_vram_all = round(sum(g["vram_total_gb"] for g in gpus_list), 2)
+            used_vram_all = round(sum(g["vram_used_gb"] for g in gpus_list), 2)
+
             hw.update(
                 {
-                    "gpu_model": torch.cuda.get_device_name(0),
-                    "gpu_memory_gb": total_gb,
-                    "vram_used_gb": used_gb,
-                    "gpu_utilization_pct": util_pct,
+                    "gpu_model": gpu_display_name,
+                    "gpu_memory_gb": total_vram_all,
+                    "vram_used_gb": used_vram_all,
+                    "gpu_utilization_pct": gpus_list[0]["gpu_utilization_pct"],
                     "cuda_version": cuda_ver,
                     "cuda_available": True,
+                    "gpus": gpus_list,
                 }
             )
         elif hasattr(torch, "backends") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -125,6 +147,17 @@ def discover_hardware() -> Dict[str, Any]:
             pt_ver = torch.__version__.split("+")[0]
             unified_vram = hw["memory_gb"]
             used_vram = round(unified_vram * 0.15, 2)
+            gpus_list.append({
+                "index": 0,
+                "name": f"{chip_name} (MPS Metal)",
+                "vram_total_gb": unified_vram,
+                "vram_allocated_gb": round(unified_vram * 0.8, 2),
+                "vram_used_gb": used_vram,
+                "vram_allocation_pct": 80,
+                "gpu_utilization_pct": 12.0,
+                "status": "online",
+                "is_available": True,
+            })
             hw.update(
                 {
                     "gpu_model": f"{chip_name} (MPS Metal)",
@@ -133,6 +166,7 @@ def discover_hardware() -> Dict[str, Any]:
                     "gpu_utilization_pct": 12.0,
                     "cuda_version": f"Apple Metal MPS / PyTorch {pt_ver}",
                     "cuda_available": True,
+                    "gpus": gpus_list,
                 }
             )
     except Exception:
@@ -152,10 +186,34 @@ def discover_hardware() -> Dict[str, Any]:
                         "gpu_utilization_pct": 8.0,
                         "cuda_version": "Apple Metal / macOS",
                         "cuda_available": True,
+                        "gpus": [{
+                            "index": 0,
+                            "name": f"{brand} (Unified Memory)",
+                            "vram_total_gb": hw["memory_gb"],
+                            "vram_allocated_gb": round(hw["memory_gb"] * 0.8, 2),
+                            "vram_used_gb": round(hw["memory_gb"] * 0.10, 2),
+                            "vram_allocation_pct": 80,
+                            "gpu_utilization_pct": 8.0,
+                            "status": "online",
+                            "is_available": True,
+                        }],
                     }
                 )
         except Exception:
             pass
+
+    if "gpus" not in hw:
+        hw["gpus"] = [{
+            "index": 0,
+            "name": hw.get("gpu_model", "CPU Accelerator"),
+            "vram_total_gb": hw.get("gpu_memory_gb", 8.0),
+            "vram_allocated_gb": round(hw.get("gpu_memory_gb", 8.0) * 0.8, 2),
+            "vram_used_gb": hw.get("vram_used_gb", 0.5),
+            "vram_allocation_pct": 80,
+            "gpu_utilization_pct": hw.get("gpu_utilization_pct", 10.0),
+            "status": "online",
+            "is_available": True,
+        }]
 
     return hw
 
@@ -269,6 +327,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         "role": args.role,
         "region": region,
         "latency_ping_ms": lat_ms,
+        "gpus": hw.get("gpus", []),
     }
 
     try:
@@ -296,6 +355,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         "status": "online",
         "region": region,
         "latency_ping_ms": lat_ms,
+        "gpus": hw.get("gpus", []),
     }
     try:
         hb_res = requests.post(

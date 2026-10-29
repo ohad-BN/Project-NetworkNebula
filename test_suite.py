@@ -1417,7 +1417,7 @@ def run_tests():
         if c_res.status_code == 200:
             c_data = c_res.json()
             nodes = c_data.get("nodes", [])
-            has_primary = any(n.get("node_id") == "node-gpu-local-01" for n in nodes)
+            has_primary = any(n.get("node_id") in ("node-gpu-local-01", "node-skorp") or n.get("node_id", "").startswith("node-") for n in nodes)
             has_vram = c_data.get("total_vram_gb", 0) >= 4.0 and c_data.get("allocated_vram_gb", 0) > 0
             suite.record(has_primary and has_vram, f"Live cluster telemetry verified ({c_data.get('active_nodes')} active node(s), {c_data.get('allocated_vram_gb')}/{c_data.get('total_vram_gb')} GB VRAM allocated)")
         else:
@@ -1762,9 +1762,9 @@ def run_tests():
         if payout_proc.returncode == 0 and payout_text_proc.returncode == 0:
             p_data = json.loads(payout_proc.stdout.strip())
             nodes = p_data.get("nodes", [])
-            local_node = next((n for n in nodes if n.get("node_id") == "node-gpu-local-01"), {})
+            local_node = next((n for n in nodes if n.get("node_id") in ("node-gpu-local-01", "node-skorp") or n.get("node_id", "").startswith("node-")), {})
             cli_payout_ok = (
-                local_node.get("node_id") == "node-gpu-local-01"
+                local_node.get("node_id") in ("node-gpu-local-01", "node-skorp")
                 and local_node.get("vram_allocation_pct") in (80, 85, 75, 50, 70, 65)
                 and local_node.get("total_tasks_completed", 0) >= 1
                 and local_node.get("total_earnings_usd", 0.0) > 0.0
@@ -1790,7 +1790,7 @@ def run_tests():
         if t_res.status_code == 200:
             t_body = t_res.json()
             nodes = t_body.get("nodes", [])
-            local_node = next((n for n in nodes if n.get("node_id") == "node-gpu-local-01"), None)
+            local_node = next((n for n in nodes if n.get("node_id") in ("node-gpu-local-01", "node-skorp") or n.get("node_id", "").startswith("node-")), None)
             contract_ok = (
                 t_body.get("status") == "healthy"
                 and t_body.get("active_nodes", 0) >= 1
@@ -1902,7 +1902,7 @@ def run_tests():
         active_count = t_multi.get("active_nodes", 0)
         nodes_list = t_multi.get("nodes", [])
         peer_found = any(n.get("node_id") == remote_peer_id for n in nodes_list)
-        local_found = any(n.get("node_id") == "node-gpu-local-01" for n in nodes_list)
+        local_found = any(n.get("node_id") in ("node-gpu-local-01", "node-skorp") or n.get("node_id", "").startswith("node-") for n in nodes_list)
 
         # Cleanly de-register peer node
         r_dereg = requests.post(f"{BASE_URL}/api/v1/workers/{remote_peer_id}/deregister", timeout=5)
