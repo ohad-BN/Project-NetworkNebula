@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Loader2, KeyRound, MailCheck, Sparkles, CheckCircle2 } from "lucide-react";
+import { Loader2, KeyRound, MailCheck, Sparkles, CheckCircle2, Info } from "lucide-react";
 
 export function RegisterPage() {
   const navigate = useNavigate();
@@ -27,6 +27,7 @@ export function RegisterPage() {
   const [verifyError, setVerifyError] = useState("");
   const [isVerifying, setIsVerifying] = useState(false);
   const [resendStatus, setResendStatus] = useState("");
+  const [devOtp, setDevOtp] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -48,6 +49,10 @@ export function RegisterPage() {
       if (res && res.is_verified) {
         navigate(role === "worker" ? "/worker" : "/");
       } else {
+        if (res?.dev_otp) {
+          setOtpCode(res.dev_otp);
+          setDevOtp(res.dev_otp);
+        }
         // Transition to 6-digit email OTP verification step
         setStep("verify");
       }
@@ -267,6 +272,17 @@ export function RegisterPage() {
 
             <form onSubmit={handleVerifyOtp}>
               <CardContent className="space-y-4">
+                {devOtp && (
+                  <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-start gap-2.5">
+                    <Info className="h-4 w-4 shrink-0 text-amber-400 mt-0.5" />
+                    <div>
+                      <span className="font-semibold text-amber-200">Local Dev Simulation Mode:</span> No external email provider configured in <code className="bg-black/40 px-1 py-0.5 rounded text-[11px] font-mono">.env</code>.
+                      <br />
+                      Your 6-digit OTP code is: <strong className="font-mono text-sm tracking-wider text-amber-100">{devOtp}</strong> (pre-filled).
+                    </div>
+                  </div>
+                )}
+
                 {verifySuccess ? (
                   <div className="p-4 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-center flex flex-col items-center gap-2">
                     <CheckCircle2 className="h-8 w-8 text-emerald-400 animate-bounce" />

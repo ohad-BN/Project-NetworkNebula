@@ -252,6 +252,9 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
         import logging
         logging.getLogger("main").warning(f"Failed to dispatch verification email: {exc}")
 
+    from app.email_service import RESEND_API_KEY, SMTP_USER
+    has_mailer = bool(RESEND_API_KEY or SMTP_USER)
+
     return {
         "user": {
             "id": user.id,
@@ -265,6 +268,8 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
         },
         "api_key": api_key,
         "api_secret": api_secret,
+        "dev_otp": otp if not has_mailer else None,
+        "mailer_active": has_mailer,
         "message": "Account registered. Please enter the 6-digit verification OTP sent to your email.",
     }
 

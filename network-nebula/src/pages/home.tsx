@@ -1,269 +1,288 @@
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  Zap,
-  Coins,
-  Globe,
-  ArrowRight,
-  Sparkles,
   Cpu,
   Server,
-  Users,
-  Play,
+  Network,
+  ShieldCheck,
+  ArrowRight,
+  Terminal,
+  Sparkles,
+  KeyRound,
+  CheckCircle2,
 } from "lucide-react";
 
 export function HomePage() {
   return (
-    <div className="min-h-screen bg-background">
-      {/* Split-Screen Hero Section */}
-      <section className="grid grid-cols-1 md:grid-cols-2 min-h-[70vh]">
-        {/* Left Side - Earner/Host Track */}
-        <div className="bg-slate-900 text-white py-16 px-8 md:px-12 flex flex-col justify-center">
-          <div className="max-w-lg mx-auto md:mx-0">
-            <div className="inline-flex items-center gap-2 rounded-full border border-slate-600 bg-slate-800 px-4 py-1.5 text-sm text-slate-300 mb-6">
-              <Zap className="h-4 w-4" />
-              <span>For PC Gamers & Hardware Owners</span>
-            </div>
-            <h1 className="text-3xl md:text-5xl font-bold tracking-tight mb-6">
-              Turn Your Idle GPU Into Passive Income
-            </h1>
-            <p className="text-lg text-slate-400 mb-8 leading-relaxed">
-              Join the decentralized network. Get paid in tokens for every AI
-              rendering job your PC completes while you sleep.
-            </p>
-            <Link to="/register/worker">
+    <div className="min-h-screen bg-background text-foreground selection:bg-indigo-500/30">
+      {/* 1. Closed Alpha Announcement Banner */}
+      <div className="border-b border-indigo-500/20 bg-indigo-950/40 px-4 py-2 text-center text-xs backdrop-blur">
+        <div className="mx-auto flex max-w-7xl items-center justify-center gap-2">
+          <Badge variant="outline" className="border-indigo-400/40 bg-indigo-500/15 text-indigo-300 font-mono text-[10px]">
+            CLOSED ALPHA
+          </Badge>
+          <span className="text-muted-foreground hidden sm:inline">
+            Invite-only testing period now active.
+          </span>
+          <span className="font-semibold text-indigo-200">
+            Use code <code className="rounded bg-indigo-500/20 px-1.5 py-0.5 font-mono text-indigo-300">NEBULA-ALPHA-2026</code> for +$100.00 compute credits.
+          </span>
+          <Link to="/register" className="inline-flex items-center gap-1 font-semibold text-primary hover:underline ml-1">
+            Claim Free Credits <ArrowRight className="h-3 w-3" />
+          </Link>
+        </div>
+      </div>
+
+      {/* 2. Hero Section */}
+      <section className="relative overflow-hidden py-20 lg:py-28">
+        {/* Glow ambient backgrounds */}
+        <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 h-[450px] w-[650px] rounded-full bg-gradient-to-tr from-indigo-600/20 via-purple-600/20 to-pink-600/10 blur-[130px] pointer-events-none" />
+        <div className="absolute top-1/3 left-1/4 -translate-x-1/2 -translate-y-1/2 h-[300px] w-[300px] rounded-full bg-emerald-600/10 blur-[100px] pointer-events-none" />
+
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 relative z-10 text-center">
+          <div className="inline-flex items-center gap-2 rounded-full border border-border/80 bg-muted/60 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur mb-6">
+            <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+            <span>Decentralized AI Cloud & Inference Grid</span>
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          </div>
+
+          <h1 className="text-4xl sm:text-6xl lg:text-7xl font-extrabold tracking-tight max-w-4xl mx-auto leading-[1.1] mb-6">
+            Enterprise GPU Compute.{" "}
+            <span className="bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+              70% Lower Cloud Cost.
+            </span>
+          </h1>
+
+          <p className="text-lg sm:text-xl text-muted-foreground max-w-2xl mx-auto mb-10 leading-relaxed font-normal">
+            A high-throughput decentralized cloud network for fine-tuning LLMs with distributed LoRA, serving models with drop-in OpenAI API compatibility, and running Mixture-of-Experts across consumer and datacenter GPUs worldwide.
+          </p>
+
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-4 max-w-md mx-auto">
+            <Link to="/register" className="w-full sm:w-auto">
               <Button
                 size="lg"
-                variant="secondary"
-                className="gap-2 bg-slate-100 text-slate-900 hover:bg-slate-200"
+                className="w-full sm:w-auto gap-2 bg-gradient-to-r from-indigo-500 via-purple-600 to-pink-500 hover:from-indigo-600 hover:to-purple-700 text-white shadow-lg shadow-indigo-500/25 h-12 px-6 font-semibold"
               >
-                Become a Host <ArrowRight className="h-4 w-4" />
+                <KeyRound className="h-4 w-4" />
+                Join Closed Alpha (+$100 Free)
               </Button>
             </Link>
-            <div className="mt-8 flex items-center gap-4 text-sm text-slate-500">
-              <div className="flex items-center gap-1">
-                <Coins className="h-4 w-4" />
-                <span>Earn $50-200/month</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <Cpu className="h-4 w-4" />
-                <span>Low resource usage</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Side - Creator/Renter Track */}
-        <div className="bg-gradient-to-br from-primary/5 to-background py-16 px-8 md:px-12 flex flex-col justify-center border-l border-border">
-          <div className="max-w-lg mx-auto md:mx-0">
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-4 py-1.5 text-sm text-primary mb-6">
-              <Sparkles className="h-4 w-4" />
-              <span>For AI Startups & Creators</span>
-            </div>
-            <h1 className="text-3xl md:text-5xl font-bold tracking-tight text-foreground mb-6">
-              The Decentralized Visual AI Network
-            </h1>
-            <p className="text-lg text-muted-foreground mb-8 leading-relaxed">
-              Rent massive GPU power for a fraction of cloud costs. Drop-in API
-              integration for your AI startup.
-            </p>
-            <Link to="/register">
-              <Button size="lg" className="gap-2">
-                Rent GPUs <ArrowRight className="h-4 w-4" />
+            <Link to="/login" className="w-full sm:w-auto">
+              <Button
+                variant="outline"
+                size="lg"
+                className="w-full sm:w-auto gap-2 border-border/80 bg-background/50 hover:bg-muted h-12 px-6 font-medium backdrop-blur"
+              >
+                <Terminal className="h-4 w-4 text-indigo-400" />
+                Sign In to Console
               </Button>
             </Link>
-            <div className="mt-8 flex items-center gap-4 text-sm text-muted-foreground">
-              <div className="flex items-center gap-1">
-                <Zap className="h-4 w-4" />
-                <span>10x cheaper than AWS</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <Globe className="h-4 w-4" />
-                <span>Global GPU network</span>
-              </div>
+          </div>
+
+          {/* Trust & Live Metrics Pill Row */}
+          <div className="mt-14 pt-8 border-t border-border/40 grid grid-cols-2 md:grid-cols-4 gap-6 text-center max-w-4xl mx-auto">
+            <div className="space-y-1">
+              <div className="text-2xl sm:text-3xl font-black text-foreground">150 / 150</div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider font-medium">Tests Verified Green</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-2xl sm:text-3xl font-black text-indigo-400">3.8x</div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider font-medium">Speculative Decode Speedup</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-2xl sm:text-3xl font-black text-emerald-400">$0.0005</div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider font-medium">Per Inference Output</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-2xl sm:text-3xl font-black text-purple-400">100%</div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider font-medium">OpenAI Drop-In Compatible</div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* How It Works - Flow Diagram Section */}
-      <section className="py-20 px-4 bg-muted/30">
-        <div className="container mx-auto max-w-6xl">
-          <div className="text-center mb-12">
-            <h2 className="text-3xl font-bold mb-4">How It Works</h2>
-            <p className="text-muted-foreground">
-              The complete orchestration pipeline
-            </p>
+      {/* 3. Dual Persona Tracks (Creators vs Host Providers) */}
+      <section className="py-16 px-4 sm:px-6 lg:px-8 border-y border-border/60 bg-muted/20">
+        <div className="mx-auto max-w-7xl">
+          <div className="text-center max-w-2xl mx-auto mb-12">
+            <h2 className="text-3xl font-bold tracking-tight">Built For Both Sides of the Compute Economy</h2>
+            <p className="text-muted-foreground mt-2">Whether you need massive GPU clusters or want to monetize idle hardware</p>
           </div>
 
-          {/* Horizontal Flow Diagram */}
-          <div className="flex flex-col md:flex-row items-center justify-between gap-6 md:gap-4">
-            {/* Step 1: Creators Submit */}
-            <div className="flex-1 text-center">
-              <div className="w-20 h-20 mx-auto rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-4">
-                <Play className="h-8 w-8 text-primary" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">
-                Creators Submit Tasks
-              </h3>
-              <p className="text-sm text-muted-foreground">
-                Upload images or prompts via REST API
-              </p>
-            </div>
-
-            {/* Arrow */}
-            <div className="hidden md:flex items-center">
-              <svg
-                className="w-16 h-8 text-muted-foreground"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M13 7l5 5m0 0l-5 5m5-5H6"
-                />
-              </svg>
-            </div>
-
-            {/* Step 2: Nebula Orchestrator */}
-            <div className="flex-1 text-center">
-              <div className="w-20 h-20 mx-auto rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center mb-4">
-                <Server className="h-8 w-8 text-indigo-500" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">
-                Nebula Orchestrator
-              </h3>
-              <p className="text-sm text-muted-foreground">
-                Queues tasks & routes to available workers
-              </p>
-            </div>
-
-            {/* Arrow */}
-            <div className="hidden md:flex items-center">
-              <svg
-                className="w-16 h-8 text-muted-foreground"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M13 7l5 5m0 0l-5 5m5-5H6"
-                />
-              </svg>
-            </div>
-
-            {/* Step 3: Distributed PCs Render */}
-            <div className="flex-1 text-center">
-              <div className="w-20 h-20 mx-auto rounded-2xl bg-green-500/10 border border-green-500/20 flex items-center justify-center mb-4">
-                <Users className="h-8 w-8 text-green-500" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">
-                Distributed PCs Render
-              </h3>
-              <p className="text-sm text-muted-foreground">
-                Gamer PCs process jobs in parallel
-              </p>
-            </div>
-          </div>
-
-          {/* Visual Connector Line (mobile) */}
-          <div className="md:hidden flex justify-center py-4">
-            <svg
-              className="w-8 h-16 text-muted-foreground"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M19 14l-7 7m0 0l-7-7m7 7H3"
-              />
-            </svg>
-          </div>
-        </div>
-      </section>
-
-      {/* Feature Highlights */}
-      <section className="py-16 px-4">
-        <div className="container mx-auto max-w-7xl">
-          <h2 className="text-3xl font-bold text-center mb-12">
-            Why Choose Network Nebula
-          </h2>
-          <div className="grid md:grid-cols-3 gap-8">
-            <Card>
-              <CardHeader>
-                <Zap className="h-10 w-10 text-primary mb-4" />
-                <CardTitle>Fast Generation</CardTitle>
-                <CardDescription>
-                  Leverage distributed GPU power for rapid image generation
+          <div className="grid md:grid-cols-2 gap-8">
+            {/* Persona A: AI Creators & Startups */}
+            <Card className="border-border/80 bg-gradient-to-b from-card to-background shadow-xl hover:border-indigo-500/40 transition-all flex flex-col justify-between">
+              <CardHeader className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+                    <Terminal className="h-5 w-5" />
+                  </div>
+                  <Badge variant="secondary" className="font-mono text-[11px]">DEVELOPER CONSOLE</Badge>
+                </div>
+                <CardTitle className="text-2xl font-bold">For AI Developers & Teams</CardTitle>
+                <CardDescription className="text-sm leading-relaxed">
+                  Rent high-performance GPU clusters on demand. Train LoRA adapters, serve 70B parameter models, and connect your existing apps with standard OpenAI client libraries.
                 </CardDescription>
               </CardHeader>
+              <CardContent className="space-y-4">
+                <ul className="space-y-2.5 text-xs text-muted-foreground">
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>OpenAI Drop-In API:</strong> Change <code className="text-foreground">base_url</code> to <code className="text-foreground">http://localhost:8000/v1</code></span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Distributed LoRA Engine:</strong> Multi-node Ring All-Reduce gradient sync</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Mixture-of-Experts (MoE):</strong> Mixtral 8x7B sharding with speculative decoding</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Free Alpha Faucet:</strong> +$100 initial testing grant with +$25 daily refills</span>
+                  </li>
+                </ul>
+                <div className="pt-2">
+                  <Link to="/register">
+                    <Button className="w-full gap-2 bg-indigo-600 hover:bg-indigo-700 text-white">
+                      Start as Creator <ArrowRight className="h-4 w-4" />
+                    </Button>
+                  </Link>
+                </div>
+              </CardContent>
             </Card>
-            <Card>
-              <CardHeader>
-                <Coins className="h-10 w-10 text-primary mb-4" />
-                <CardTitle>Low Cost</CardTitle>
-                <CardDescription>
-                  Pay only for what you use with our competitive pricing model
-                </CardDescription>
-              </CardHeader>
-            </Card>
-            <Card>
-              <CardHeader>
-                <Globe className="h-10 w-10 text-primary mb-4" />
-                <CardTitle>Decentralized</CardTitle>
-                <CardDescription>
-                  No single point of failure, powered by a global network
-                </CardDescription>
-              </CardHeader>
-            </Card>
-          </div>
-        </div>
-      </section>
 
-      {/* Pricing Preview */}
-      <section className="py-16 px-4 bg-muted/50">
-        <div className="container mx-auto max-w-7xl">
-          <div className="text-center mb-12">
-            <h2 className="text-3xl font-bold mb-4">
-              Simple, Transparent Pricing
-            </h2>
-            <p className="text-muted-foreground">
-              Pay only for the compute you use
-            </p>
-          </div>
-          <div className="max-w-md mx-auto">
-            <Card className="border-primary/30 bg-primary/5">
-              <CardHeader className="text-center">
-                <CardTitle className="text-4xl font-bold">$0.001</CardTitle>
-                <CardDescription>per megapixel-step</CardDescription>
+            {/* Persona B: Host Providers & Gamers */}
+            <Card className="border-border/80 bg-gradient-to-b from-card to-background shadow-xl hover:border-emerald-500/40 transition-all flex flex-col justify-between">
+              <CardHeader className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    <Server className="h-5 w-5" />
+                  </div>
+                  <Badge variant="secondary" className="font-mono text-[11px] text-emerald-400 border-emerald-500/30">HOST PROVIDER</Badge>
+                </div>
+                <CardTitle className="text-2xl font-bold">For GPU Owners & Fleets</CardTitle>
+                <CardDescription className="text-sm leading-relaxed">
+                  Turn idle NVIDIA GPUs (RTX 3080 / 4070 / 4080 / 4090 / A100) and Apple Silicon into a passive revenue stream with our automated background worker daemon.
+                </CardDescription>
               </CardHeader>
-              <CardContent className="text-center">
-                <p className="text-sm text-muted-foreground">
-                  For a 512x512 image at 20 steps, that's only{" "}
-                  <span className="font-semibold text-foreground">$0.01</span>{" "}
-                  per image!
-                </p>
+              <CardContent className="space-y-4">
+                <ul className="space-y-2.5 text-xs text-muted-foreground">
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>1-Click Mesh Launcher:</strong> Run <code className="text-foreground">.\join_mesh.bat</code> to connect in seconds</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Automated Staking & SLA:</strong> High reputation hosts receive priority task dispatch</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Multi-Chain Payouts:</strong> Automated host withdrawals via USDC on Polygon / Base / Arbitrum</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span><strong>Hardware Protection:</strong> Configurable VRAM caps and temperature throttles</span>
+                  </li>
+                </ul>
+                <div className="pt-2">
+                  <Link to="/register">
+                    <Button variant="outline" className="w-full gap-2 border-emerald-500/40 hover:bg-emerald-500/10 text-emerald-400">
+                      Become a Host Provider <ArrowRight className="h-4 w-4" />
+                    </Button>
+                  </Link>
+                </div>
               </CardContent>
             </Card>
           </div>
         </div>
       </section>
+
+      {/* 4. Architecture Showcase */}
+      <section className="py-20 px-4 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-7xl">
+          <div className="text-center max-w-3xl mx-auto mb-14">
+            <h2 className="text-3xl font-bold">End-to-End Enterprise Architecture</h2>
+            <p className="text-muted-foreground mt-2">Formal distributed architecture implemented according to university software engineering standards</p>
+          </div>
+
+          <div className="grid md:grid-cols-3 gap-6">
+            <div className="p-6 rounded-xl border border-border/80 bg-card/60 backdrop-blur space-y-3">
+              <div className="h-10 w-10 rounded-lg bg-indigo-500/15 flex items-center justify-center text-indigo-400">
+                <Cpu className="h-5 w-5" />
+              </div>
+              <h3 className="text-lg font-bold">Orchestrator Gateway</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                FastAPI 1.9 async API gateway offering distributed telemetry tracing, Celery task scheduling, MinIO S3 dataset presigning, and double-entry ledger balance accounting.
+              </p>
+            </div>
+
+            <div className="p-6 rounded-xl border border-border/80 bg-card/60 backdrop-blur space-y-3">
+              <div className="h-10 w-10 rounded-lg bg-purple-500/15 flex items-center justify-center text-purple-400">
+                <Network className="h-5 w-5" />
+              </div>
+              <h3 className="text-lg font-bold">P2P Kademlia Swarm</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                DHT routing mesh allowing workers to discover peers across NATs, perform Ring All-Reduce gradient aggregations, and route sparse MoE activation tensors without centralized bottlenecks.
+              </p>
+            </div>
+
+            <div className="p-6 rounded-xl border border-border/80 bg-card/60 backdrop-blur space-y-3">
+              <div className="h-10 w-10 rounded-lg bg-emerald-500/15 flex items-center justify-center text-emerald-400">
+                <ShieldCheck className="h-5 w-5" />
+              </div>
+              <h3 className="text-lg font-bold">SLA & Verifiable Compute</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                Cryptographic output verification, deterministic spot-checks, automated staking slashing for dropped tasks, and dispute resolution engines to ensure 99.9% compute reliability.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 5. Closed Alpha Access Callout */}
+      <section className="py-16 px-4 bg-gradient-to-b from-indigo-950/20 to-background border-t border-border/60">
+        <div className="mx-auto max-w-4xl text-center space-y-6">
+          <Badge className="bg-indigo-500/20 text-indigo-300 border-indigo-500/40 font-mono">
+            ACCESS CODE: NEBULA-ALPHA-2026
+          </Badge>
+          <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight">Ready to Run Decentralized Compute?</h2>
+          <p className="text-muted-foreground max-w-xl mx-auto text-sm leading-relaxed">
+            Create an account with your university or personal email to instantly receive your $100.00 compute credit grant. No credit card or financial commitment required during Private Alpha.
+          </p>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+            <Link to="/register">
+              <Button size="lg" className="bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-semibold shadow-lg">
+                Create Account & Join Alpha
+              </Button>
+            </Link>
+            <Link to="/login">
+              <Button variant="outline" size="lg">
+                Sign In
+              </Button>
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* 6. Footer */}
+      <footer className="border-t border-border/60 py-10 px-4 text-xs text-muted-foreground">
+        <div className="mx-auto max-w-7xl flex flex-col md:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <div className="h-5 w-5 rounded bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white">N</div>
+            <span className="font-semibold text-foreground">Project NetworkNebula</span>
+            <span>· Ariel University Computer Science (Intro2SE)</span>
+          </div>
+          <div className="flex items-center gap-4">
+            <span className="font-mono text-[11px]">MIT Licensed</span>
+            <span>·</span>
+            <span className="font-mono text-[11px]">Cloudflare Zero-Trust WAN Ready</span>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }

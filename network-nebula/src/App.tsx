@@ -1,8 +1,9 @@
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, useNavigate } from "react-router-dom";
 import { Toaster } from "@/components/ui/sonner";
 import { Navbar } from "@/components/layout/navbar";
 import { useAuthStore } from "@/stores/auth-store";
 import { ProtectedRoute } from "@/components/common/protected-route";
+import { HomePage } from "@/pages/home";
 import { LoginPage } from "@/pages/login";
 import { RegisterPage } from "@/pages/register";
 import { CreateJobPage } from "@/pages/create-job";
@@ -36,29 +37,132 @@ function ProtectedRouteWrapper({
 
 function App() {
   const user = useAuthStore((state) => state.user);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const logout = useAuthStore((state) => state.logout);
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    logout();
+    navigate("/");
+  };
 
   return (
     <div className="min-h-screen bg-background">
-      <Navbar user={user} onLogout={logout} />
+      <Navbar user={user} onLogout={handleLogout} />
       <main>
         <Routes>
-          <Route path="/" element={<TrainingStudioPage />} />
-          <Route path="/training" element={<TrainingStudioPage />} />
-          <Route path="/inference" element={<InferenceHubPage />} />
-          <Route path="/swarm" element={<SwarmStudioPage />} />
-          <Route path="/moe" element={<MoeStudioPage />} />
-          <Route path="/api-tokens" element={<ApiTokensPage />} />
-          <Route path="/cluster" element={<ClusterStatusPage />} />
-          <Route path="/governance" element={<GovernancePage />} />
+          {/* Public SaaS & Auth Routes */}
+          <Route
+            path="/"
+            element={
+              isAuthenticated ? (
+                user?.role === "worker" ? <WorkerDashboardPage /> : <TrainingStudioPage />
+              ) : (
+                <HomePage />
+              )
+            }
+          />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/register/worker" element={<RegisterWorkerPage />} />
-          <Route path="/create-job" element={<CreateJobPage />} />
-          <Route path="/job-status/:taskId" element={<JobStatusPage />} />
-          <Route path="/jobs" element={<JobHistoryPage />} />
-          <Route path="/worker" element={<WorkerDashboardPage />} />
-          <Route path="/worker/earnings" element={<WorkerEarningsPage />} />
+
+          {/* Protected Studio & Developer Console Routes */}
+          <Route
+            path="/training"
+            element={
+              <ProtectedRouteWrapper>
+                <TrainingStudioPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/inference"
+            element={
+              <ProtectedRouteWrapper>
+                <InferenceHubPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/swarm"
+            element={
+              <ProtectedRouteWrapper>
+                <SwarmStudioPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/moe"
+            element={
+              <ProtectedRouteWrapper>
+                <MoeStudioPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/api-tokens"
+            element={
+              <ProtectedRouteWrapper>
+                <ApiTokensPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/cluster"
+            element={
+              <ProtectedRouteWrapper>
+                <ClusterStatusPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/governance"
+            element={
+              <ProtectedRouteWrapper>
+                <GovernancePage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/create-job"
+            element={
+              <ProtectedRouteWrapper>
+                <CreateJobPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/job-status/:taskId"
+            element={
+              <ProtectedRouteWrapper>
+                <JobStatusPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/jobs"
+            element={
+              <ProtectedRouteWrapper>
+                <JobHistoryPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/worker"
+            element={
+              <ProtectedRouteWrapper allowedRoles={["worker"]}>
+                <WorkerDashboardPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/worker/earnings"
+            element={
+              <ProtectedRouteWrapper allowedRoles={["worker"]}>
+                <WorkerEarningsPage />
+              </ProtectedRouteWrapper>
+            }
+          />
           <Route
             path="/wallet"
             element={

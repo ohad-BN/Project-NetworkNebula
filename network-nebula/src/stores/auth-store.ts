@@ -18,7 +18,7 @@ interface AuthActions {
     password: string,
     role: "creator" | "worker",
     inviteCode?: string
-  ) => Promise<{ is_verified?: boolean; message?: string }>;
+  ) => Promise<{ is_verified?: boolean; message?: string; dev_otp?: string | null; mailer_active?: boolean }>;
   verifyEmail: (email: string, code: string) => Promise<{ balance?: number; message?: string }>;
   resendVerificationCode: (email: string) => Promise<void>;
   validateInviteCode: (code: string) => Promise<boolean>;
@@ -120,7 +120,7 @@ export const useAuthStore = create<AuthStore>()(
             error: null,
           });
 
-          return { is_verified: data.user.is_verified, message: data.message };
+          return { is_verified: data.user.is_verified, message: data.message, dev_otp: data.dev_otp, mailer_active: data.mailer_active };
         } catch (error) {
           set({
             error: error instanceof Error ? error.message : "Registration failed",
@@ -230,6 +230,7 @@ export const useAuthStore = create<AuthStore>()(
         });
         localStorage.removeItem("api_key");
         localStorage.removeItem("api_secret");
+        localStorage.removeItem("auth-storage");
       },
 
       verifySession: async () => {
