@@ -28,6 +28,7 @@ import {
   Laptop,
   Monitor,
   Server,
+  Globe,
 } from "lucide-react";
 import {
   workersService,
@@ -203,65 +204,71 @@ export function WorkerDashboardPage() {
                   Connect Machine / Add GPU
                 </Button>
               </DialogTrigger>
-              <DialogContent className="max-w-2xl">
-                <DialogHeader>
-                  <DialogTitle className="flex items-center gap-2 text-xl">
-                    <Cpu className="h-5 w-5 text-emerald-500" />
-                    Connect GPU Hardware to Your Account
+              <DialogContent className="sm:max-w-2xl w-full bg-[#181920] border-[#2e303a] p-6 shadow-2xl overflow-hidden text-card-foreground">
+                <DialogHeader className="space-y-1.5">
+                  <DialogTitle className="flex items-center gap-2.5 text-xl font-bold">
+                    <Cpu className="h-5 w-5 text-emerald-400" />
+                    Connect GPU Hardware to Your Fleet
                   </DialogTitle>
-                  <DialogDescription>
-                    Follow the simple guide below to launch the lightweight agent on your machine. Your hardware will automatically link to your account.
+                  <DialogDescription className="text-xs text-muted-foreground leading-relaxed">
+                    Launch the lightweight agent on any Windows PC, Apple Silicon Mac, or Linux machine.
+                    It links automatically to your account and appears in your dashboard in real time.
                   </DialogDescription>
                 </DialogHeader>
 
-                <Tabs defaultValue="windows" className="pt-2">
-                  <TabsList className="grid grid-cols-2 mb-4">
-                    <TabsTrigger value="windows" className="gap-2 text-xs">
+                <Tabs defaultValue="windows" className="pt-2 w-full">
+                  <TabsList className="grid w-full grid-cols-2 mb-4 bg-muted/60">
+                    <TabsTrigger value="windows" className="gap-2 text-xs py-2">
                       <Monitor className="h-4 w-4" /> Windows (PowerShell)
                     </TabsTrigger>
-                    <TabsTrigger value="macos" className="gap-2 text-xs">
+                    <TabsTrigger value="macos" className="gap-2 text-xs py-2">
                       <Laptop className="h-4 w-4" /> macOS / Linux (Terminal)
                     </TabsTrigger>
                   </TabsList>
 
                   {/* Windows Tab */}
                   <TabsContent value="windows" className="space-y-4 text-xs">
-                    <div className="p-3 bg-muted/40 rounded-lg border space-y-2">
-                      <p className="font-semibold text-foreground flex items-center gap-1.5">
+                    <div className="p-3 bg-muted/40 rounded-lg border space-y-1">
+                      <p className="font-semibold text-foreground flex items-center gap-2">
                         <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/20 text-primary text-[11px] font-bold">1</span>
                         Open PowerShell on your Windows PC
                       </p>
-                      <p className="text-muted-foreground text-[11px]">
+                      <p className="text-muted-foreground text-[11px] pl-7">
                         Requires Python 3.10+ and NVIDIA CUDA drivers.
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between">
-                        <span className="font-semibold text-foreground flex items-center gap-1.5">
+                        <span className="font-semibold text-foreground flex items-center gap-2">
                           <span className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400 text-[11px] font-bold">2</span>
                           Run the 1-Click PowerShell Connector
                         </span>
-                        <span className="text-[10px] font-mono text-muted-foreground">Pre-authenticated with your key</span>
+                        <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Pre-authenticated</span>
                       </div>
 
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-[11px] border border-slate-800">
-                        <span className="truncate mr-2">{powershellBootstrapper}</span>
+                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-xs border border-slate-800 gap-3 min-w-0 overflow-hidden">
+                        <span className="truncate select-all min-w-0 flex-1 text-emerald-400 font-mono text-[11px]">
+                          {powershellBootstrapper}
+                        </span>
                         <Button
-                          variant="ghost"
+                          variant="secondary"
                           size="sm"
-                          className="h-7 px-2 text-slate-300 hover:text-white shrink-0"
+                          className="h-7 px-2.5 text-xs shrink-0 gap-1.5 font-sans font-medium"
                           onClick={() => copyToClipboard(powershellBootstrapper, "ps-boot")}
                         >
                           {copiedCmd === "ps-boot" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                          <span>{copiedCmd === "ps-boot" ? "Copied" : "Copy"}</span>
                         </Button>
                       </div>
                     </div>
 
                     <div className="pt-2 border-t space-y-1.5">
-                      <span className="text-muted-foreground text-[11px]">Or if already inside the project directory:</span>
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-[11px] border border-slate-800">
-                        <span className="truncate mr-2">{powershellLocalCmd}</span>
+                      <span className="text-muted-foreground text-[11px] block">Or if already inside the project directory:</span>
+                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2 rounded-lg font-mono text-[11px] border border-slate-800 gap-3 min-w-0 overflow-hidden">
+                        <span className="truncate select-all min-w-0 flex-1 text-slate-300">
+                          {powershellLocalCmd}
+                        </span>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -276,42 +283,47 @@ export function WorkerDashboardPage() {
 
                   {/* macOS / Linux Tab */}
                   <TabsContent value="macos" className="space-y-4 text-xs">
-                    <div className="p-3 bg-muted/40 rounded-lg border space-y-2">
-                      <p className="font-semibold text-foreground flex items-center gap-1.5">
+                    <div className="p-3 bg-muted/40 rounded-lg border space-y-1">
+                      <p className="font-semibold text-foreground flex items-center gap-2">
                         <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/20 text-primary text-[11px] font-bold">1</span>
                         Open Terminal on your Mac or Linux Server
                       </p>
-                      <p className="text-muted-foreground text-[11px]">
+                      <p className="text-muted-foreground text-[11px] pl-7">
                         Supports Apple Silicon M1/M2/M3/M4 via Metal Performance Shaders (MPS) or Linux NVIDIA CUDA.
                       </p>
                     </div>
 
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between">
-                        <span className="font-semibold text-foreground flex items-center gap-1.5">
+                        <span className="font-semibold text-foreground flex items-center gap-2">
                           <span className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400 text-[11px] font-bold">2</span>
                           Run the 1-Click Terminal Connector
                         </span>
-                        <span className="text-[10px] font-mono text-muted-foreground">Pre-authenticated with your key</span>
+                        <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Pre-authenticated</span>
                       </div>
 
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-[11px] border border-slate-800">
-                        <span className="truncate mr-2">{bashBootstrapper}</span>
+                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-xs border border-slate-800 gap-3 min-w-0 overflow-hidden">
+                        <span className="truncate select-all min-w-0 flex-1 text-emerald-400 font-mono text-[11px]">
+                          {bashBootstrapper}
+                        </span>
                         <Button
-                          variant="ghost"
+                          variant="secondary"
                           size="sm"
-                          className="h-7 px-2 text-slate-300 hover:text-white shrink-0"
+                          className="h-7 px-2.5 text-xs shrink-0 gap-1.5 font-sans font-medium"
                           onClick={() => copyToClipboard(bashBootstrapper, "sh-boot")}
                         >
                           {copiedCmd === "sh-boot" ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                          <span>{copiedCmd === "sh-boot" ? "Copied" : "Copy"}</span>
                         </Button>
                       </div>
                     </div>
 
                     <div className="pt-2 border-t space-y-1.5">
-                      <span className="text-muted-foreground text-[11px]">Or if already inside the project directory:</span>
-                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2.5 rounded-lg font-mono text-[11px] border border-slate-800">
-                        <span className="truncate mr-2">{bashLocalCmd}</span>
+                      <span className="text-muted-foreground text-[11px] block">Or if already inside the project directory:</span>
+                      <div className="flex items-center justify-between bg-slate-950 text-slate-100 p-2 rounded-lg font-mono text-[11px] border border-slate-800 gap-3 min-w-0 overflow-hidden">
+                        <span className="truncate select-all min-w-0 flex-1 text-slate-300">
+                          {bashLocalCmd}
+                        </span>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -329,8 +341,8 @@ export function WorkerDashboardPage() {
           </div>
         </div>
 
-        {/* View Switcher: My Hardware Fleet vs Global Network Mesh */}
-        <div className="flex items-center justify-between border-b border-border/80 pb-3">
+        {/* View Switcher: My Connected Machines vs Global Network Mesh */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/80 pb-3">
           <div className="flex items-center gap-2 bg-muted/60 p-1 rounded-lg border text-xs font-medium">
             <button
               onClick={() => setActiveTab("my_fleet")}
@@ -341,7 +353,7 @@ export function WorkerDashboardPage() {
               }`}
             >
               <Server className="h-3.5 w-3.5" />
-              <span>My Contributed Hardware ({myNodes.length})</span>
+              <span>My Connected Machines ({myNodes.length})</span>
             </button>
             <button
               onClick={() => setActiveTab("global_mesh")}
@@ -356,8 +368,21 @@ export function WorkerDashboardPage() {
             </button>
           </div>
 
-          <div className="text-xs text-muted-foreground hidden sm:block">
-            {lastHeartbeat && `Telemetry synced: ${lastHeartbeat.toLocaleTimeString()}`}
+          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+            {activeTab === "my_fleet" ? (
+              <span className="text-[11px] text-muted-foreground hidden md:inline">
+                Your personal hardware pool • Any PC or Mac you connect appears here
+              </span>
+            ) : (
+              <span className="text-[11px] text-muted-foreground hidden md:inline">
+                Entire public network • All community host nodes across the globe
+              </span>
+            )}
+            {lastHeartbeat && (
+              <span className="font-mono text-[10px] text-muted-foreground border-l pl-3 hidden sm:inline">
+                Synced {lastHeartbeat.toLocaleTimeString()}
+              </span>
+            )}
           </div>
         </div>
 
@@ -368,7 +393,7 @@ export function WorkerDashboardPage() {
             {/* Top Metric Strip */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader className="p-4 sm:p-5 pb-2">
                   <CardDescription className="text-xs">Connected Machines</CardDescription>
                   <CardTitle className="text-2xl font-bold flex items-center justify-between">
                     <span>{myNodes.length}</span>
@@ -377,44 +402,44 @@ export function WorkerDashboardPage() {
                     </Badge>
                   </CardTitle>
                 </CardHeader>
-                <CardContent className="text-[11px] text-muted-foreground">
+                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
                   Linked to your account
                 </CardContent>
               </Card>
 
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader className="p-4 sm:p-5 pb-2">
                   <CardDescription className="text-xs">Contributed VRAM</CardDescription>
                   <CardTitle className="text-2xl font-bold text-primary font-mono">
                     {allocatedUserVram.toFixed(1)} <span className="text-sm font-normal text-muted-foreground">/ {totalUserVram.toFixed(1)} GB</span>
                   </CardTitle>
                 </CardHeader>
-                <CardContent className="text-[11px] text-muted-foreground">
+                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
                   Active allocation ceiling
                 </CardContent>
               </Card>
 
               <Card>
-                <CardHeader className="pb-2">
-                  <CardDescription className="text-xs">Combined Compute Rate</CardDescription>
+                <CardHeader className="p-4 sm:p-5 pb-2">
+                  <CardDescription className="text-xs">Fleet Hourly Rate</CardDescription>
                   <CardTitle className="text-2xl font-bold font-mono">
                     ${combinedHourlyRate.toFixed(2)}
                     <span className="text-xs font-normal text-muted-foreground">/hr</span>
                   </CardTitle>
                 </CardHeader>
-                <CardContent className="text-[11px] text-muted-foreground">
-                  Automatic SLA earnings
+                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
+                  Combined compute revenue
                 </CardContent>
               </Card>
 
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader className="p-4 sm:p-5 pb-2">
                   <CardDescription className="text-xs">Total Accrued Earnings</CardDescription>
                   <CardTitle className="text-2xl font-bold font-mono text-emerald-400">
                     ${totalUserEarnings.toFixed(4)}
                   </CardTitle>
                 </CardHeader>
-                <CardContent className="text-[11px] text-muted-foreground flex justify-between items-center">
+                <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground flex justify-between items-center">
                   <span>SLA credited balance</span>
                   <Link to="/wallet" className="text-emerald-400 hover:underline">Wallet</Link>
                 </CardContent>
@@ -448,13 +473,18 @@ export function WorkerDashboardPage() {
             {/* GRID OF INDIVIDUAL CONNECTED MACHINES */}
             {myNodes.length > 0 && (
               <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-base font-bold flex items-center gap-2">
-                    <Laptop className="h-4 w-4 text-emerald-400" />
-                    Active Physical Hardware Nodes
-                  </h2>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                  <div>
+                    <h2 className="text-base font-bold flex items-center gap-2">
+                      <Laptop className="h-4 w-4 text-emerald-400" />
+                      Active Physical Hardware Nodes
+                    </h2>
+                    <p className="text-xs text-muted-foreground">
+                      All computers and GPUs linked to your account. Control settings remotely from any device.
+                    </p>
+                  </div>
                   <span className="text-xs text-muted-foreground font-mono">
-                    Control settings remotely across all computers
+                    {myNodes.length} machine{myNodes.length === 1 ? "" : "s"} configured
                   </span>
                 </div>
 
@@ -470,11 +500,11 @@ export function WorkerDashboardPage() {
                         <div className={`h-1 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
 
                         <CardHeader className="pb-3">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="space-y-1">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1 min-w-0">
                               <div className="flex items-center gap-2">
-                                <span className={`h-2.5 w-2.5 rounded-full ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
-                                <CardTitle className="text-base font-bold truncate max-w-[280px]">
+                                <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
+                                <CardTitle className="text-base font-bold text-foreground">
                                   {w.name || w.gpu_model}
                                 </CardTitle>
                               </div>
@@ -515,23 +545,41 @@ export function WorkerDashboardPage() {
                         </CardHeader>
 
                         <CardContent className="space-y-4">
-                          {/* Hardware Specs Grid */}
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs bg-muted/40 p-2.5 rounded-lg border font-mono">
-                            <div>
-                              <span className="text-[10px] text-muted-foreground block font-sans">GPU Accelerator</span>
-                              <span className="font-semibold text-foreground truncate block">{w.gpu_model || w.gpu_info}</span>
+                          {/* Hardware Specs Grid - 2x2 spacious responsive layout */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs bg-muted/30 p-3.5 rounded-lg border font-mono">
+                            <div className="space-y-0.5">
+                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                                GPU Accelerator
+                              </span>
+                              <span className="font-semibold text-foreground flex items-center gap-1.5">
+                                <Cpu className="h-3.5 w-3.5 text-primary shrink-0" />
+                                {w.gpu_model || w.gpu_info}
+                              </span>
                             </div>
-                            <div>
-                              <span className="text-[10px] text-muted-foreground block font-sans">CUDA / Framework</span>
-                              <span className="font-semibold text-foreground">{w.cuda_version || "Metal / MPS"}</span>
+                            <div className="space-y-0.5">
+                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                                CUDA / Framework
+                              </span>
+                              <span className="font-semibold text-foreground">
+                                {w.cuda_version || "Metal / MPS"}
+                              </span>
                             </div>
-                            <div>
-                              <span className="text-[10px] text-muted-foreground block font-sans">CPU & RAM</span>
-                              <span className="font-semibold text-foreground">{w.cpu_cores} cores • {w.memory_gb}GB</span>
+                            <div className="space-y-0.5">
+                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                                CPU & System RAM
+                              </span>
+                              <span className="font-semibold text-foreground">
+                                {w.cpu_cores} Cores • {w.memory_gb} GB RAM
+                              </span>
                             </div>
-                            <div>
-                              <span className="text-[10px] text-muted-foreground block font-sans">Region & Latency</span>
-                              <span className="font-semibold text-foreground">{w.region || "us-east"} • {w.latency_ping_ms ?? 12.0}ms</span>
+                            <div className="space-y-0.5">
+                              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                                Region & Ping Latency
+                              </span>
+                              <span className="font-semibold text-foreground flex items-center gap-1.5">
+                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
+                                {w.region || "us-east"} • {w.latency_ping_ms ?? 12.0}ms
+                              </span>
                             </div>
                           </div>
 
@@ -594,6 +642,17 @@ export function WorkerDashboardPage() {
         {/* TAB 2: GLOBAL NETWORK MESH (Cluster-Wide Telemetry) */}
         {activeTab === "global_mesh" && (
           <div className="space-y-6">
+            <div className="bg-primary/10 border border-primary/20 rounded-lg p-4 flex items-start gap-3">
+              <Globe className="h-5 w-5 text-primary shrink-0 mt-0.5" />
+              <div className="text-xs space-y-1">
+                <p className="font-semibold text-foreground text-sm">Public Decentralized Network Mesh</p>
+                <p className="text-muted-foreground leading-relaxed">
+                  This table displays all verified compute host nodes and peer shards operating across the entire decentralized NetworkNebula network (including public community hosts worldwide).
+                  To view and remotely manage <strong>your own connected computers & GPUs</strong>, switch to the <strong>"My Connected Machines"</strong> tab above.
+                </p>
+              </div>
+            </div>
+
             <div className="border rounded-lg overflow-hidden bg-card">
               <div className="p-4 bg-muted/40 border-b flex items-center justify-between">
                 <div>
