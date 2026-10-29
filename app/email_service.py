@@ -103,7 +103,40 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
     </html>
     """
 
-    # 1. Try Resend API if API key is present
+    # 1. Try SMTP first if configured (e.g. Gmail SMTP sends to ANY recipient without sandbox restrictions)
+    if smtp_host and smtp_user and smtp_password:
+        try:
+            clean_pw = smtp_password.replace(" ", "").strip()
+            # For Gmail SMTP, the From address should match the authenticated user
+            from_header = smtp_from
+            if not from_header or "networknebula.org" in from_header or "@" not in from_header:
+                from_header = f"NetworkNebula <{smtp_user}>"
+
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = from_header
+            msg["To"] = email
+            msg.attach(MIMEText(f"Your NetworkNebula verification code is: {code}", "plain"))
+            msg.attach(MIMEText(html_content, "html"))
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+                server.starttls()
+                server.login(smtp_user, clean_pw)
+                server.sendmail(smtp_user, [email], msg.as_string())
+            logger.info(f"[SMTP] Verification email sent to {email}")
+            try:
+                print(f"  ✅ [GMAIL SMTP] Live email delivered to {email}!")
+            except Exception:
+                print(f"  [GMAIL SMTP] Live email delivered to {email}!")
+            return True
+        except Exception as e:
+            logger.error(f"[SMTP] Error sending email via SMTP: {e}")
+            try:
+                print(f"  ❌ [SMTP Error] {e}")
+            except Exception:
+                print(f"  [SMTP Error] {e}")
+
+    # 2. Try Resend API if API key is present
     if resend_api_key and resend_api_key.strip():
         try:
             resp = requests.post(
@@ -139,33 +172,6 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
                 print(f"  ❌ [RESEND API Error] {e}")
             except Exception:
                 print(f"  [RESEND API Error] {e}")
-
-    # 2. Try SMTP if configured
-    if smtp_host and smtp_user and smtp_password:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = smtp_from
-            msg["To"] = email
-            msg.attach(MIMEText(f"Your NetworkNebula verification code is: {code}", "plain"))
-            msg.attach(MIMEText(html_content, "html"))
-
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-                server.starttls()
-                server.login(smtp_user, smtp_password)
-                server.sendmail(smtp_from, [email], msg.as_string())
-            logger.info(f"[SMTP] Verification email sent to {email}")
-            try:
-                print(f"  ✅ [SMTP] Live email delivered to {email}!")
-            except Exception:
-                print(f"  [SMTP] Live email delivered to {email}!")
-            return True
-        except Exception as e:
-            logger.error(f"[SMTP] Error sending email: {e}")
-            try:
-                print(f"  ❌ [SMTP Error] {e}")
-            except Exception:
-                print(f"  [SMTP Error] {e}")
 
     # 3. Development / Local Fallback Mode (Console Output)
     print("\n" + "=" * 76)
