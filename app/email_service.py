@@ -25,6 +25,8 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+logger = logging.getLogger("email_service")
+
 
 def get_resend_api_key() -> Optional[str]:
     """Retrieve Resend API key dynamically from environment or .env file."""
