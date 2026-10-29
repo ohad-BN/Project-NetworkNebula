@@ -4,6 +4,7 @@ Project NetworkNebula — Transactional Email Service
 ===================================================
 Dispatches email verification codes, password resets, and invite notifications.
 Supports Resend API (primary), SMTP fallback, and console simulation for local/offline dev.
+Dynamically reloads .env configuration on each dispatch.
 """
 
 import json
@@ -14,18 +15,29 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
+import dotenv
 import requests
 
 logger = logging.getLogger("email_service")
 
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "NetworkNebula <onboarding@resend.dev>")
 
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+def get_resend_api_key() -> Optional[str]:
+    """Retrieve Resend API key dynamically from environment or .env file."""
+    dotenv.load_dotenv(dotenv.find_dotenv(), override=True)
+    return os.environ.get("RESEND_API_KEY")
+
+
+def has_configured_mailer() -> bool:
+    """Check if either Resend or SMTP credentials are configured."""
+    dotenv.load_dotenv(dotenv.find_dotenv(), override=True)
+    resend_key = os.environ.get("RESEND_API_KEY")
+    smtp_user = os.environ.get("SMTP_USER")
+    return bool((resend_key and resend_key.strip()) or (smtp_user and smtp_user.strip()))
+
+
+# Backward compatibility aliases
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@networknebula.org")
 
 
 def send_verification_email(email: str, code: str, initial_credits: float = 100.0) -> bool:
@@ -33,8 +45,19 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
     Send a 6-digit email verification OTP code to the newly registered user.
     Uses Resend API if configured, SMTP if configured, or logs to console for local testing.
     """
+    dotenv.load_dotenv(dotenv.find_dotenv(), override=True)
+
+    resend_api_key = os.environ.get("RESEND_API_KEY")
+    resend_from_email = os.environ.get("RESEND_FROM_EMAIL", "NetworkNebula <onboarding@resend.dev>")
+
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", 587))
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    smtp_from = os.environ.get("SMTP_FROM", "noreply@networknebula.org")
+
     subject = f"Your NetworkNebula Verification Code: {code}"
-    
+
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -74,16 +97,16 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
     """
 
     # 1. Try Resend API if API key is present
-    if RESEND_API_KEY:
+    if resend_api_key and resend_api_key.strip():
         try:
             resp = requests.post(
                 "https://api.resend.com/emails",
                 headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Authorization": f"Bearer {resend_api_key.strip()}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "from": RESEND_FROM_EMAIL,
+                    "from": resend_from_email,
                     "to": [email],
                     "subject": subject,
                     "html": html_content,
@@ -91,35 +114,40 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
                 timeout=10,
             )
             if resp.status_code in [200, 201]:
-                logger.info(f"[RESEND] Verification email sent to {email}")
+                logger.info(f"[RESEND] Verification email sent to {email} (ID: {resp.json().get('id')})")
+                print(f"  ✅ [RESEND API] Live email delivered to {email}!")
                 return True
             else:
                 logger.warning(f"[RESEND] Failed status {resp.status_code}: {resp.text}")
+                print(f"  ⚠️ [RESEND API Warning] Status {resp.status_code}: {resp.text}")
         except Exception as e:
             logger.error(f"[RESEND] Error sending verification email: {e}")
+            print(f"  ❌ [RESEND API Error] {e}")
 
     # 2. Try SMTP if configured
-    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD:
+    if smtp_host and smtp_user and smtp_password:
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
-            msg["From"] = SMTP_FROM
+            msg["From"] = smtp_from
             msg["To"] = email
             msg.attach(MIMEText(f"Your NetworkNebula verification code is: {code}", "plain"))
             msg.attach(MIMEText(html_content, "html"))
 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
                 server.starttls()
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, [email], msg.as_string())
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_from, [email], msg.as_string())
             logger.info(f"[SMTP] Verification email sent to {email}")
+            print(f"  ✅ [SMTP] Live email delivered to {email}!")
             return True
         except Exception as e:
             logger.error(f"[SMTP] Error sending email: {e}")
+            print(f"  ❌ [SMTP Error] {e}")
 
     # 3. Development / Local Fallback Mode (Console Output)
     print("\n" + "=" * 76)
-    print(f"  ✉️  [NEBULA AUTH DISPATCH] VERIFICATION EMAIL")
+    print(f"  ✉️  [NEBULA AUTH DISPATCH] VERIFICATION EMAIL (DEV SIMULATION)")
     print("=" * 76)
     print(f"  Recipient          : {email}")
     print(f"  Verification Code  : {code}")

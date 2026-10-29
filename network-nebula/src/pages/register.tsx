@@ -5,7 +5,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Loader2, KeyRound, MailCheck, Sparkles, CheckCircle2, Info } from "lucide-react";
+import { Loader2, KeyRound, MailCheck, Sparkles, CheckCircle2, Info, Trash2 } from "lucide-react";
+import { apiClient } from "@/services/api/client";
+import { toast } from "sonner";
 
 export function RegisterPage() {
   const navigate = useNavigate();
@@ -350,13 +352,34 @@ export function RegisterPage() {
                   </Button>
                 )}
 
-                <button
-                  type="button"
-                  onClick={() => navigate(role === "worker" ? "/worker" : "/")}
-                  className="text-xs text-muted-foreground hover:text-foreground text-center"
-                >
-                  Skip for now, go to dashboard
-                </button>
+                <div className="flex items-center justify-between w-full pt-2 border-t border-border/60 text-xs">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!confirm(`Cancel pending registration for ${email}? All unverified details will be completely deleted.`)) return;
+                      try {
+                        await apiClient.post("/auth/cancel-registration", { email });
+                        toast.success("Unverified registration cancelled. Details purged.");
+                        setStep("register");
+                        setOtpCode("");
+                      } catch {
+                        toast.error("Failed to cancel registration");
+                      }
+                    }}
+                    className="text-destructive hover:underline flex items-center gap-1 font-medium"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Cancel & Delete Registration
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => navigate("/login")}
+                    className="text-xs text-muted-foreground hover:text-foreground text-center"
+                  >
+                    Back to sign in
+                  </button>
+                </div>
               </CardFooter>
             </form>
           </>

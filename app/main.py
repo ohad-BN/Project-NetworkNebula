@@ -252,8 +252,8 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
         import logging
         logging.getLogger("main").warning(f"Failed to dispatch verification email: {exc}")
 
-    from app.email_service import RESEND_API_KEY, SMTP_USER
-    has_mailer = bool(RESEND_API_KEY or SMTP_USER)
+    from app.email_service import has_configured_mailer
+    has_mailer = has_configured_mailer()
 
     return {
         "user": {
@@ -276,15 +276,23 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
 
 @app.post("/auth/login")
 def login(request: LoginRequest, db=Depends(get_db)):
-    user = get_user_by_email(db, request.email)
+    clean_email = request.email.strip().lower()
+    user = get_user_by_email(db, clean_email)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not user.is_active:
+    if not user.is_active and user.is_verified:
         raise HTTPException(status_code=403, detail="Account is disabled")
+
+    # Strict Verification Gatekeeper
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Account email not verified. Please enter the 6-digit verification OTP code sent to your email.",
+        )
 
     return {
         "user": {
@@ -294,6 +302,7 @@ def login(request: LoginRequest, db=Depends(get_db)):
             "role": "worker" if user.is_worker else "creator",
             "is_worker": user.is_worker,
             "balance": user.balance,
+            "is_verified": user.is_verified,
             "created_at": str(user.created_at),
         },
         "api_key": user.api_key,
@@ -1199,6 +1208,11 @@ app.include_router(payment_router)
 from app.invite_router import router as invite_router
 
 app.include_router(invite_router)
+
+# Include Flagship User Profile & Activity Router
+from app.user_profile_router import router as user_profile_router
+
+app.include_router(user_profile_router)
 
 
 

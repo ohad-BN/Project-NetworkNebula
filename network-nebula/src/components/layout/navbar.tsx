@@ -4,6 +4,7 @@ import {
   Menu,
   X,
   Wallet,
+  User as UserIcon,
   LogOut,
   ChevronDown,
   Terminal,
@@ -188,6 +189,12 @@ export function Navbar({ user, onLogout }: NavbarProps) {
                       {user.email}
                     </div>
                     <DropdownMenuSeparator />
+                    <DropdownMenuItem asChild>
+                      <Link to="/profile" className="cursor-pointer">
+                        <UserIcon className="mr-2 h-3.5 w-3.5 text-indigo-400" />
+                        Account & Activity
+                      </Link>
+                    </DropdownMenuItem>
                     <DropdownMenuItem asChild>
                       <Link to="/wallet" className="cursor-pointer">
                         <Wallet className="mr-2 h-3.5 w-3.5 text-amber-400" />

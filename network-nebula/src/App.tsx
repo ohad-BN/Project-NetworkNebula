@@ -21,6 +21,7 @@ import { ClusterStatusPage } from "@/pages/cluster-status";
 import { GovernancePage } from "@/pages/governance";
 import { SwarmStudioPage } from "@/pages/swarm-studio";
 import { MoeStudioPage } from "@/pages/moe-studio";
+import { ProfilePage } from "@/pages/profile";
 import type { ReactNode } from "react";
 
 function ProtectedRouteWrapper({
@@ -160,6 +161,14 @@ function App() {
             element={
               <ProtectedRouteWrapper allowedRoles={["worker"]}>
                 <WorkerEarningsPage />
+              </ProtectedRouteWrapper>
+            }
+          />
+          <Route
+            path="/profile"
+            element={
+              <ProtectedRouteWrapper>
+                <ProfilePage />
               </ProtectedRouteWrapper>
             }
           />
