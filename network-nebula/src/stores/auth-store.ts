@@ -13,7 +13,16 @@ interface AuthState {
 
 interface AuthActions {
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, role: "creator" | "worker") => Promise<void>;
+  register: (
+    email: string,
+    password: string,
+    role: "creator" | "worker",
+    inviteCode?: string
+  ) => Promise<{ is_verified?: boolean; message?: string }>;
+  verifyEmail: (email: string, code: string) => Promise<{ balance?: number; message?: string }>;
+  resendVerificationCode: (email: string) => Promise<void>;
+  validateInviteCode: (code: string) => Promise<boolean>;
+  claimFaucet: () => Promise<{ amount: number; balance: number; message: string }>;
   logout: () => void;
   verifySession: () => Promise<boolean>;
   clearError: () => void;
@@ -70,7 +79,12 @@ export const useAuthStore = create<AuthStore>()(
         }
       },
 
-      register: async (email: string, password: string, role: "creator" | "worker") => {
+      register: async (
+        email: string,
+        password: string,
+        role: "creator" | "worker",
+        inviteCode?: string
+      ) => {
         set({ isLoading: true, error: null });
         try {
           const response = await fetch("http://localhost:8000/auth/register", {
@@ -80,7 +94,8 @@ export const useAuthStore = create<AuthStore>()(
               email,
               password,
               confirm_password: password,
-              role
+              role,
+              invite_code: inviteCode || undefined,
             }),
           });
 
@@ -104,6 +119,8 @@ export const useAuthStore = create<AuthStore>()(
             isLoading: false,
             error: null,
           });
+
+          return { is_verified: data.user.is_verified, message: data.message };
         } catch (error) {
           set({
             error: error instanceof Error ? error.message : "Registration failed",
@@ -111,6 +128,96 @@ export const useAuthStore = create<AuthStore>()(
           });
           throw error;
         }
+      },
+
+      verifyEmail: async (email: string, code: string) => {
+        set({ isLoading: true, error: null });
+        try {
+          const response = await fetch("http://localhost:8000/auth/verify-email", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, code }),
+          });
+
+          if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.detail || "Verification failed");
+          }
+
+          const data = await response.json();
+          const currentUser = get().user;
+          if (currentUser) {
+            set({
+              user: {
+                ...currentUser,
+                balance: data.balance ?? currentUser.balance,
+              },
+              isLoading: false,
+              error: null,
+            });
+          } else {
+            set({ isLoading: false, error: null });
+          }
+          return { balance: data.balance, message: data.message };
+        } catch (error) {
+          set({
+            error: error instanceof Error ? error.message : "Verification failed",
+            isLoading: false,
+          });
+          throw error;
+        }
+      },
+
+      resendVerificationCode: async (email: string) => {
+        try {
+          await fetch("http://localhost:8000/auth/resend-code", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email }),
+          });
+        } catch {
+          // ignore error
+        }
+      },
+
+      validateInviteCode: async (code: string) => {
+        try {
+          const response = await fetch("http://localhost:8000/api/v1/invites/validate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
+          });
+          if (!response.ok) return false;
+          const data = await response.json();
+          return Boolean(data.valid);
+        } catch {
+          return false;
+        }
+      },
+
+      claimFaucet: async () => {
+        const { apiKey } = get();
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (apiKey) headers["X-API-Key"] = apiKey;
+
+        const response = await fetch("http://localhost:8000/api/wallet/faucet", {
+          method: "POST",
+          headers,
+        });
+
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.detail || "Faucet claim failed");
+        }
+
+        const data = await response.json();
+        const currentUser = get().user;
+        if (currentUser) {
+          set({
+            user: { ...currentUser, balance: data.balance },
+          });
+        }
+        return data;
       },
 
       logout: () => {

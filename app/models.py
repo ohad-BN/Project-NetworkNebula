@@ -32,6 +32,7 @@ class TransactionType(str, enum.Enum):
     UNSTAKE = "UNSTAKE"
     SLASH_PENALTY = "SLASH_PENALTY"
     COMPENSATION = "COMPENSATION"
+    FAUCET_GRANT = "FAUCET_GRANT"
 
 
 class PayoutStatus(str, enum.Enum):
@@ -80,7 +81,26 @@ class User(Base):
     is_worker = Column(Boolean, default=False)
     balance = Column(Float, default=0.0)
     total_earned = Column(Float, default=0.0)
+    is_verified = Column(Boolean, default=False)
+    verification_code = Column(String(6), nullable=True)
+    verification_expires_at = Column(DateTime(timezone=True), nullable=True)
+    invited_by_code = Column(String(64), nullable=True)
+    last_faucet_claim = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class InviteCode(Base):
+    __tablename__ = "invite_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(64), unique=True, index=True, nullable=False)
+    created_by = Column(String(36), nullable=True)
+    max_uses = Column(Integer, default=1)
+    times_used = Column(Integer, default=0)
+    initial_credits = Column(Float, default=100.0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Worker(Base):

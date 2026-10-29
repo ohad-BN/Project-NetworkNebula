@@ -5,6 +5,7 @@ import {
   FileText,
   Printer,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import { useWalletStore } from "@/stores/wallet-store";
 import { useAuthStore } from "@/stores/auth-store";
@@ -129,6 +130,24 @@ export function WalletPage() {
         </div>
 
         <div className="flex items-center gap-3">
+          <Button
+            variant="default"
+            size="sm"
+            onClick={async () => {
+              try {
+                const res = await apiClient.post<any>("/api/wallet/faucet");
+                toast.success(res.data.message || "Claimed +$25.00 Alpha Compute Credits!");
+                fetchBalance();
+                fetchTransactions();
+              } catch (err: any) {
+                toast.error(err.response?.data?.detail || "Daily faucet already claimed or unavailable");
+              }
+            }}
+            className="gap-1.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white shadow-sm font-medium"
+          >
+            <Sparkles className="h-4 w-4" />
+            <span>Alpha Faucet (+$25)</span>
+          </Button>
           <Button
             variant="outline"
             size="sm"

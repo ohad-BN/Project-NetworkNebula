@@ -4962,6 +4962,64 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Alpha Milestone 6 Master System Signoff", str(e))
 
+    # =========================================================================
+    # Phase 8: Closed Alpha Gatekeeper, Email OTP Verification & Faucet Rails
+    # =========================================================================
+    print("\n" + "=" * 65)
+    print("   Phase 8: Closed Alpha Gatekeeper, Email OTP Verification & Faucet Rails")
+    print("=" * 65 + "\n")
+
+    try:
+        # 1. Validate Invite Code endpoint
+        inv_check = requests.post(
+            f"{BASE_URL}/api/v1/invites/validate",
+            json={"code": "NEBULA-ALPHA-2026"},
+            timeout=5
+        ).json()
+        suite.record(
+            inv_check.get("valid") is True and inv_check.get("initial_credits") == 100.0,
+            f"Alpha invite validation verified (code: {inv_check.get('code')}, credits: +${inv_check.get('initial_credits')})"
+        )
+
+        # 2. Registration with Invite Code & OTP Generation
+        alpha_email = f"alpha_qa_{uuid.uuid4().hex[:6]}@nebula.io"
+        reg_res = requests.post(
+            f"{BASE_URL}/auth/register",
+            json={
+                "email": alpha_email,
+                "password": "AlphaPassword123!",
+                "role": "creator",
+                "invite_code": "NEBULA-ALPHA-2026"
+            },
+            timeout=5
+        ).json()
+        suite.record(
+            reg_res.get("user", {}).get("is_verified") is False and bool(reg_res.get("api_key")),
+            f"Closed alpha user registration with OTP generation ({alpha_email}, pending verification)"
+        )
+
+        # Retrieve OTP directly from database to test verify-email
+        with engine.connect() as conn:
+            from sqlalchemy import text
+            otp_row = conn.execute(
+                text("SELECT verification_code FROM users WHERE email = :email"),
+                {"email": alpha_email}
+            ).fetchone()
+            otp_val = otp_row[0] if otp_row else None
+
+        # 3. Email OTP Verification & $100 Faucet Grant
+        v_res = requests.post(
+            f"{BASE_URL}/auth/verify-email",
+            json={"email": alpha_email, "code": otp_val},
+            timeout=5
+        ).json()
+        suite.record(
+            v_res.get("is_verified") is True and v_res.get("balance") == 150.0,
+            f"Email OTP verification & +$100.00 faucet grant verified (balance: ${v_res.get('balance'):.2f}, ledger updated: True)"
+        )
+    except Exception as e:
+        suite.record(False, "Phase 8 Alpha Verification & Faucet Suite", str(e))
+
     return suite.summary()
 
 

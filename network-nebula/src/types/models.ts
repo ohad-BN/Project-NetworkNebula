@@ -2,6 +2,9 @@ export interface User {
   id: string;
   email: string;
   role: "creator" | "worker";
+  balance?: number;
+  is_verified?: boolean;
+  name?: string;
   created_at: string;
 }
 
@@ -48,30 +51,26 @@ export interface Worker {
   user_id: string;
   hostname: string;
   ip_address: string;
-  cpu_model: string;
-  cpu_cores: number;
-  ram_gb: number;
-  gpu_model?: string;
-  status: "online" | "offline" | "busy";
-  earnings: number;
-  created_at: string;
-  last_seen?: string;
-}
-
-export interface WorkerStats {
-  worker_id: string;
-  total_tasks: number;
-  completed_tasks: number;
-  failed_tasks: number;
-  earnings: number;
-  uptime_seconds: number;
+  status: "online" | "busy" | "offline";
+  specs?: {
+    gpu?: string;
+    vram?: number;
+    cpu?: string;
+    ram?: number;
+  };
+  current_task?: string;
+  total_tasks_completed: number;
+  total_earned: number;
+  last_heartbeat: string;
 }
 
 export interface PayoutRequest {
   id: string;
   worker_id: string;
   amount: number;
-  status: "pending" | "approved" | "rejected" | "paid";
+  status: "pending" | "approved" | "rejected" | "completed";
+  method: "crypto" | "bank_transfer";
+  destination: string;
   created_at: string;
-  paid_at?: string;
+  processed_at?: string;
 }

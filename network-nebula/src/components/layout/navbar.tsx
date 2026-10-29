@@ -3,10 +3,8 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Menu,
   X,
-  User,
   Wallet,
   LogOut,
-  Settings,
   ChevronDown,
   Terminal,
   Server,
@@ -46,11 +44,11 @@ const DEVELOPER_LINKS: NavItem[] = [
   { href: "/moe", label: "MoE & Speculative", icon: Sparkles, badge: "3.8x" },
   { href: "/swarm", label: "Swarm Studio", icon: Layers, badge: "70B" },
   { href: "/api-tokens", label: "API Keys", icon: Key },
-  { href: "/jobs", label: "History", icon: Clock },
+  { href: "/jobs", label: "Job History", icon: Clock },
 ];
 
 const HOST_LINKS: NavItem[] = [
-  { href: "/worker", label: "Worker Node", icon: Activity, badge: "CLI" },
+  { href: "/worker", label: "Worker Dashboard", icon: Activity, badge: "CLI" },
   { href: "/worker/earnings", label: "Earnings & Payouts", icon: Coins, badge: "USDC" },
   { href: "/cluster", label: "GPU Fleet Mesh", icon: Network, badge: "P2P" },
   { href: "/governance", label: "Governance & SLA", icon: ShieldCheck, badge: "99.9%" },
@@ -89,32 +87,33 @@ export function Navbar({ user, onLogout }: NavbarProps) {
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    <nav className="sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+    <header className="sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+      {/* Tier 1: Main Header (Brand, Mode Switcher, Global Actions, Account) */}
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-        <div className="flex h-16 items-center justify-between gap-4">
-          {/* Left: Brand Logo & Segmented Mode Switcher */}
+        <div className="flex h-14 items-center justify-between gap-4">
+          {/* Left: Brand Logo + Workspace Mode Switcher */}
           <div className="flex items-center gap-4 sm:gap-6 shrink-0">
             <Link to="/" className="flex items-center gap-2.5 shrink-0 group">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 via-purple-600 to-pink-500 shadow-md shadow-indigo-500/20 group-hover:scale-105 transition-transform">
-                <span className="text-base font-black text-white">N</span>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 via-purple-600 to-pink-500 shadow-md shadow-indigo-500/20 group-hover:scale-105 transition-transform">
+                <span className="text-sm font-black text-white">N</span>
               </div>
-              <div className="hidden sm:block">
-                <span className="font-extrabold text-sm tracking-tight text-foreground block">
+              <div>
+                <span className="font-extrabold text-sm tracking-tight text-foreground block leading-tight">
                   Network Nebula
                 </span>
-                <span className="block text-[9px] text-muted-foreground font-mono -mt-0.5 tracking-wider uppercase">
+                <span className="hidden sm:block text-[9px] text-muted-foreground font-mono tracking-wider uppercase">
                   Decentralized AI Cloud
                 </span>
               </div>
             </Link>
 
-            {/* Segmented Workspace Mode Switcher (Desktop) */}
-            <div className="hidden lg:flex items-center p-1 rounded-xl bg-muted/60 border border-border/80 text-xs font-medium">
+            {/* Segmented Workspace Mode Switcher */}
+            <div className="hidden sm:flex items-center p-0.5 rounded-lg bg-muted/60 border border-border/80 text-xs font-medium">
               <button
                 type="button"
                 onClick={() => handleSwitchMode("developer")}
                 className={cn(
-                  "flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all",
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all",
                   activeMode === "developer"
                     ? "bg-background text-foreground shadow-sm font-semibold border border-indigo-500/30"
                     : "text-muted-foreground hover:text-foreground hover:bg-background/50"
@@ -127,7 +126,7 @@ export function Navbar({ user, onLogout }: NavbarProps) {
                 type="button"
                 onClick={() => handleSwitchMode("host")}
                 className={cn(
-                  "flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all",
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all",
                   activeMode === "host"
                     ? "bg-background text-foreground shadow-sm font-semibold border border-emerald-500/30"
                     : "text-muted-foreground hover:text-foreground hover:bg-background/50"
@@ -140,59 +139,24 @@ export function Navbar({ user, onLogout }: NavbarProps) {
             </div>
           </div>
 
-          {/* Center: Contextual Nav Links based on Mode */}
-          <div className="hidden md:flex items-center gap-1">
-            {currentLinks.map((link) => {
-              const Icon = link.icon;
-              const active = isActive(link.href);
-              return (
-                <Link
-                  key={link.href}
-                  to={link.href}
-                  className={cn(
-                    "inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all rounded-lg shrink-0",
-                    active
-                      ? "text-foreground bg-muted font-semibold shadow-sm border border-border"
-                      : "text-muted-foreground hover:text-foreground hover:bg-muted/60"
-                  )}
-                >
-                  <Icon className={cn("h-3.5 w-3.5", active ? "text-primary" : "text-muted-foreground")} />
-                  <span>{link.label}</span>
-                  {link.badge && (
-                    <span
-                      className={cn(
-                        "ml-0.5 px-1.5 py-0.5 rounded text-[9px] font-mono leading-none",
-                        activeMode === "developer"
-                          ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
-                          : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                      )}
-                    >
-                      {link.badge}
-                    </span>
-                  )}
-                </Link>
-              );
-            })}
-          </div>
-
-          {/* Right Side: Quick Mode Pill for smaller screens + Wallet + User Profile */}
-          <div className="hidden md:flex items-center gap-2">
-            {/* Quick Mode Toggle Icon for medium screens */}
+          {/* Right: Quick Switch (mobile) + Wallet + User Profile */}
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Quick Mode Toggle for small screens */}
             <Button
               variant="outline"
               size="sm"
               onClick={() => handleSwitchMode(activeMode === "developer" ? "host" : "developer")}
-              className="lg:hidden text-xs gap-1.5 h-8 border-border"
+              className="sm:hidden text-xs gap-1 h-8 px-2 border-border"
             >
               {activeMode === "developer" ? (
                 <>
                   <Server className="h-3.5 w-3.5 text-emerald-400" />
-                  <span>Host View</span>
+                  <span>Host</span>
                 </>
               ) : (
                 <>
                   <Terminal className="h-3.5 w-3.5 text-indigo-400" />
-                  <span>Dev View</span>
+                  <span>Dev</span>
                 </>
               )}
             </Button>
@@ -200,20 +164,23 @@ export function Navbar({ user, onLogout }: NavbarProps) {
             {user ? (
               <>
                 <Link to="/wallet">
-                  <Button variant="ghost" size="sm" className="gap-2 h-8 text-xs font-medium">
+                  <Button variant="ghost" size="sm" className="gap-1.5 h-8 text-xs font-medium px-2.5">
                     <Wallet className="h-3.5 w-3.5 text-amber-400" />
-                    <span>Wallet</span>
+                    <span className="hidden sm:inline">Wallet</span>
                   </Button>
                 </Link>
+
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="sm" className="gap-1.5 h-8 text-xs">
-                      <User className="h-3.5 w-3.5" />
-                      <span className="hidden xl:inline max-w-[120px] truncate">{user.email}</span>
+                    <Button variant="ghost" size="sm" className="gap-1.5 h-8 text-xs px-2.5">
+                      <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/20 text-primary font-bold text-[10px]">
+                        {user.email.charAt(0).toUpperCase()}
+                      </div>
+                      <span className="hidden md:inline max-w-[120px] truncate">{user.email}</span>
                       <ChevronDown className="h-3 w-3 opacity-60" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-48 text-xs">
+                  <DropdownMenuContent align="end" className="w-52 text-xs">
                     <div className="px-2 py-1.5 font-semibold text-muted-foreground text-[10px] uppercase tracking-wider">
                       Signed in as
                     </div>
@@ -222,9 +189,15 @@ export function Navbar({ user, onLogout }: NavbarProps) {
                     </div>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem asChild>
-                      <Link to="/settings" className="cursor-pointer">
-                        <Settings className="mr-2 h-3.5 w-3.5" />
-                        Settings
+                      <Link to="/wallet" className="cursor-pointer">
+                        <Wallet className="mr-2 h-3.5 w-3.5 text-amber-400" />
+                        Wallet & Credits
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem asChild>
+                      <Link to="/api-tokens" className="cursor-pointer">
+                        <Key className="mr-2 h-3.5 w-3.5 text-indigo-400" />
+                        API Keys & Tokens
                       </Link>
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -255,43 +228,80 @@ export function Navbar({ user, onLogout }: NavbarProps) {
                 </DropdownMenu>
               </>
             ) : (
-              <>
+              <div className="flex items-center gap-1.5">
                 <Link to="/login">
-                  <Button variant="ghost" size="sm" className="h-8 text-xs">
+                  <Button variant="ghost" size="sm" className="h-8 text-xs px-2.5">
                     Login
                   </Button>
                 </Link>
                 <Link to="/register">
                   <Button
                     size="sm"
-                    className="h-8 text-xs bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white shadow-sm"
+                    className="h-8 text-xs px-3 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white shadow-sm"
                   >
                     Register
                   </Button>
                 </Link>
-              </>
+              </div>
             )}
-          </div>
 
-          {/* Mobile Menu Hamburger */}
-          <div className="flex items-center md:hidden">
+            {/* Mobile Hamburger Button */}
             <Button
               variant="ghost"
               size="icon"
-              className="h-9 w-9"
+              className="h-8 w-8 md:hidden ml-1"
               onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
               aria-label={isMobileMenuOpen ? "Close menu" : "Open menu"}
             >
-              {isMobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+              {isMobileMenuOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
             </Button>
           </div>
         </div>
       </div>
 
-      {/* Mobile Drawer */}
+      {/* Tier 2: Dedicated Contextual Studio Navigation Bar */}
+      <div className="hidden md:block border-t border-border/50 bg-muted/20">
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+          <div className="flex h-10 items-center gap-1 overflow-x-auto no-scrollbar py-1">
+            {currentLinks.map((link) => {
+              const Icon = link.icon;
+              const active = isActive(link.href);
+              return (
+                <Link
+                  key={link.href}
+                  to={link.href}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium transition-all rounded-md shrink-0",
+                    active
+                      ? "text-foreground bg-background font-semibold shadow-sm border border-border/80 text-primary"
+                      : "text-muted-foreground hover:text-foreground hover:bg-background/40"
+                  )}
+                >
+                  <Icon className={cn("h-3.5 w-3.5", active ? "text-primary" : "text-muted-foreground")} />
+                  <span>{link.label}</span>
+                  {link.badge && (
+                    <span
+                      className={cn(
+                        "ml-0.5 px-1.5 py-0.5 rounded text-[9px] font-mono leading-none",
+                        activeMode === "developer"
+                          ? "bg-indigo-500/15 text-indigo-400 border border-indigo-500/30"
+                          : "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                      )}
+                    >
+                      {link.badge}
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile Drawer (When Open) */}
       {isMobileMenuOpen && (
-        <div className="border-t border-border bg-background/95 backdrop-blur md:hidden max-h-[85vh] overflow-y-auto">
-          {/* Mode Switcher Buttons */}
+        <div className="border-t border-border bg-background/98 backdrop-blur md:hidden max-h-[85vh] overflow-y-auto">
+          {/* Workspace Switcher in Mobile Drawer */}
           <div className="p-3 border-b border-border/80 grid grid-cols-2 gap-2">
             <Button
               size="sm"
@@ -325,10 +335,10 @@ export function Navbar({ user, onLogout }: NavbarProps) {
             </Button>
           </div>
 
-          {/* Active Navigation Category Links */}
+          {/* Studio Navigation Links */}
           <div className="p-3 space-y-1">
             <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
-              {activeMode === "developer" ? "💻 Developer Workspaces" : "⚡ Host & Compute Nodes"}
+              {activeMode === "developer" ? "💻 Developer Console" : "⚡ Host Provider Fleet"}
             </div>
             {currentLinks.map((link) => {
               const Icon = link.icon;
@@ -359,7 +369,7 @@ export function Navbar({ user, onLogout }: NavbarProps) {
             })}
           </div>
 
-          {/* User Account & Session Actions */}
+          {/* User Account / Session Footer in Mobile Drawer */}
           <div className="p-3 border-t border-border space-y-2 bg-muted/20">
             {user ? (
               <>
@@ -407,6 +417,6 @@ export function Navbar({ user, onLogout }: NavbarProps) {
           </div>
         </div>
       )}
-    </nav>
+    </header>
   );
 }

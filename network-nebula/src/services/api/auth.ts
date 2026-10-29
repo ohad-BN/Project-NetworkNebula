@@ -11,6 +11,7 @@ export interface RegisterRequest {
   password: string;
   confirm_password: string;
   role?: "creator" | "worker";
+  invite_code?: string;
 }
 
 export const authService = {
@@ -33,6 +34,26 @@ export const authService = {
     if (response.data.api_secret) {
       localStorage.setItem("api_secret", response.data.api_secret);
     }
+    return response.data;
+  },
+
+  verifyEmail: async (email: string, code: string): Promise<any> => {
+    const response = await apiClient.post("/auth/verify-email", { email, code });
+    return response.data;
+  },
+
+  resendVerificationCode: async (email: string): Promise<any> => {
+    const response = await apiClient.post("/auth/resend-code", { email });
+    return response.data;
+  },
+
+  validateInviteCode: async (code: string): Promise<any> => {
+    const response = await apiClient.post("/api/v1/invites/validate", { code });
+    return response.data;
+  },
+
+  claimFaucet: async (): Promise<any> => {
+    const response = await apiClient.post("/api/wallet/faucet", {});
     return response.data;
   },
 

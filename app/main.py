@@ -132,6 +132,29 @@ manager = ConnectionManager()
 @app.on_event("startup")
 def startup_event():
     Base.metadata.create_all(bind=engine)
+    # Ensure Closed Alpha columns & seed invite codes exist
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code VARCHAR(16);"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_expires_at TIMESTAMP;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_by_code VARCHAR(64);"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_faucet_claim TIMESTAMP;"))
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            try:
+                conn.execute(text("ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'FAUCET_GRANT';"))
+            except Exception:
+                pass
+            conn.execute(text("""
+                INSERT INTO invite_codes (code, max_uses, times_used, initial_credits, is_active, created_at)
+                VALUES ('NEBULA-ALPHA-2026', 1000, 0, 100.0, TRUE, NOW())
+                ON CONFLICT (code) DO NOTHING;
+            """))
+            conn.commit()
+    except Exception as exc:
+        import logging
+        logging.getLogger("main").warning(f"Schema check: {exc}")
 
 
 @app.get("/")
@@ -166,6 +189,7 @@ class RegisterRequest(BaseModel):
     password: str
     confirm_password: Optional[str] = None
     role: Optional[str] = "creator"
+    invite_code: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -176,23 +200,58 @@ class LoginRequest(BaseModel):
 @app.post("/auth/register")
 def register_user(request: RegisterRequest, db=Depends(get_db)):
     # Check if email already exists
-    existing_user = get_user_by_email(db, request.email)
+    clean_email = request.email.strip().lower()
+    existing_user = get_user_by_email(db, clean_email)
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Closed Alpha Gatekeeper: validate invite code if gatekeeper is enforced or invite code is provided
+    import os
+    gatekeeper_enforced = os.getenv("CLOSED_ALPHA_GATE", "false").lower() in ("true", "1", "yes")
+    code_record = None
+    if gatekeeper_enforced or request.invite_code:
+        inv_code = (request.invite_code or "").strip().upper()
+        if not inv_code:
+            raise HTTPException(status_code=400, detail="Alpha invite code is required to join Closed Alpha")
+        from app.models import InviteCode
+        code_record = db.query(InviteCode).filter(InviteCode.code == inv_code, InviteCode.is_active == True).first()
+        if not code_record or (code_record.expires_at and code_record.expires_at < datetime.utcnow()):
+            raise HTTPException(status_code=400, detail="Invalid or expired invite code")
+        if code_record.times_used >= code_record.max_uses:
+            raise HTTPException(status_code=400, detail="Invite code has reached its maximum usage limit")
+        code_record.times_used += 1
+
+    # Generate 6-digit OTP verification code
+    from datetime import timedelta
+    otp = f"{random.randint(100000, 999999)}"
+    otp_expiry = datetime.utcnow() + timedelta(minutes=15)
 
     api_key, api_secret = create_api_key_pair()
     user = User(
         id=str(uuid.uuid4()),
         api_key=api_key,
         api_secret=api_secret,
-        email=request.email,
+        email=clean_email,
         password_hash=hash_password(request.password),
         name=request.email.split("@")[0],
         is_worker=(request.role == "worker"),
         balance=50.0,
+        is_verified=False,
+        verification_code=otp,
+        verification_expires_at=otp_expiry,
+        invited_by_code=request.invite_code.strip().upper() if request.invite_code else None,
     )
     db.add(user)
     db.commit()
+
+    # Dispatch verification email (non-blocking)
+    try:
+        from app.email_service import send_verification_email
+        send_verification_email(user.email, otp)
+    except Exception as exc:
+        import logging
+        logging.getLogger("main").warning(f"Failed to dispatch verification email: {exc}")
+
     return {
         "user": {
             "id": user.id,
@@ -201,10 +260,12 @@ def register_user(request: RegisterRequest, db=Depends(get_db)):
             "role": "worker" if user.is_worker else "creator",
             "is_worker": user.is_worker,
             "balance": user.balance,
+            "is_verified": user.is_verified,
             "created_at": str(user.created_at),
         },
         "api_key": api_key,
         "api_secret": api_secret,
+        "message": "Account registered. Please enter the 6-digit verification OTP sent to your email.",
     }
 
 
@@ -1128,6 +1189,11 @@ app.include_router(dht_router)
 from app.payment_router import router as payment_router
 
 app.include_router(payment_router)
+
+# Include Closed Alpha Invites & Email Verification Router (Alpha Milestone 8)
+from app.invite_router import router as invite_router
+
+app.include_router(invite_router)
 
 
 
