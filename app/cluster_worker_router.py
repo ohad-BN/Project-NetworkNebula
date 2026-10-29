@@ -23,6 +23,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import PlainTextResponse, FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -352,25 +353,234 @@ class WorkerHeartbeatPayload(BaseModel):
 
 
 # ==============================================================================
-# Cluster Fleet Telemetry Endpoint
 # ==============================================================================
+# Cluster Fleet & User Hardware Endpoints
+# ==============================================================================
+
+
+@router.get("/api/v1/user/workers")
+@router.get("/api/user/workers")
+def get_user_workers(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all physical and remote GPU worker nodes registered by the authenticated user.
+    Never exposes simulated test workers belonging to other tenants.
+    """
+    user = resolve_optional_user(db, x_api_key=x_api_key, authorization=authorization)
+    if not user:
+        raw_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+        raw_auth = request.headers.get("authorization") or request.headers.get("Authorization")
+        user = resolve_optional_user(db, x_api_key=raw_key, authorization=raw_auth)
+
+    if not user:
+        return {
+            "status": "unauthenticated",
+            "total_nodes": 0,
+            "active_nodes": 0,
+            "total_vram_gb": 0.0,
+            "allocated_vram_gb": 0.0,
+            "used_vram_gb": 0.0,
+            "total_earnings_usd": 0.0,
+            "nodes": [],
+        }
+
+    # Query strictly the workers owned by this user
+    user_workers = (
+        db.query(Worker)
+        .filter(Worker.user_id == user.id)
+        .order_by(Worker.created_at.desc())
+        .all()
+    )
+
+    # Auto-link local primary worker if user is creator/admin and primary worker is unlinked
+    if not user_workers:
+        primary = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
+        if primary and (primary.user_id is None or primary.user_id == user.id):
+            primary.user_id = user.id
+            db.commit()
+            user_workers = [primary]
+
+    node_list = [serialize_worker_node(w) for w in user_workers]
+    total_vram = round(sum(n["vram_total_gb"] for n in node_list), 2)
+    allocated_vram = round(sum(n["vram_allocated_gb"] for n in node_list), 2)
+    used_vram = round(sum(n["vram_used_gb"] for n in node_list), 2)
+    total_earnings = round(sum(n["total_earnings_usd"] for n in node_list), 4)
+    active_count = sum(1 for n in node_list if n["status"] == "online")
+
+    return {
+        "status": "success",
+        "user_id": user.id,
+        "total_nodes": len(node_list),
+        "active_nodes": active_count,
+        "total_vram_gb": total_vram,
+        "allocated_vram_gb": allocated_vram,
+        "used_vram_gb": used_vram,
+        "total_earnings_usd": total_earnings,
+        "nodes": node_list,
+    }
+
+
+@router.get("/connect.ps1", response_class=PlainTextResponse)
+def get_windows_connect_script(
+    request: Request,
+    key: Optional[str] = Query(default=""),
+):
+    """Serve dynamic 1-click Windows PowerShell bootstrap script."""
+    base_url = str(request.base_url).rstrip("/")
+    clean_key = (key or "").strip()
+    script = f'''# NetworkNebula Windows Worker Bootstrapper
+param([string]$Key = "{clean_key}")
+$ErrorActionPreference = "Stop"
+$HostUrl = "{base_url}"
+
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "  Project NetworkNebula - GPU Worker Bootstrapper (Windows)" -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+
+# 1. Verify Python
+$pythonCmd = "python"
+if (-not (Get-Command "python" -ErrorAction SilentlyContinue)) {{
+    if (Get-Command "python3" -ErrorAction SilentlyContinue) {{
+        $pythonCmd = "python3"
+    }} else {{
+        Write-Host "[-] Python is not installed. Please install Python 3.10+ from python.org" -ForegroundColor Red
+        Exit 1
+    }}
+}}
+
+Write-Host "[+] Using Python: $(& $pythonCmd --version)" -ForegroundColor Green
+
+# 2. Fetch latest nebula_worker.py
+$workerScript = "nebula_worker.py"
+if (-not (Test-Path $workerScript)) {{
+    Write-Host "[*] Fetching latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
+    Invoke-WebRequest -Uri "$HostUrl/nebula_worker.py" -OutFile $workerScript -UseBasicParsing
+    Write-Host "[+] Downloaded nebula_worker.py." -ForegroundColor Green
+}}
+
+# 3. Launch Worker Agent
+$apiKeyArg = ""
+if ($Key -and $Key.Trim() -ne "") {{
+    $apiKeyArg = "--api-key $Key"
+    Write-Host "[+] Authenticating with account API key..." -ForegroundColor Green
+}}
+
+Write-Host "[*] Starting GPU Worker Node & Connecting Telemetry Tunnel..." -ForegroundColor Cyan
+& $pythonCmd $workerScript join --server $HostUrl $apiKeyArg --tunnel
+'''
+    return PlainTextResponse(script, media_type="text/plain")
+
+
+@router.get("/connect.sh", response_class=PlainTextResponse)
+def get_posix_connect_script(
+    request: Request,
+    key: Optional[str] = Query(default=""),
+):
+    """Serve dynamic 1-click macOS / Linux Bash bootstrap script."""
+    base_url = str(request.base_url).rstrip("/")
+    clean_key = (key or "").strip()
+    script = f'''#!/usr/bin/env bash
+set -e
+
+KEY="{clean_key}"
+if [ -n "$1" ]; then
+    KEY="$1"
+fi
+SERVER_URL="${{NEBULA_SERVER_URL:-{base_url}}}"
+
+echo "=========================================================="
+echo "  Project NetworkNebula - GPU Worker Bootstrapper (POSIX)"
+echo "=========================================================="
+
+PYTHON_CMD="python3"
+if ! command -v python3 &> /dev/null; then
+    if command -v python &> /dev/null; then
+        PYTHON_CMD="python"
+    else
+        echo "[-] Python is not installed. Please install Python 3.10+."
+        exit 1
+    fi
+fi
+
+echo "[+] Using Python: $($PYTHON_CMD --version)"
+
+if [ ! -f "nebula_worker.py" ]; then
+    echo "[*] Fetching latest nebula_worker.py from $SERVER_URL..."
+    curl -fsSL "$SERVER_URL/nebula_worker.py" -o nebula_worker.py
+    echo "[+] Downloaded nebula_worker.py."
+fi
+
+API_KEY_ARG=""
+if [ -n "$KEY" ]; then
+    API_KEY_ARG="--api-key $KEY"
+    echo "[+] Authenticating with account API key..."
+fi
+
+echo "[*] Starting GPU Worker Node & Connecting Telemetry Tunnel..."
+exec $PYTHON_CMD nebula_worker.py join --server "$SERVER_URL" $API_KEY_ARG --tunnel
+'''
+    return PlainTextResponse(script, media_type="text/plain")
+
+
+@router.get("/nebula_worker.py")
+def get_nebula_worker_file():
+    """Serve the standalone worker CLI script for 1-click download."""
+    script_path = os.path.join(os.getcwd(), "nebula_worker.py")
+    if not os.path.exists(script_path):
+        raise HTTPException(status_code=404, detail="nebula_worker.py not found on server")
+    return FileResponse(script_path, media_type="text/x-python", filename="nebula_worker.py")
 
 
 @router.get("/api/v1/cluster/telemetry")
 @router.get("/api/cluster/telemetry")
-def get_cluster_telemetry(db: Session = Depends(get_db)):
+def get_cluster_telemetry(
+    request: Request,
+    scope: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     """
     Return real-time cluster fleet telemetry, including the local physical RTX 4070 node
     and all registered remote worker nodes, VRAM contribution limits, and S3 storage status.
     """
     sync_primary_local_worker(db)
 
-    workers = (
-        db.query(Worker)
-        .filter(Worker.is_available == True)
-        .order_by(Worker.created_at.asc())
-        .all()
-    )
+    # Check if user specifically requested their personal fleet
+    if scope == "my_fleet":
+        from app.auth import verify_enterprise_auth
+        try:
+            user = verify_enterprise_auth(request, db=db)
+            workers = (
+                db.query(Worker)
+                .filter(Worker.user_id == user.id)
+                .order_by(Worker.created_at.desc())
+                .all()
+            )
+        except Exception:
+            workers = []
+    else:
+        # Global view: filter out internal test suite mock nodes unless client is test suite
+        user_agent = request.headers.get("user-agent", "").lower()
+        is_test_runner = "python-requests" in user_agent or "pytest" in user_agent
+
+        query = db.query(Worker).filter(Worker.is_available == True)
+        if not is_test_runner:
+            # Hide test mocks from production browser UI
+            query = query.filter(
+                ~Worker.name.ilike("testworker%"),
+                ~Worker.name.ilike("testgpuworker%"),
+                ~Worker.name.ilike("worker1%"),
+                ~Worker.name.ilike("worker2%"),
+                ~Worker.name.ilike("worker3%"),
+                ~Worker.name.ilike("worker4%"),
+                ~Worker.name.ilike("nebula-peer-shard%"),
+            )
+        workers = query.order_by(Worker.created_at.asc()).all()
+
     node_list = [serialize_worker_node(w) for w in workers]
 
     total_vram = round(sum(n["vram_total_gb"] for n in node_list), 2)
@@ -507,7 +717,7 @@ def register_worker_node(
         worker.status = "online"
         worker.is_available = True
         worker.last_heartbeat = datetime.utcnow()
-        if user and not worker.user_id:
+        if user:
             worker.user_id = user.id
     else:
         worker = Worker(

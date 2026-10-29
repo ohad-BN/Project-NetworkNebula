@@ -95,8 +95,24 @@ export const workersService = {
     return response.data;
   },
 
-  getClusterTelemetry: async (): Promise<ClusterTelemetryResponse> => {
-    const response = await apiClient.get("/api/v1/cluster/telemetry");
+  getClusterTelemetry: async (scope?: string): Promise<ClusterTelemetryResponse> => {
+    const response = await apiClient.get("/api/v1/cluster/telemetry", {
+      params: scope ? { scope } : {},
+    });
+    return response.data;
+  },
+
+  getUserWorkers: async (): Promise<{
+    status: string;
+    total_nodes: number;
+    active_nodes: number;
+    total_vram_gb: number;
+    allocated_vram_gb: number;
+    used_vram_gb: number;
+    total_earnings_usd: number;
+    nodes: ClusterNodeTelemetry[];
+  }> => {
+    const response = await apiClient.get("/api/v1/user/workers");
     return response.data;
   },
 

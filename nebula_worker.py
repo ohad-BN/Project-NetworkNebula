@@ -244,11 +244,16 @@ def cmd_join(args: argparse.Namespace) -> int:
     region = getattr(args, "region", "us-east") or "us-east"
 
     node_name = args.name or f"{hw['hostname']} ({hw['gpu_model']})"
-    worker_id = args.worker_id or DEFAULT_WORKER_ID
+    safe_host = hw['hostname'].lower().replace(" ", "-").replace(".", "-")
+    if args.worker_id and args.worker_id != DEFAULT_WORKER_ID:
+        worker_id = args.worker_id
+    else:
+        worker_id = f"node-{safe_host}"
 
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     if args.api_key:
-        headers["X-API-Key"] = args.api_key
+        headers["X-API-Key"] = args.api_key.strip()
+        headers["Authorization"] = f"Bearer {args.api_key.strip()}"
 
     reg_payload = {
         "worker_id": worker_id,
@@ -792,15 +797,15 @@ def build_parser() -> argparse.ArgumentParser:
     join_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # status command
-    stat_p = subparsers.add_parser("status", help="Show live GPU fleet telemetry and contribution %")
+    stat_p = subparsers.add_parser("status", help="Show live GPU fleet telemetry and contribution percentage")
     stat_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
     stat_p.add_argument("--json", action="store_true", help="Output status as machine-readable JSON")
 
     # set-limit command
-    lim_p = subparsers.add_parser("set-limit", help="Adjust GPU VRAM contribution percentage (10-100%)")
+    lim_p = subparsers.add_parser("set-limit", help="Adjust GPU VRAM contribution percentage (10-100%%)")
     lim_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
     lim_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
-    lim_p.add_argument("--vram-pct", type=int, required=True, help="Target GPU VRAM contribution % (10-100)")
+    lim_p.add_argument("--vram-pct", type=int, required=True, help="Target GPU VRAM contribution percentage (10-100)")
     lim_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # work command (Phase 3.3)
