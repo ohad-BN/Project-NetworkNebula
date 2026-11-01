@@ -15,6 +15,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Cpu,
+  DollarSign,
   Sliders,
   Copy,
   Check,
@@ -430,17 +431,22 @@ export function WorkerDashboardPage() {
           <div>
             <h2 className="text-base font-bold flex items-center gap-2">
               <Laptop className="h-4 w-4 text-emerald-400" />
-              Connected Compute Systems ({myNodes.length})
+              Active Physical Hardware Nodes
             </h2>
             <p className="text-xs text-muted-foreground">
-              Each system groups its hardware and GPU cards. Manage VRAM allocation per GPU card remotely.
+              All computers and GPUs linked to your account. Control settings remotely from any device.
             </p>
           </div>
-          {lastHeartbeat && (
-            <span className="font-mono text-[10px] text-muted-foreground">
-              Telemetry synced {lastHeartbeat.toLocaleTimeString()}
+          <div className="flex items-center gap-3">
+            {lastHeartbeat && (
+              <span className="font-mono text-[10px] text-muted-foreground">
+                Synced {lastHeartbeat.toLocaleTimeString()}
+              </span>
+            )}
+            <span className="text-xs text-muted-foreground font-mono">
+              {myNodes.length} machine{myNodes.length === 1 ? "" : "s"} configured
             </span>
-          )}
+          </div>
         </div>
 
         {/* EMPTY STATE */}
@@ -458,15 +464,15 @@ export function WorkerDashboardPage() {
           </Card>
         )}
 
-        {/* HIERARCHICAL SYSTEM & MULTI-GPU CARDS */}
-        <div className="space-y-6">
+        {/* COMPACT CARD BLOCKS GRID (PREVIOUS BLOCK DESIGN) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {myNodes.map((w) => {
             const isOnline = w.status === "online" && w.is_available;
             const systemGpus = w.gpus && w.gpus.length > 0
               ? w.gpus
               : [{
                   index: 0,
-                  name: w.gpu_model || "GPU Accelerator",
+                  name: w.gpu_model || w.gpu_info || "GPU Accelerator",
                   vram_total_gb: w.gpu_memory_gb || w.vram_total_gb || 8.0,
                   vram_allocated_gb: w.vram_allocated_gb || 6.4,
                   vram_used_gb: w.vram_used_gb || 0.95,
@@ -476,133 +482,185 @@ export function WorkerDashboardPage() {
                   is_available: w.is_available,
                 }];
 
+            const vramAlloc = w.vram_allocated_gb || ((w.gpu_memory_gb || 8.0) * (w.vram_allocation_pct || 80)) / 100;
+            const vramTotal = w.gpu_memory_gb || w.vram_total_gb || 8.0;
+
             return (
-              <Card key={w.node_id || w.id} className="border-border/80 bg-card/80 backdrop-blur-sm relative overflow-hidden shadow-sm">
-                {/* Status accent bar */}
-                <div className={`h-1.5 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
+              <Card key={w.node_id || w.id} className="border-border/80 bg-card/70 backdrop-blur-sm relative overflow-hidden shadow-sm flex flex-col justify-between">
+                <div>
+                  {/* Top highlight bar based on status */}
+                  <div className={`h-1.5 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
 
-                {/* System Header */}
-                <CardHeader className="p-4 sm:p-5 pb-3 border-b bg-muted/20">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2.5">
-                        <span className={`h-3 w-3 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
-                        <CardTitle className="text-lg font-bold text-foreground">
-                          {w.system_name || w.name}
-                        </CardTitle>
-                        <Badge variant="outline" className="font-mono text-[10px] uppercase">
-                          {systemGpus.length} GPU{systemGpus.length === 1 ? "" : "s"}
-                        </Badge>
+                  <CardHeader className="p-4 sm:p-5 pb-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
+                          <CardTitle className="text-base font-bold text-foreground truncate">
+                            {w.system_name || w.name || w.gpu_model}
+                          </CardTitle>
+                        </div>
+                        <p className="text-xs text-muted-foreground font-mono truncate">
+                          Node ID: {w.node_id || w.id}
+                        </p>
                       </div>
-                      <p className="text-xs text-muted-foreground font-mono">
-                        Node ID: {w.node_id || w.id} • {w.cpu_cores} CPU Cores • {w.memory_gb} GB System RAM • {w.cuda_version || "Metal / MPS"} • {w.region || "us-east"} ({w.latency_ping_ms ?? 12.0}ms)
-                      </p>
-                    </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      <Badge variant={isOnline ? "default" : "secondary"} className={isOnline ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-xs" : "text-xs"}>
-                        {isOnline ? "Online • Active" : "Paused • Offline"}
-                      </Badge>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <Badge variant={isOnline ? "default" : "secondary"} className={isOnline ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]" : "text-[10px]"}>
+                          {isOnline ? "Online • Active" : "Paused • Offline"}
+                        </Badge>
 
-                      {/* Remote Pause / Resume Toggle */}
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-8 w-8 p-0"
-                        title={isOnline ? "Pause System (Stop receiving tasks)" : "Resume System (Start accepting tasks)"}
-                        onClick={() => handleToggleAvailability(w.node_id || w.id, w.is_available)}
-                        disabled={isUpdating}
-                      >
-                        {isOnline ? <Pause className="h-4 w-4 text-amber-400" /> : <Play className="h-4 w-4 text-emerald-400" />}
-                      </Button>
-
-                      {/* Deregister Node */}
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-                        title="Remove / Unlink Machine"
-                        onClick={() => handleDeregister(w.node_id || w.id)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                </CardHeader>
-
-                {/* Individual GPU Cards Section */}
-                <CardContent className="p-4 sm:p-5 space-y-4">
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span className="font-semibold uppercase tracking-wider text-[11px] text-foreground flex items-center gap-1.5">
-                      <Cpu className="h-3.5 w-3.5 text-primary" />
-                      Installed GPU Accelerators & VRAM Allocation Controls
-                    </span>
-                    <span className="font-mono text-[11px]">
-                      Combined Rate: ${(w.hourly_rate_usd || 0.45).toFixed(2)}/hr • Accrued: ${(w.total_earnings_usd || 0).toFixed(4)}
-                    </span>
-                  </div>
-
-                  <div className={`grid grid-cols-1 ${systemGpus.length > 1 ? "md:grid-cols-2" : "grid-cols-1"} gap-4`}>
-                    {systemGpus.map((gpu) => {
-                      const vramAlloc = gpu.vram_allocated_gb || (gpu.vram_total_gb * (gpu.vram_allocation_pct || 80)) / 100;
-
-                      return (
-                        <div
-                          key={`gpu-${gpu.index}`}
-                          className="bg-muted/30 border rounded-lg p-4 space-y-3.5"
+                        {/* Remote Pause / Resume Toggle */}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 w-7 p-0"
+                          title={isOnline ? "Pause Machine (Stop receiving tasks)" : "Resume Machine (Start accepting tasks)"}
+                          onClick={() => handleToggleAvailability(w.node_id || w.id, w.is_available)}
+                          disabled={isUpdating}
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <div className="flex items-center gap-2">
-                                <Badge className="bg-primary/20 text-primary border-primary/30 text-[10px] font-mono">
-                                  GPU {gpu.index}
-                                </Badge>
-                                <span className="font-bold text-sm text-foreground">
-                                  {gpu.name}
+                          {isOnline ? <Pause className="h-3.5 w-3.5 text-amber-400" /> : <Play className="h-3.5 w-3.5 text-emerald-400" />}
+                        </Button>
+
+                        {/* Deregister Node */}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
+                          title="Remove / Unlink Machine"
+                          onClick={() => handleDeregister(w.node_id || w.id)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </CardHeader>
+
+                  <CardContent className="p-4 sm:p-5 pt-0 space-y-4">
+                    {/* Hardware Specs Grid - 2x2 spacious responsive layout */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs bg-muted/30 p-3.5 rounded-lg border font-mono">
+                      <div className="space-y-0.5">
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                          GPU Accelerator
+                        </span>
+                        <span className="font-semibold text-foreground flex items-center gap-1.5 truncate">
+                          <Cpu className="h-3.5 w-3.5 text-primary shrink-0" />
+                          {w.gpu_model || w.gpu_info}
+                        </span>
+                      </div>
+                      <div className="space-y-0.5">
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                          CUDA / Framework
+                        </span>
+                        <span className="font-semibold text-foreground">
+                          {w.cuda_version || "Metal / MPS"}
+                        </span>
+                      </div>
+                      <div className="space-y-0.5">
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                          CPU & System RAM
+                        </span>
+                        <span className="font-semibold text-foreground">
+                          {w.cpu_cores} Cores • {w.memory_gb} GB RAM
+                        </span>
+                      </div>
+                      <div className="space-y-0.5">
+                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold block font-sans">
+                          Region & Ping Latency
+                        </span>
+                        <span className="font-semibold text-foreground flex items-center gap-1.5">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
+                          {w.region || "us-east"} • {w.latency_ping_ms ?? 12.0}ms
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Remote VRAM Allocation Slider(s) */}
+                    {systemGpus.length > 1 ? (
+                      <div className="space-y-3 pt-1">
+                        <span className="text-[11px] font-semibold text-foreground uppercase tracking-wider flex items-center gap-1.5">
+                          <Sliders className="h-3 w-3 text-primary" />
+                          VRAM Allocation Controls ({systemGpus.length} GPUs)
+                        </span>
+                        {systemGpus.map((gpu, gIdx) => {
+                          const gAlloc = gpu.vram_allocated_gb || ((gpu.vram_total_gb || 8.0) * (gpu.vram_allocation_pct || 80)) / 100;
+                          const gTotal = gpu.vram_total_gb || 8.0;
+                          const gPct = gpu.vram_allocation_pct || 80;
+                          return (
+                            <div key={`gpu-slider-${gpu.index ?? gIdx}`} className="space-y-1.5 p-2.5 rounded-md bg-muted/40 border">
+                              <div className="flex items-center justify-between text-xs">
+                                <span className="font-medium text-foreground flex items-center gap-1.5">
+                                  <Badge className="bg-primary/20 text-primary border-primary/30 text-[9px] font-mono h-4 px-1">
+                                    GPU {gpu.index ?? gIdx}
+                                  </Badge>
+                                  <span className="truncate max-w-[140px]">{gpu.name || "GPU Card"}</span>
+                                </span>
+                                <span className="font-mono font-bold text-primary text-[11px]">
+                                  {gPct}% ({gAlloc.toFixed(1)} / {gTotal.toFixed(1)} GB)
                                 </span>
                               </div>
-                              <span className="text-[11px] text-muted-foreground font-mono mt-0.5 block">
-                                {gpu.gpu_utilization_pct || 10}% utilization • {gpu.vram_total_gb} GB Total VRAM
-                              </span>
+                              <Slider
+                                value={gPct}
+                                min={10}
+                                max={100}
+                                step={5}
+                                disabled={isUpdating || !isOnline}
+                                onValueChange={(val) => handleSliderChange(w.node_id || w.id, val, gpu.index ?? gIdx)}
+                              />
                             </div>
-
-                            <span className="font-mono font-bold text-sm text-primary">
-                              {gpu.vram_allocation_pct || 80}%
-                            </span>
-                          </div>
-
-                          {/* Dedicated Slider per GPU */}
-                          <div className="space-y-1.5 pt-1">
-                            <div className="flex items-center justify-between text-xs">
-                              <span className="text-muted-foreground flex items-center gap-1 text-[11px]">
-                                <Sliders className="h-3 w-3 text-primary" />
-                                VRAM Allocation Ceiling
-                              </span>
-                              <span className="font-mono text-xs font-semibold text-foreground">
-                                {vramAlloc.toFixed(1)} / {gpu.vram_total_gb.toFixed(1)} GB
-                              </span>
-                            </div>
-
-                            <Slider
-                              value={gpu.vram_allocation_pct || 80}
-                              min={10}
-                              max={100}
-                              step={5}
-                              disabled={isUpdating || !isOnline}
-                              onValueChange={(val) => handleSliderChange(w.node_id || w.id, val, gpu.index)}
-                            />
-
-                            <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
-                              <span>10% (Low)</span>
-                              <span>50% (Balanced)</span>
-                              <span>100% (Dedicated)</span>
-                            </div>
-                          </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="space-y-2 pt-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-foreground flex items-center gap-1.5">
+                            <Sliders className="h-3.5 w-3.5 text-primary" />
+                            Remote VRAM Contribution Ceiling
+                          </span>
+                          <span className="font-mono font-bold text-primary">
+                            {w.vram_allocation_pct || 80}% ({vramAlloc.toFixed(1)} / {vramTotal.toFixed(1)} GB)
+                          </span>
                         </div>
-                      );
-                    })}
+
+                        <Slider
+                          value={w.vram_allocation_pct || 80}
+                          min={10}
+                          max={100}
+                          step={5}
+                          disabled={isUpdating || !isOnline}
+                          onValueChange={(val) => handleSliderChange(w.node_id || w.id, val, 0)}
+                        />
+
+                        <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
+                          <span>10% (Low impact)</span>
+                          <span>50% (Balanced)</span>
+                          <span>100% (Dedicated)</span>
+                        </div>
+                      </div>
+                    )}
+                  </CardContent>
+                </div>
+
+                {/* Machine Earnings & Telemetry footer */}
+                <div className="flex items-center justify-between p-4 sm:p-5 pt-3 border-t text-xs bg-muted/10">
+                  <div className="flex items-center gap-2">
+                    <DollarSign className="h-4 w-4 text-emerald-400" />
+                    <span className="text-muted-foreground">Accrued:</span>
+                    <span className="font-mono font-bold text-emerald-400">
+                      ${(w.total_earnings_usd || 0).toFixed(4)}
+                    </span>
                   </div>
-                </CardContent>
+
+                  <div className="flex items-center gap-2 text-muted-foreground">
+                    <span>Rate:</span>
+                    <span className="font-mono font-semibold text-foreground">
+                      ${(w.hourly_rate_usd || 0.45).toFixed(2)}/hr
+                    </span>
+                    <span>•</span>
+                    <span>Tasks: {w.total_tasks_completed || 0}</span>
+                  </div>
+                </div>
               </Card>
             );
           })}
