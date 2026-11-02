@@ -13,6 +13,10 @@ import {
   Sliders,
   TrendingDown,
   UploadCloud,
+  Server,
+  Network,
+  CheckSquare,
+  Square,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,6 +26,19 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { apiClient } from "@/services/api/client";
 import { toast } from "sonner";
+
+interface ClusterNodeItem {
+  node_id: string;
+  name: string;
+  gpu_model: string;
+  vram_total_gb: number;
+  vram_allocated_gb: number;
+  vram_allocation_pct: number;
+  status: string;
+  is_available: boolean;
+  region?: string;
+  hourly_rate_usd?: number;
+}
 
 interface TrainingJobItem {
   id: string;
@@ -52,14 +69,19 @@ export function TrainingStudioPage() {
 
   // Form State
   const [jobName, setJobName] = useState("");
-  const [baseModel, setBaseModel] = useState("meta-llama/Llama-3-8B");
+  const [baseModel, setBaseModel] = useState("Qwen/Qwen2.5-0.5B-Instruct");
   const [trainType, setTrainType] = useState("lora");
-  const [datasetUrl, setDatasetUrl] = useState("http://localhost:9000/nebula-datasets/enterprise/dataset.jsonl");
+  const [datasetUrl, setDatasetUrl] = useState("http://localhost:9000/nebula-datasets/enterprise/real_alpaca_dataset.jsonl");
   const [epochs, setEpochs] = useState("3");
   const [learningRate, setLearningRate] = useState("0.0002");
   const [loraR, setLoraR] = useState("16");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGeneratingUpload, setIsGeneratingUpload] = useState(false);
+
+  // Fleet & Multi-Worker State
+  const [clusterNodes, setClusterNodes] = useState<ClusterNodeItem[]>([]);
+  const [distributionMode, setDistributionMode] = useState<"single" | "distributed">("single");
+  const [selectedWorkerIds, setSelectedWorkerIds] = useState<string[]>([]);
 
   const fetchJobs = async () => {
     try {
@@ -73,11 +95,35 @@ export function TrainingStudioPage() {
     }
   };
 
+  const fetchClusterNodes = async () => {
+    try {
+      const res = await apiClient.get("/api/v1/cluster/telemetry");
+      const nodes = (res.data?.nodes || []) as ClusterNodeItem[];
+      setClusterNodes(nodes);
+      const onlineIds = nodes.filter((n) => n.status === "online").map((n) => n.node_id);
+      if (onlineIds.length > 0 && selectedWorkerIds.length === 0) {
+        setSelectedWorkerIds(onlineIds);
+      }
+    } catch (err) {
+      // Ignore telemetry fetch errors
+    }
+  };
+
   useEffect(() => {
     fetchJobs();
-    const interval = setInterval(fetchJobs, 5000);
+    fetchClusterNodes();
+    const interval = setInterval(() => {
+      fetchJobs();
+      fetchClusterNodes();
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  const toggleWorkerSelection = (nodeId: string) => {
+    setSelectedWorkerIds((prev) =>
+      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
+    );
+  };
 
   const handleGenerateUploadUrl = async () => {
     try {
@@ -98,23 +144,35 @@ export function TrainingStudioPage() {
     e.preventDefault();
     try {
       setIsSubmitting(true);
+      const isDistributed = distributionMode === "distributed" && selectedWorkerIds.length > 1;
+      const targetWorkerIds = isDistributed ? selectedWorkerIds : undefined;
+      const gpuCount = isDistributed ? selectedWorkerIds.length : 1;
+
       const payload = {
         name: jobName.trim() || undefined,
         base_model: baseModel,
         train_type: trainType,
-        parallelism: "data_parallel",
-        num_gpus: 1,
+        parallelism: isDistributed ? "data_parallel" : "data_parallel",
+        num_gpus: gpuCount,
+        worker_ids: targetWorkerIds,
         dataset_s3_url: datasetUrl,
         total_epochs: parseInt(epochs, 10) || 3,
         hyperparameters: {
           learning_rate: parseFloat(learningRate) || 0.0002,
           batch_size: 4,
           lora_r: parseInt(loraR, 10) || 16,
-          lora_alpha: 32
+          lora_alpha: 32,
+          worker_ids: targetWorkerIds,
         }
       };
-      await apiClient.post("/api/v1/training/jobs", payload);
-      toast.success("Training run submitted to GPU compute fleet");
+
+      const endpoint = isDistributed ? "/api/v1/training/distributed/jobs" : "/api/v1/training/jobs";
+      await apiClient.post(endpoint, payload);
+      toast.success(
+        isDistributed
+          ? `Distributed training run dispatched across ${selectedWorkerIds.length} nodes!`
+          : "Training run submitted to GPU compute fleet"
+      );
       setIsSubmitModalOpen(false);
       setJobName("");
       fetchJobs();
@@ -210,10 +268,9 @@ export function TrainingStudioPage() {
                       value={baseModel}
                       onChange={(e) => setBaseModel(e.target.value)}
                     >
-                      <option value="meta-llama/Llama-3-8B">meta-llama/Llama-3-8B</option>
-                      <option value="mistralai/Mistral-7B-Instruct-v0.3">mistralai/Mistral-7B</option>
-                      <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B</option>
-                      <option value="deepseek-ai/DeepSeek-R1-Distill-Qwen-8B">DeepSeek-R1-Distill-8B</option>
+                      <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen/Qwen2.5-0.5B (Active Local Hardware)</option>
+                      <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen/Qwen2.5-1.5B (Active Local Hardware)</option>
+                      <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B (Production Fine-Tuning)</option>
                     </select>
                   </div>
 
@@ -230,6 +287,102 @@ export function TrainingStudioPage() {
                       <option value="full">Full Fine-Tuning</option>
                     </select>
                   </div>
+                </div>
+
+                {/* Compute Fleet & Distribution Selector */}
+                <div className="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3.5">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-sm font-semibold flex items-center gap-1.5">
+                      <Network className="h-4 w-4 text-primary" />
+                      Compute Fleet Distribution
+                    </Label>
+                    <Badge variant="outline" className="text-xs">
+                      {clusterNodes.filter((n) => n.status === "online").length} Nodes Available
+                    </Badge>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDistributionMode("single")}
+                      className={`flex items-center gap-2 rounded-md border p-2.5 text-left text-xs transition-colors cursor-pointer ${
+                        distributionMode === "single"
+                          ? "border-primary bg-primary/10 text-primary font-medium"
+                          : "border-border/60 hover:bg-muted/50 text-muted-foreground"
+                      }`}
+                    >
+                      <Cpu className="h-4 w-4 shrink-0" />
+                      <div>
+                        <div className="font-semibold text-foreground">Single Best GPU</div>
+                        <div className="text-[11px] opacity-80">Auto-routes to highest VRAM node</div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setDistributionMode("distributed")}
+                      className={`flex items-center gap-2 rounded-md border p-2.5 text-left text-xs transition-colors cursor-pointer ${
+                        distributionMode === "distributed"
+                          ? "border-primary bg-primary/10 text-primary font-medium"
+                          : "border-border/60 hover:bg-muted/50 text-muted-foreground"
+                      }`}
+                    >
+                      <Server className="h-4 w-4 shrink-0" />
+                      <div>
+                        <div className="font-semibold text-foreground">Distributed Mesh</div>
+                        <div className="text-[11px] opacity-80">Ring All-Reduce multi-node split</div>
+                      </div>
+                    </button>
+                  </div>
+
+                  {distributionMode === "distributed" && (
+                    <div className="space-y-2 pt-1 border-t border-border/40">
+                      <div className="text-xs text-muted-foreground flex items-center justify-between">
+                        <span>Select worker nodes to join this distributed training run:</span>
+                        <span className="font-mono text-primary">{selectedWorkerIds.length} selected</span>
+                      </div>
+                      <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                        {clusterNodes.map((node) => {
+                          const isSelected = selectedWorkerIds.includes(node.node_id);
+                          const isOnline = node.status === "online";
+                          return (
+                            <div
+                              key={node.node_id}
+                              onClick={() => toggleWorkerSelection(node.node_id)}
+                              className={`flex items-center justify-between p-2 rounded border text-xs cursor-pointer transition-colors ${
+                                isSelected
+                                  ? "border-primary/60 bg-primary/5"
+                                  : "border-border/40 hover:bg-muted/40"
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                {isSelected ? (
+                                  <CheckSquare className="h-4 w-4 text-primary" />
+                                ) : (
+                                  <Square className="h-4 w-4 text-muted-foreground" />
+                                )}
+                                <div>
+                                  <div className="font-medium text-foreground">{node.name || node.node_id}</div>
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {node.gpu_model || "CPU Fallback"} • {node.vram_allocated_gb || node.vram_total_gb || 8} GB VRAM
+                                  </div>
+                                </div>
+                              </div>
+                              <Badge
+                                variant={isOnline ? "default" : "outline"}
+                                className={`text-[10px] ${isOnline ? "bg-emerald-600" : "text-muted-foreground"}`}
+                              >
+                                {node.status || "offline"}
+                              </Badge>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[11px] text-muted-foreground italic">
+                        ⚡ Micro-batch dataset shards will be partitioned proportionally based on node compute horsepower (CUDA VRAM vs CPU) and merged each epoch.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-2">

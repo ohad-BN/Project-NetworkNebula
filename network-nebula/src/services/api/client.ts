@@ -1,6 +1,16 @@
 import axios from "axios";
 
-const API_BASE_URL = "http://localhost:8000";
+export const getApiBaseUrl = (): string => {
+  if (typeof window !== "undefined") {
+    if (window.location.port === "5173") {
+      return "http://localhost:8000";
+    }
+    return "";
+  }
+  return "http://localhost:8000";
+};
+
+const API_BASE_URL = getApiBaseUrl();
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,

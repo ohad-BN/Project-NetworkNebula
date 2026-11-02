@@ -418,6 +418,20 @@ class ShardingEngine:
 
         pipeline_id = f"pipe-{uuid.uuid4().hex[:8]}"
 
+        if not worker_ids:
+            from app.database import SessionLocal
+            from app.models import Worker
+            from app.cluster_worker_router import is_real_hardware_node, LOCAL_PRIMARY_NODE_ID
+            try:
+                db_s = SessionLocal()
+                real_workers = [w.id for w in db_s.query(Worker).filter(Worker.status == "online", Worker.is_available == True).all() if is_real_hardware_node(w)]
+                db_s.close()
+            except Exception:
+                real_workers = []
+            if not real_workers:
+                real_workers = [LOCAL_PRIMARY_NODE_ID]
+            worker_ids = [real_workers[idx % len(real_workers)] for idx in range(len(stages))]
+
         # Assign primary workers if provided
         if worker_ids:
             for idx, wid in enumerate(worker_ids):
@@ -745,11 +759,25 @@ class ShardingEngine:
                 num_stages=num_stages,
                 quantization=quantization,
             )
-            # Assign worker nodes to each stage
+            # Query real physical online workers from database
+            from app.database import SessionLocal
+            from app.models import Worker
+            from app.cluster_worker_router import is_real_hardware_node, LOCAL_PRIMARY_NODE_ID
+            real_workers = []
+            try:
+                db_s = SessionLocal()
+                real_workers = [w.id for w in db_s.query(Worker).filter(Worker.status == "online", Worker.is_available == True).all() if is_real_hardware_node(w)]
+                db_s.close()
+            except Exception:
+                pass
+            if not real_workers:
+                real_workers = [LOCAL_PRIMARY_NODE_ID]
+
+            # Assign real worker nodes to each stage
             for idx, stage in enumerate(stages):
-                stage.primary_worker_id = f"swarm-gpu-node-0{idx + 1}"
+                stage.primary_worker_id = real_workers[idx % len(real_workers)]
                 stage.status = "ready"
-                stage.standby_worker_ids = [f"swarm-gpu-standby-0{idx + 1}"]
+                stage.standby_worker_ids = [w for w in real_workers if w != stage.primary_worker_id]
 
             pipeline = SwarmPipeline(
                 pipeline_id=pipeline_id,

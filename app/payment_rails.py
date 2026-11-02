@@ -246,7 +246,7 @@ def process_stripe_webhook(
             user = db.query(User).filter(User.email == customer_email).first()
 
     if not user:
-        user = db.query(User).filter(User.is_active == True).first()
+        user = db.query(User).filter(User.is_active == True).order_by(User.created_at.asc()).first()
 
     if not user:
         raise HTTPException(
@@ -447,7 +447,7 @@ def verify_crypto_deposit(
     if user_id:
         user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        user = db.query(User).filter(User.is_active == True).first()
+        user = db.query(User).filter(User.is_active == True).order_by(User.created_at.asc()).first()
 
     if not user:
         raise HTTPException(

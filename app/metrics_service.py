@@ -229,8 +229,9 @@ class MetricsService:
 
     def get_metrics_summary(self, db: Session) -> Dict[str, Any]:
         """Return structured JSON summary of real-time cluster telemetry and SLA metrics."""
+        from app.cluster_worker_router import is_real_hardware_node
         pct = self.compute_percentiles()
-        workers = db.query(Worker).all()
+        workers = [w for w in db.query(Worker).all() if is_real_hardware_node(w)]
 
         total_nodes = len(workers)
         online_nodes = sum(1 for w in workers if w.is_available and (w.status or "").lower() == "online")

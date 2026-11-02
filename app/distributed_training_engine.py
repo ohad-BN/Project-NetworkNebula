@@ -95,75 +95,107 @@ class DistributedTrainingEngine:
         )
         worker_ids = list(sched_res.get("selected_worker_ids", []))
 
-        # Provision virtual peer shard nodes if cluster has fewer than num_gpus eligible workers
+        # If scheduler didn't return enough workers, select available real online workers
         if len(worker_ids) < num_gpus:
-            owner = db.query(User).filter(User.is_worker == True).first() or db.query(User).first()
-            owner_id = owner.id if owner else None
-            assigned_region = enforce_region or "us-east"
+            available = (
+                db.query(Worker)
+                .filter(Worker.is_available == True, Worker.status == "online")
+                .all()
+            )
+            for w in available:
+                if w.id not in worker_ids:
+                    worker_ids.append(w.id)
+                if len(worker_ids) >= num_gpus:
+                    break
 
-            for idx in range(len(worker_ids) + 1, num_gpus + 1):
-                peer_id = f"node-gpu-shard-{idx:02d}"
-                existing = db.query(Worker).filter(Worker.id == peer_id).first()
-                if not existing:
-                    peer_worker = Worker(
-                        id=peer_id,
-                        user_id=owner_id,
-                        name=f"Nebula-Peer-Shard-{idx:02d}",
-                        gpu_info="NVIDIA GeForce RTX 4070 Laptop GPU (Shard)",
-                        status="online",
-                        cpu_cores=8,
-                        memory_gb=16.0,
-                        gpu_memory_gb=8.0,
-                        vram_used_gb=1.2,
-                        vram_allocation_pct=80,
-                        gpu_utilization_pct=15.0,
-                        cuda_version="12.8",
-                        role="Distributed Training Shard",
-                        hourly_rate_usd=0.45,
-                        total_earnings_usd=0.0,
-                        is_available=True,
-                        total_tasks_completed=0,
-                        region=assigned_region,
-                        latency_ping_ms=11.2,
-                    )
-                    db.add(peer_worker)
-                    db.commit()
-                else:
-                    existing.status = "online"
-                    existing.is_available = True
-                    if enforce_region:
-                        existing.region = enforce_region
-                    db.commit()
-
-                if peer_id not in worker_ids:
-                    worker_ids.append(peer_id)
+        if not worker_ids:
+            from app.cluster_worker_router import LOCAL_PRIMARY_NODE_ID
+            worker_ids = [LOCAL_PRIMARY_NODE_ID]
 
         return worker_ids[:num_gpus]
+
+    def compute_worker_weights(self, worker_ids: List[str]) -> Dict[str, float]:
+        """Compute relative compute capacity weights for participating workers."""
+        from app.database import SessionLocal
+        from app.models import Worker
+        db = SessionLocal()
+        weights = {}
+        try:
+            for wid in worker_ids:
+                w = db.query(Worker).filter(Worker.id == wid).first()
+                if not w:
+                    weights[wid] = 1.0
+                    continue
+                gpu_name = (w.gpu_info or "").lower()
+                alloc_pct = float(w.vram_allocation_pct or 80) / 100.0
+                tot_vram = float(w.gpu_memory_gb or 8.0)
+                is_cuda = (
+                    "nvidia" in gpu_name
+                    or "geforce" in gpu_name
+                    or "rtx" in gpu_name
+                    or "a100" in gpu_name
+                    or "h100" in gpu_name
+                    or "cuda" in (w.cuda_version or "").lower()
+                )
+                if is_cuda:
+                    base_weight = max(3.0, tot_vram * alloc_pct)
+                else:
+                    base_weight = 1.0
+                weights[wid] = round(base_weight, 2)
+        finally:
+            db.close()
+        return weights
 
     def partition_dataset_shards(
         self,
         records: List[Dict[str, str]],
         worker_ids: List[str],
+        weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, List[Dict[str, str]]]:
         """
         Deterministically partition training dataset records into disjoint shards
-        across all participating `worker_ids`. Ensures every worker receives at least 1 batch item.
+        proportional to worker compute horsepower / hardware capacity.
+        Ensures every participating worker receives at least 1 batch item.
         """
         num_workers = max(1, len(worker_ids))
         shards: Dict[str, List[Dict[str, str]]] = {wid: [] for wid in worker_ids}
-
         if not records:
             return shards
 
-        # Round-robin distribution across worker shards
-        for idx, record in enumerate(records):
-            target_wid = worker_ids[idx % num_workers]
-            shards[target_wid].append(record)
+        if not weights:
+            weights = self.compute_worker_weights(worker_ids)
 
-        # Guarantee every worker has at least one sample even if dataset is smaller than num_workers
+        total_weight = sum(weights.get(wid, 1.0) for wid in worker_ids)
+        total_records = len(records)
+
+        # Calculate quota per worker based on horsepower weight
+        quotas: Dict[str, int] = {}
+        assigned = 0
+        for wid in worker_ids:
+            w_ratio = weights.get(wid, 1.0) / max(0.001, total_weight)
+            q = max(1, int(round(w_ratio * total_records)))
+            quotas[wid] = q
+            assigned += q
+
+        # Distribute items per quota
+        current_idx = 0
+        for wid in worker_ids:
+            q = quotas.get(wid, 1)
+            shard_items = records[current_idx : current_idx + q]
+            if not shard_items and records:
+                shard_items = [records[current_idx % total_records]]
+            shards[wid] = shard_items
+            current_idx += len(shard_items)
+
+        # Distribute any remaining records to top-weighted worker
+        if current_idx < total_records:
+            best_wid = max(worker_ids, key=lambda w: weights.get(w, 1.0))
+            shards[best_wid].extend(records[current_idx:])
+
+        # Guarantee every worker has at least 1 record
         for idx, wid in enumerate(worker_ids):
             if not shards[wid]:
-                shards[wid].append(records[idx % len(records)])
+                shards[wid].append(records[idx % total_records])
 
         return shards
 
@@ -273,8 +305,9 @@ class DistributedTrainingEngine:
         worker_group = WorkerGroup(group_id=f"grp_{job_id[:8]}", worker_ids=worker_ids)
 
         # Load dataset & partition across workers
+        worker_weights = self.compute_worker_weights(worker_ids)
         all_records = training_engine.load_dataset_records(dataset_s3_url)
-        worker_shards = self.partition_dataset_shards(all_records, worker_ids)
+        worker_shards = self.partition_dataset_shards(all_records, worker_ids, weights=worker_weights)
 
         print(
             f"[DIST_ENGINE] Starting distributed job {job_id} across {num_workers} workers "
@@ -341,6 +374,22 @@ class DistributedTrainingEngine:
 
                     w_loss = round(sum(shard_losses) / max(1, len(shard_losses)), 4)
                     worker_epoch_losses[wid] = w_loss
+
+                    # Real-time WebSocket dispatch to connected remote workers
+                    try:
+                        from app.cluster_worker_router import worker_tunnel_manager
+                        if worker_tunnel_manager.is_connected(wid):
+                            import asyncio
+                            asyncio.run(worker_tunnel_manager.send_task_dispatch(wid, {
+                                "task": {
+                                    "task_id": f"dist-train-{job_id[:8]}-ep{epoch}",
+                                    "prompt": f"Distributed LoRA training micro-batch (epoch {epoch}, shard {wid})",
+                                    "task_type": "training",
+                                    "cost": 0.0052,
+                                }
+                            }))
+                    except Exception:
+                        pass
 
                     # Snapshot worker's updated LoRA tensors for Ring All-Reduce
                     worker_state_dicts[wid] = {
@@ -451,6 +500,24 @@ class DistributedTrainingEngine:
 
             dist_task.status = "completed"
             dist_task.completed_at = datetime.utcnow()
+
+            # Increment tasks completed & credit horsepower-proportional earnings for participating workers in DB
+            try:
+                from app.database import SessionLocal
+                from app.models import Worker
+                from app.worker import attribute_worker_earnings
+                with SessionLocal() as db:
+                    tot_weight = max(1.0, sum(worker_weights.values()))
+                    for wid in worker_ids:
+                        w_db = db.query(Worker).filter(Worker.id == wid).first()
+                        if w_db:
+                            w_db.total_tasks_completed = (w_db.total_tasks_completed or 0) + 1
+                            w_weight = float(worker_weights.get(wid, 1.0))
+                            reward = round(0.015 * total_epochs * (w_weight / tot_weight), 4)
+                            attribute_worker_earnings(wid, reward, f"Distributed training shard for job {job_id[:8]}", db=db)
+                    db.commit()
+            except Exception as e:
+                print(f"[DIST_ENGINE] Note: worker credit error: {e}")
 
             shard_summary = {
                 "job_id": job_id,

@@ -13,6 +13,7 @@ in the decentralized fleet based on:
 
 import json
 import math
+import socket
 import time
 import uuid
 import logging
@@ -25,7 +26,11 @@ from app.models import Worker, Task, TrainingJob
 
 logger = logging.getLogger("cluster_scheduler")
 
-LOCAL_PRIMARY_NODE_ID = "node-gpu-local-01"
+def get_local_primary_node_id() -> str:
+    safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+    return f"node-{safe_host}"
+
+LOCAL_PRIMARY_NODE_ID = get_local_primary_node_id()
 
 
 class ClusterScheduler:

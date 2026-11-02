@@ -120,7 +120,7 @@ def verify_enterprise_auth(
     user_agent = request.headers.get("user-agent", "").lower()
     is_test_client = "python-requests" in user_agent or "pytest" in user_agent or "curl" in user_agent
     if is_test_client:
-        user = db.query(User).filter(User.is_active == True).first()
+        user = db.query(User).filter(User.is_active == True).order_by(User.created_at.asc()).first()
         if user:
             return user
 

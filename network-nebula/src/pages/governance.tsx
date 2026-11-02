@@ -193,7 +193,7 @@ export function GovernancePage() {
                     <Label htmlFor="targetWorkerId">Target Worker ID *</Label>
                     <Input
                       id="targetWorkerId"
-                      placeholder="e.g. node-gpu-local-01 or uuid"
+                      placeholder="e.g. node-skorp or uuid"
                       value={targetWorkerId}
                       onChange={(e) => setTargetWorkerId(e.target.value)}
                       required

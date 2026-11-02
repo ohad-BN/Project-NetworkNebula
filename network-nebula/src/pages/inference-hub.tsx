@@ -100,12 +100,12 @@ export function InferenceHubPage() {
 
   // Deploy Form
   const [deployName, setDeployName] = useState("");
-  const [deployModelId, setDeployModelId] = useState("meta-llama/Llama-3-8B");
+  const [deployModelId, setDeployModelId] = useState("Qwen/Qwen2.5-0.5B-Instruct");
   const [deployAdapterUrl, setDeployAdapterUrl] = useState("");
   const [isDeploying, setIsDeploying] = useState(false);
 
   // Playground State
-  const [selectedModel, setSelectedModel] = useState("meta-llama/Llama-3-8B");
+  const [selectedModel, setSelectedModel] = useState("Qwen/Qwen2.5-0.5B-Instruct");
   const [systemPrompt, setSystemPrompt] = useState("You are a professional Enterprise AI assistant.");
   const [userPrompt, setUserPrompt] = useState("Hello, can you explain what makes decentralized GPU compute fast?");
   const [isStream, setIsStream] = useState(false);
@@ -116,7 +116,7 @@ export function InferenceHubPage() {
   // Side-by-Side Comparison State
   const [compareModelA, setCompareModelA] = useState("Qwen/Qwen2.5-0.5B-Instruct");
   const [compareAdapterA, setCompareAdapterA] = useState("");
-  const [compareModelB, setCompareModelB] = useState("meta-llama/Llama-3-8B");
+  const [compareModelB, setCompareModelB] = useState("Qwen/Qwen2.5-1.5B-Instruct");
   const [compareAdapterB, setCompareAdapterB] = useState("");
   const [comparePrompt, setComparePrompt] = useState("Explain the difference between data parallelism and tensor parallelism in 2 concise sentences.");
   const [isComparing, setIsComparing] = useState(false);
@@ -147,7 +147,12 @@ export function InferenceHubPage() {
     try {
       const res = await apiClient.get("/v1/models");
       if (res.data?.data) {
-        setModels(res.data.data);
+        // Filter out simulated/unsupported models: only display genuine active hardware models
+        const realPrefixes = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"];
+        const realModels = res.data.data.filter((m: { id: string }) =>
+          realPrefixes.some((p) => m.id.startsWith(p)) || !m.id.includes("/")
+        );
+        setModels(realModels.length > 0 ? realModels : res.data.data);
       }
     } catch {
       // Ignore
@@ -212,7 +217,10 @@ export function InferenceHubPage() {
       ];
 
       if (isStream) {
-        const response = await fetch("http://localhost:8000/v1/chat/completions", {
+        const streamEndpoint = typeof window !== "undefined" && window.location.port !== "5173"
+          ? "/v1/chat/completions"
+          : "http://localhost:8000/v1/chat/completions";
+        const response = await fetch(streamEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -401,11 +409,9 @@ print(response.choices[0].message.content)`;
                     value={deployModelId}
                     onChange={(e) => setDeployModelId(e.target.value)}
                   >
-                    <option value="meta-llama/Llama-3-8B">meta-llama/Llama-3-8B</option>
-                    <option value="mistralai/Mistral-7B-Instruct-v0.3">mistralai/Mistral-7B</option>
-                    <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B</option>
-                    <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen/Qwen2.5-0.5B (Fast Edge)</option>
-                    <option value="deepseek-ai/DeepSeek-R1-Distill-Qwen-8B">DeepSeek-R1-Distill-8B</option>
+                    <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen/Qwen2.5-0.5B (Active Local Hardware)</option>
+                    <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen/Qwen2.5-1.5B (Active Local Hardware)</option>
+                    <option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B (Production Serving)</option>
                   </select>
                 </div>
 

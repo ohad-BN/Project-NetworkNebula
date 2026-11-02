@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import time
 import uuid
@@ -15,6 +16,8 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -43,14 +46,17 @@ from app.worker import celery_app, render_image, run_batch_inference, train_mode
 
 app = FastAPI(title=settings.APP_NAME, version="1.9.1")
 
-# CORS middleware - allow frontend on port 5173 to communicate with API on port 8000
+# CORS middleware - allow frontend on port 5173, tunnels, and remote clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+DIST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "network-nebula", "dist"))
 
 
 @app.middleware("http")
@@ -159,6 +165,9 @@ def startup_event():
 
 @app.get("/")
 def root():
+    index_file = os.path.join(DIST_DIR, "index.html")
+    if os.path.isfile(index_file):
+        return FileResponse(index_file)
     return {"message": "Network Nebula v1.7.0 - Task Types Ready"}
 
 
@@ -1214,6 +1223,49 @@ app.include_router(invite_router)
 from app.user_profile_router import router as user_profile_router
 
 app.include_router(user_profile_router)
+
+
+# ==============================================================================
+# Single-Page Application (SPA) Static Files & Client-Side Route Fallback
+# ==============================================================================
+if os.path.isdir(DIST_DIR):
+    assets_dir = os.path.join(DIST_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    API_PREFIXES = (
+        "/api/",
+        "/auth/",
+        "/v1/",
+        "/ws/",
+        "/tasks",
+        "/workers",
+        "/connect.",
+        "/health",
+        "/pricing",
+        "/metrics",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/nebula_worker.py",
+    )
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        normalized = "/" + full_path.lstrip("/")
+        if any(normalized.startswith(prefix) for prefix in API_PREFIXES):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        candidate = os.path.join(DIST_DIR, full_path)
+        if full_path and os.path.isfile(candidate):
+            return FileResponse(candidate)
+
+        index_path = os.path.join(DIST_DIR, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+
+        raise HTTPException(status_code=404, detail="Page Not Found")
+
 
 
 

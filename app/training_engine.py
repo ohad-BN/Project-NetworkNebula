@@ -70,30 +70,56 @@ class PeftTrainingEngine:
 
     def load_dataset_records(self, dataset_s3_url: Optional[str] = None) -> List[Dict[str, str]]:
         """
-        Ingest instruction-tuning dataset from MinIO S3 or presigned URL.
-        Falls back to verified default instruction pairs if S3 is unreachable.
+        Ingest instruction-tuning dataset from local file path, MinIO S3 (s3://),
+        or presigned HTTP URL. Supports Alpaca, Prompt-Completion, and OpenAI Chat formats.
         """
         records: List[Dict[str, str]] = []
         if dataset_s3_url:
             try:
-                resp = requests.get(dataset_s3_url, timeout=5)
-                if resp.status_code == 200:
-                    for line in resp.text.splitlines():
+                raw_text: Optional[str] = None
+                # Case 1: Local file path
+                if os.path.exists(dataset_s3_url):
+                    with open(dataset_s3_url, "r", encoding="utf-8") as f:
+                        raw_text = f.read()
+                # Case 2: S3 URI (s3://bucket/object_key)
+                elif dataset_s3_url.startswith("s3://"):
+                    parts = dataset_s3_url[5:].split("/", 1)
+                    bucket = parts[0]
+                    key = parts[1] if len(parts) > 1 else ""
+                    storage = get_storage()
+                    raw_bytes = storage.download_bytes(bucket, key)
+                    raw_text = raw_bytes.decode("utf-8")
+                # Case 3: HTTP/HTTPS presigned or public URL
+                elif dataset_s3_url.startswith("http://") or dataset_s3_url.startswith("https://"):
+                    resp = requests.get(dataset_s3_url, timeout=10)
+                    if resp.status_code == 200:
+                        raw_text = resp.text
+
+                if raw_text:
+                    for line in raw_text.splitlines():
                         line = line.strip()
                         if line:
                             try:
                                 data = json.loads(line)
                                 if "instruction" in data and "response" in data:
-                                    records.append(data)
+                                    records.append({
+                                        "instruction": str(data["instruction"]),
+                                        "response": str(data["response"])
+                                    })
                                 elif "prompt" in data and "completion" in data:
                                     records.append({
-                                        "instruction": data["prompt"],
-                                        "response": data["completion"]
+                                        "instruction": str(data["prompt"]),
+                                        "response": str(data["completion"])
                                     })
+                                elif "messages" in data and isinstance(data["messages"], list):
+                                    user_msg = next((m.get("content", "") for m in data["messages"] if m.get("role") == "user"), "")
+                                    asst_msg = next((m.get("content", "") for m in data["messages"] if m.get("role") == "assistant"), "")
+                                    if user_msg and asst_msg:
+                                        records.append({"instruction": user_msg, "response": asst_msg})
                             except json.JSONDecodeError:
                                 continue
             except Exception as e:
-                logger.warning(f"Could not download dataset from {dataset_s3_url}: {e}")
+                logger.warning(f"Could not load dataset from {dataset_s3_url}: {e}")
 
         if not records:
             records = list(DEFAULT_TRAINING_RECORDS)

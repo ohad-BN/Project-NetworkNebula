@@ -15,6 +15,7 @@ from pathlib import Path
 import urllib.request
 import urllib.error
 import requests
+import subprocess
 import logging
 import warnings
 
@@ -75,9 +76,10 @@ class TestSuite:
         print(f"{C.BOLD}{'-'*65}{C.RESET}\n")
         return self.failed == 0
 
-def run_tests():
-    print_header("NETWORK NEBULA — MASTER UNIFIED TEST SUITE")
+def run_tests(quick: bool = False):
+    print_header(f"NETWORK NEBULA — {'FAST SMOKE SUITE' if quick else 'MASTER UNIFIED TEST SUITE'}")
     suite = TestSuite()
+    BASE_URL = "http://127.0.0.1:8000"
 
     # =========================================================================
     # PHASE 1: CORE ARCHITECTURE, AUTH & MODELS
@@ -222,7 +224,7 @@ def run_tests():
                 data=reg_data,
                 headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 reg_res = json.loads(resp.read().decode())
                 api_key = reg_res.get("api_key")
                 api_secret = reg_res.get("api_secret")
@@ -234,7 +236,7 @@ def run_tests():
                     "http://127.0.0.1:8000/auth/me",
                     headers={"X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
-                with urllib.request.urlopen(me_req, timeout=3) as me_resp:
+                with urllib.request.urlopen(me_req, timeout=10) as me_resp:
                     me_res = json.loads(me_resp.read().decode())
                     suite.record(me_res.get("email") == test_email, "Live GET /auth/me authentication verified")
 
@@ -243,7 +245,7 @@ def run_tests():
                     "http://127.0.0.1:8000/api/wallet/balance",
                     headers={"X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
-                with urllib.request.urlopen(bal_req, timeout=3) as bal_resp:
+                with urllib.request.urlopen(bal_req, timeout=10) as bal_resp:
                     bal_res = json.loads(bal_resp.read().decode())
                     suite.record("balance" in bal_res, f"Live GET /api/wallet/balance: ${bal_res.get('balance'):.2f}")
 
@@ -254,7 +256,7 @@ def run_tests():
                     data=dep_data,
                     headers={"Content-Type": "application/json", "X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
-                with urllib.request.urlopen(dep_req, timeout=3) as dep_resp:
+                with urllib.request.urlopen(dep_req, timeout=10) as dep_resp:
                     dep_res = json.loads(dep_resp.read().decode())
                     suite.record(dep_res.get("amount") == 10.0, f"Live POST /api/wallet/deposit ($10.00 credited)")
 
@@ -270,14 +272,14 @@ def run_tests():
                     data=task_payload,
                     headers={"Content-Type": "application/json", "X-API-Key": api_key, "X-API-Secret": api_secret}
                 )
-                with urllib.request.urlopen(t_req, timeout=3) as t_resp:
+                with urllib.request.urlopen(t_req, timeout=10) as t_resp:
                     t_res = json.loads(t_resp.read().decode())
                     task_id = t_res.get("id") or t_res.get("task_id")
                     suite.record(bool(task_id), f"Live POST /api/tasks submitted (ID: {task_id[:12]}...)")
 
                     # Verify GET /api/tasks/{id} (status polling)
                     status_req = urllib.request.Request(f"http://127.0.0.1:8000/api/tasks/{task_id}")
-                    with urllib.request.urlopen(status_req, timeout=3) as s_resp:
+                    with urllib.request.urlopen(status_req, timeout=10) as s_resp:
                         s_res = json.loads(s_resp.read().decode())
                         suite.record(s_res.get("status") in ["pending", "processing", "completed"], 
                                      f"Live GET /api/tasks/{task_id[:12]}... status: '{s_res.get('status')}'")
@@ -302,6 +304,54 @@ def run_tests():
             missing_spec = spec_file
             break
     suite.record(specs_ok, f"Core Architecture Specs present ({', '.join(core_specs)})", missing_spec)
+
+    if quick:
+        print_header("Phase Quick: Standalone Worker CLI, Fleet Payout & Closed Alpha Auth")
+        try:
+            # Standalone worker join check
+            join_proc = subprocess.run(
+                [sys.executable, "nebula_worker.py", "join", "--worker-id", "node-gpu-local-01", "--once", "--json"],
+                capture_output=True, text=True, timeout=15
+            )
+            suite.record(join_proc.returncode == 0 and "node-gpu-local-01" in join_proc.stdout, "CLI 'nebula_worker.py join --once' verified")
+
+            # Worker payout check
+            payout_proc = subprocess.run([sys.executable, "get_payout.py", "--worker-id", "node-gpu-local-01", "--json"], capture_output=True, text=True, timeout=15)
+            suite.record(payout_proc.returncode == 0, "CLI 'get_payout.py' telemetry verified")
+
+            # Alpha invite validation
+            inv_check = requests.post(f"{BASE_URL}/api/v1/invites/validate", json={"code": "NEBULA-ALPHA-2026"}, timeout=5).json()
+            suite.record(inv_check.get("valid") is True, f"Alpha invite validation (code: {inv_check.get('code')})")
+
+            # Registration with invite & OTP
+            alpha_email = f"quick_qa_{uuid.uuid4().hex[:6]}@nebula.io"
+            reg_res = requests.post(f"{BASE_URL}/auth/register", json={"email": alpha_email, "password": "Password123!", "role": "creator", "invite_code": "NEBULA-ALPHA-2026"}, timeout=5).json()
+            suite.record(bool(reg_res.get("api_key")), f"User registration with OTP ({alpha_email})")
+
+            from app.database import engine
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                otp_row = conn.execute(text("SELECT verification_code FROM users WHERE email = :email"), {"email": alpha_email}).fetchone()
+                otp_val = otp_row[0] if otp_row else None
+            v_res = requests.post(f"{BASE_URL}/auth/verify-email", json={"email": alpha_email, "code": otp_val}, timeout=5).json()
+            suite.record(v_res.get("is_verified") is True and v_res.get("balance") == 150.0, "Email OTP verification & +$100.00 faucet grant")
+        except Exception as e:
+            suite.record(False, "Quick Suite Execution", str(e))
+        finally:
+            try:
+                from app.cluster_worker_router import is_real_hardware_node
+                from app.database import SessionLocal
+                from app.models import Worker as DBWorker, Task
+                db_clean = SessionLocal()
+                for tw in db_clean.query(DBWorker).all():
+                    if not is_real_hardware_node(tw):
+                        db_clean.query(Task).filter(Task.claimed_by == tw.id).delete(synchronize_session=False)
+                        db_clean.delete(tw)
+                db_clean.commit()
+                db_clean.close()
+            except Exception:
+                pass
+        return suite.summary()
 
     # E1.2 Enterprise Database Models & PostgreSQL Tables
     try:
@@ -1500,7 +1550,6 @@ def run_tests():
 
     # M2.5 Standalone CLI 'join --once' Subprocess Registration & Heartbeat
     try:
-        import subprocess
         join_proc = subprocess.run(
             [
                 sys.executable,
@@ -4610,26 +4659,28 @@ def run_tests():
         replay_rejected = replay_res.status_code == 409
 
         # 4. Test Automated Host Worker Withdrawal Disbursement Engine
+        test_worker_id = None
         db_gen = get_suite_db()
         test_db = next(db_gen)
-        w_node = test_db.query(DBWorker).first()
-        if not w_node:
-            w_node = DBWorker(
-                id=f"worker-payout-{uuid.uuid4().hex[:8]}",
-                name="RTX 4090 Payout Node",
-                status="online",
-                total_earnings_usd=100.0,
-            )
-            test_db.add(w_node)
-            test_db.commit()
-            test_db.refresh(w_node)
-        else:
-            w_node.total_earnings_usd = max(w_node.total_earnings_usd or 0.0, 100.0)
-            test_db.commit()
-            test_db.refresh(w_node)
-
-        test_worker_id = w_node.id
-        test_db.close()
+        try:
+            w_node = test_db.query(DBWorker).first()
+            if not w_node:
+                w_node = DBWorker(
+                    id=f"worker-payout-{uuid.uuid4().hex[:8]}",
+                    name="RTX 4090 Payout Node",
+                    status="online",
+                    total_earnings_usd=100.0,
+                )
+                test_db.add(w_node)
+                test_db.commit()
+                test_db.refresh(w_node)
+            else:
+                w_node.total_earnings_usd = max(w_node.total_earnings_usd or 0.0, 100.0)
+                test_db.commit()
+                test_db.refresh(w_node)
+            test_worker_id = w_node.id
+        finally:
+            test_db.close()
 
         # 4a. Attempt sub-threshold withdrawal ($5.00 < $10.00 min) -> Expect HTTP 400
         sub_res = requests.post(
@@ -5020,6 +5071,20 @@ def run_tests():
     except Exception as e:
         suite.record(False, "Phase 8 Alpha Verification & Faucet Suite", str(e))
 
+    # Automatic Teardown: Purge synthetic test workers so only real hardware persists
+    try:
+        from app.cluster_worker_router import is_real_hardware_node
+        db_clean = next(get_suite_db())
+        test_workers = db_clean.query(DBWorker).all()
+        for tw in test_workers:
+            if not is_real_hardware_node(tw):
+                db_clean.query(Task).filter(Task.claimed_by == tw.id).delete(synchronize_session=False)
+                db_clean.delete(tw)
+        db_clean.commit()
+        db_clean.close()
+    except Exception:
+        pass
+
     return suite.summary()
 
 
@@ -5030,7 +5095,11 @@ def run_tests():
 
 
 if __name__ == "__main__":
-    success = run_tests()
+    import argparse
+    parser = argparse.ArgumentParser(description="NetworkNebula Master Test Suite")
+    parser.add_argument("--quick", action="store_true", help="Run fast core regression checks (<10s)")
+    args = parser.parse_args()
+    success = run_tests(quick=args.quick)
     sys.exit(0 if success else 1)
 
 

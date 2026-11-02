@@ -147,15 +147,10 @@ export function SwarmStudioPage() {
     e.preventDefault();
     try {
       setIsCreating(true);
-      const workerIds = Array.from({ length: newNumStages }, (_, i) => `swarm-gpu-node-0${i + 1}`);
-      const standbyIds = Array.from({ length: newNumStages }, (_, i) => `swarm-gpu-standby-0${i + 1}`);
-
       const res = await swarmService.createPipeline({
         model_id: newModelId,
         num_stages: newNumStages,
         quantization: newQuantization,
-        worker_ids: workerIds,
-        standby_worker_ids: standbyIds,
         name: newPipelineName.trim() || undefined,
       });
 

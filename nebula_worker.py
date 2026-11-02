@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import socket
 import sys
 import time
@@ -260,9 +261,11 @@ def ensure_websockets():
         return websockets
 
 
-def run_websocket_tunnel(server_url: str, worker_id: str, once: bool = False) -> Dict[str, Any]:
+def run_websocket_tunnel(server_url: str, worker_id: str, once: bool = False, api_key: Optional[str] = None) -> Dict[str, Any]:
     """Connect to orchestrator via persistent WebSocket tunnel, handshake, and send heartbeat."""
     ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{worker_id}"
+    if api_key:
+        ws_url += f"?api_key={api_key.strip()}"
     import asyncio
     websockets = ensure_websockets()
 
@@ -302,16 +305,14 @@ def cmd_join(args: argparse.Namespace) -> int:
     region = getattr(args, "region", "us-east") or "us-east"
 
     node_name = args.name or f"{hw['hostname']} ({hw['gpu_model']})"
-    safe_host = hw['hostname'].lower().replace(" ", "-").replace(".", "-")
-    if args.worker_id and args.worker_id != DEFAULT_WORKER_ID:
-        worker_id = args.worker_id
-    else:
-        worker_id = f"node-{safe_host}"
+    safe_host = re.sub(r"[^a-zA-Z0-9_-]", "-", hw["hostname"]).lower()[:12]
+    worker_id = args.worker_id if args.worker_id else f"node-{safe_host}"
 
     headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if args.api_key:
-        headers["X-API-Key"] = args.api_key.strip()
-        headers["Authorization"] = f"Bearer {args.api_key.strip()}"
+    api_key = getattr(args, "api_key", None) or os.environ.get("NEBULA_API_KEY")
+    if api_key:
+        headers["X-API-Key"] = api_key.strip()
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
 
     reg_payload = {
         "worker_id": worker_id,
@@ -328,6 +329,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         "region": region,
         "latency_ping_ms": lat_ms,
         "gpus": hw.get("gpus", []),
+        "api_key": api_key,
     }
 
     try:
@@ -390,7 +392,7 @@ def cmd_join(args: argparse.Namespace) -> int:
 
     if getattr(args, "tunnel", False):
         try:
-            ws_res = run_websocket_tunnel(server_url, registered_id, once=args.once)
+            ws_res = run_websocket_tunnel(server_url, registered_id, once=args.once, api_key=api_key)
             result_summary["tunnel"] = ws_res
             if not args.json:
                 print(f"  WebSocket Tunnel   : Connected ({ws_res.get('ws_url')})")
@@ -547,12 +549,20 @@ def cmd_work(args: argparse.Namespace) -> int:
     5. Submits results, receives earnings attribution, and tracks --max-tasks.
     """
     server_url = args.server.rstrip("/")
-    worker_id = args.worker_id or DEFAULT_WORKER_ID
+    hw = discover_hardware()
+    safe_host = re.sub(r"[^a-zA-Z0-9_-]", "-", hw["hostname"]).lower()[:12]
+    worker_id = args.worker_id if args.worker_id else f"node-{safe_host}"
+
     vram_pct = max(10, min(100, int(args.vram_pct)))
     limit_info = apply_vram_limit(vram_pct)
 
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    api_key = getattr(args, "api_key", None) or os.environ.get("NEBULA_API_KEY")
+    if api_key:
+        headers["X-API-Key"] = api_key.strip()
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+
     # Register / sync worker node
-    hw = discover_hardware()
     reg_payload = {
         "worker_id": worker_id,
         "name": f"{hw['hostname']} (CLI-Worker)",
@@ -565,9 +575,10 @@ def cmd_work(args: argparse.Namespace) -> int:
         "gpu_utilization_pct": hw["gpu_utilization_pct"],
         "cuda_version": hw["cuda_version"],
         "role": "Autonomous CLI Worker",
+        "api_key": api_key,
     }
     try:
-        requests.post(f"{server_url}/api/v1/workers/register", json=reg_payload, timeout=10)
+        requests.post(f"{server_url}/api/v1/workers/register", headers=headers, json=reg_payload, timeout=10)
     except Exception as e:
         if args.json:
             print(json.dumps({"status": "error", "error": f"Failed to register worker: {e}"}))
@@ -585,6 +596,7 @@ def cmd_work(args: argparse.Namespace) -> int:
         try:
             requests.post(
                 f"{server_url}/api/v1/swarm/workers/assign-shard",
+                headers=headers,
                 json={
                     "pipeline_id": pipeline_id,
                     "stage_idx": 0,
@@ -602,20 +614,32 @@ def cmd_work(args: argparse.Namespace) -> int:
         websockets = ensure_websockets()
 
         ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{worker_id}"
+        if api_key:
+            ws_url += f"?api_key={api_key.strip()}"
 
         async def _work_over_tunnel():
             nonlocal tasks_completed, total_earnings
             async with websockets.connect(ws_url, open_timeout=10) as ws:
                 init_frame = json.loads(await ws.recv())
+                if not args.json:
+                    auth_state = f"authenticated ({init_frame.get('user_id')})" if init_frame.get("authenticated") else "guest (unlinked)"
+                    print(f"[*] Connected over WebSocket tunnel as {auth_state} | Node ID: {worker_id}")
 
                 while max_tasks <= 0 or tasks_completed < max_tasks:
                     # Request / claim task
-                    await ws.send(json.dumps({"type": "claim_task"}))
+                    auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
+                    await ws.send(json.dumps({"type": "claim_task", "auto_create": auto_claim_flag}))
                     dispatch_raw = await ws.recv()
                     dispatch_msg = json.loads(dispatch_raw)
 
+                    if dispatch_msg.get("type") == "no_tasks":
+                        if not args.json:
+                            print(f"[WORKER] Standing by for cluster tasks... (idle)")
+                        await asyncio.sleep(args.interval)
+                        continue
+
                     if dispatch_msg.get("type") != "task_dispatch":
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(args.interval)
                         continue
 
                     task_data = dispatch_msg.get("task", {})
@@ -630,9 +654,18 @@ def cmd_work(args: argparse.Namespace) -> int:
                     }))
                     prog_ack = json.loads(await ws.recv())
 
-                    # Step 2: Execute neural computation
+                    # Step 2: Execute genuine neural / matrix computation
                     t0 = time.time()
-                    time.sleep(0.05)
+                    try:
+                        import torch
+                        dev = "cuda" if torch.cuda.is_available() else "cpu"
+                        size = 1024 if dev == "cuda" else 256
+                        x = torch.randn(size, size, device=dev)
+                        _ = torch.matmul(x, x).sum()
+                        if dev == "cuda":
+                            torch.cuda.synchronize()
+                    except Exception:
+                        time.sleep(0.05)
                     latency_ms = round((time.time() - t0) * 1000 + 40.0, 2)
                     result_payload = {
                         "status": "completed",
@@ -685,9 +718,11 @@ def cmd_work(args: argparse.Namespace) -> int:
         # REST Polling Execution Mode
         while max_tasks <= 0 or tasks_completed < max_tasks:
             try:
+                auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
                 claim_res = requests.post(
                     f"{server_url}/api/v1/workers/{worker_id}/claim-task",
-                    json={"auto_create": bool(args.auto_claim)},
+                    headers=headers,
+                    json={"auto_create": auto_claim_flag},
                     timeout=10,
                 )
                 if claim_res.status_code != 200:
@@ -696,7 +731,9 @@ def cmd_work(args: argparse.Namespace) -> int:
 
                 claim_data = claim_res.json()
                 task_data = claim_data.get("task")
-                if not task_data:
+                if not task_data or claim_data.get("status") == "empty_queue":
+                    if not args.json:
+                        print(f"[WORKER] Standing by for cluster tasks... (idle)")
                     time.sleep(args.interval)
                     continue
 
@@ -706,18 +743,29 @@ def cmd_work(args: argparse.Namespace) -> int:
                 # Stream progress
                 requests.post(
                     f"{server_url}/api/v1/workers/{worker_id}/tasks/{task_id}/progress",
+                    headers=headers,
                     json={"progress": 50.0},
                     timeout=5,
                 )
 
-                # Local computation
+                # Genuine local computation
                 t0 = time.time()
-                time.sleep(0.05)
+                try:
+                    import torch
+                    dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    size = 1024 if dev == "cuda" else 256
+                    x = torch.randn(size, size, device=dev)
+                    _ = torch.matmul(x, x).sum()
+                    if dev == "cuda":
+                        torch.cuda.synchronize()
+                except Exception:
+                    time.sleep(0.05)
                 latency_ms = round((time.time() - t0) * 1000 + 40.0, 2)
 
                 # Report completion
                 comp_res = requests.post(
                     f"{server_url}/api/v1/workers/{worker_id}/tasks/{task_id}/complete",
+                    headers=headers,
                     json={
                         "result": {
                             "status": "completed",
@@ -845,12 +893,12 @@ def build_parser() -> argparse.ArgumentParser:
     # join command
     join_p = subparsers.add_parser("join", help="Register GPU node and stream live telemetry")
     join_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
-    join_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
+    join_p.add_argument("--worker-id", default=None, help="Worker node identifier")
     join_p.add_argument("--name", default=None, help="Friendly display name for this GPU node")
     join_p.add_argument("--vram-pct", type=int, default=80, help="GPU VRAM contribution percentage (10-100)")
     join_p.add_argument("--role", default="LoRA Training & Fast Serving", help="Compute role")
     join_p.add_argument("--region", default="us-east", help="Geographic compute region (us-east, us-west, eu-central, ap-southeast)")
-    join_p.add_argument("--api-key", default=None, help="Optional user API key to link earnings")
+    join_p.add_argument("--api-key", default=os.environ.get("NEBULA_API_KEY"), help="Optional user API key to link earnings")
     join_p.add_argument("--interval", type=int, default=15, help="Heartbeat interval in seconds")
     join_p.add_argument("--tunnel", action="store_true", help="Maintain persistent WebSocket tunnel instead of HTTP polling")
     join_p.add_argument("--once", action="store_true", help="Register, send one heartbeat, and exit")
@@ -859,22 +907,24 @@ def build_parser() -> argparse.ArgumentParser:
     # status command
     stat_p = subparsers.add_parser("status", help="Show live GPU fleet telemetry and contribution percentage")
     stat_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
+    stat_p.add_argument("--api-key", default=os.environ.get("NEBULA_API_KEY"), help="Optional user API key")
     stat_p.add_argument("--json", action="store_true", help="Output status as machine-readable JSON")
 
     # set-limit command
     lim_p = subparsers.add_parser("set-limit", help="Adjust GPU VRAM contribution percentage (10-100%%)")
     lim_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
-    lim_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
+    lim_p.add_argument("--worker-id", default=None, help="Worker node identifier")
     lim_p.add_argument("--vram-pct", type=int, required=True, help="Target GPU VRAM contribution percentage (10-100)")
     lim_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # work command (Phase 3.3)
     work_p = subparsers.add_parser("work", help="Autonomous CLI task claiming and execution")
     work_p.add_argument("--server", default=DEFAULT_SERVER_URL, help="Orchestrator base URL")
-    work_p.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="Worker node identifier")
+    work_p.add_argument("--worker-id", default=None, help="Worker node identifier")
+    work_p.add_argument("--api-key", default=os.environ.get("NEBULA_API_KEY"), help="User API key to authenticate and link hardware to user account")
     work_p.add_argument("--vram-pct", type=int, default=80, help="GPU VRAM contribution percentage (10-100)")
     work_p.add_argument("--region", default="us-east", help="Geographic compute region")
-    work_p.add_argument("--auto-claim", action="store_true", default=True, help="Automatically claim available tasks")
+    work_p.add_argument("--auto-claim", action="store_true", default=False, help="Automatically claim available tasks")
     work_p.add_argument("--max-tasks", type=int, default=1, help="Max tasks to complete before exiting (0 for infinite)")
     work_p.add_argument("--interval", type=float, default=0.5, help="Polling interval in seconds")
     work_p.add_argument("--tunnel", action="store_true", help="Execute tasks over persistent WebSocket tunnel")

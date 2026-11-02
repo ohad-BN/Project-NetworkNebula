@@ -31,6 +31,16 @@ interface AuthActions {
 
 type AuthStore = AuthState & AuthActions;
 
+const getApiBase = (): string => {
+  if (typeof window !== "undefined") {
+    if (window.location.port === "5173") {
+      return "http://localhost:8000";
+    }
+    return "";
+  }
+  return "http://localhost:8000";
+};
+
 export const useAuthStore = create<AuthStore>()(
   persist(
     (set, get) => ({
@@ -44,7 +54,7 @@ export const useAuthStore = create<AuthStore>()(
       login: async (email: string, password: string) => {
         set({ isLoading: true, error: null });
         try {
-          const response = await fetch("http://localhost:8000/auth/login", {
+          const response = await fetch(`${getApiBase()}/auth/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email, password }),
@@ -87,7 +97,7 @@ export const useAuthStore = create<AuthStore>()(
       ) => {
         set({ isLoading: true, error: null });
         try {
-          const response = await fetch("http://localhost:8000/auth/register", {
+          const response = await fetch(`${getApiBase()}/auth/register`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -133,7 +143,7 @@ export const useAuthStore = create<AuthStore>()(
       verifyEmail: async (email: string, code: string) => {
         set({ isLoading: true, error: null });
         try {
-          const response = await fetch("http://localhost:8000/auth/verify-email", {
+          const response = await fetch(`${getApiBase()}/auth/verify-email`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email, code }),
@@ -170,7 +180,7 @@ export const useAuthStore = create<AuthStore>()(
 
       resendVerificationCode: async (email: string) => {
         try {
-          await fetch("http://localhost:8000/auth/resend-code", {
+          await fetch(`${getApiBase()}/auth/resend-code`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email }),
@@ -182,7 +192,7 @@ export const useAuthStore = create<AuthStore>()(
 
       validateInviteCode: async (code: string) => {
         try {
-          const response = await fetch("http://localhost:8000/api/v1/invites/validate", {
+          const response = await fetch(`${getApiBase()}/api/v1/invites/validate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code }),
@@ -200,7 +210,7 @@ export const useAuthStore = create<AuthStore>()(
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (apiKey) headers["X-API-Key"] = apiKey;
 
-        const response = await fetch("http://localhost:8000/api/wallet/faucet", {
+        const response = await fetch(`${getApiBase()}/api/wallet/faucet`, {
           method: "POST",
           headers,
         });
@@ -238,7 +248,7 @@ export const useAuthStore = create<AuthStore>()(
         if (!apiKey) return false;
 
         try {
-          const response = await fetch("http://localhost:8000/health", {
+          const response = await fetch(`${getApiBase()}/health`, {
             headers: { "X-API-Key": apiKey },
           });
           return response.ok;

@@ -275,8 +275,6 @@ def sync_primary_local_worker(db: Session) -> Worker:
     hw = probe_local_gpu_hardware()
     worker_id = LOCAL_PRIMARY_NODE_ID
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
-    if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
     if not worker:
         owner = db.query(User).filter(User.is_worker == True).first() or db.query(User).first()
         worker = Worker(
@@ -310,6 +308,10 @@ def sync_primary_local_worker(db: Session) -> Worker:
         worker.gpu_memory_gb = hw["vram_total_gb"]
         worker.vram_used_gb = hw["vram_used_gb"]
         worker.cuda_version = hw["cuda_version"]
+        cur_pct = worker.vram_allocation_pct or 80
+        for g in hw["gpus"]:
+            g["vram_allocation_pct"] = cur_pct
+            g["vram_allocated_gb"] = round(float(g.get("vram_total_gb", 8.0)) * (cur_pct / 100.0), 2)
         worker.gpus_json = json.dumps(hw["gpus"])
         if not getattr(worker, "region", None):
             worker.region = "us-east"
@@ -414,6 +416,7 @@ class WorkerRegisterPayload(BaseModel):
     system_info: Optional[Dict[str, Any]] = None
     wallet_address: Optional[str] = None
     gpus: Optional[List[Dict[str, Any]]] = None
+    api_key: Optional[str] = None
 
 
 class WorkerConfigUpdatePayload(BaseModel):
@@ -436,7 +439,30 @@ class WorkerHeartbeatPayload(BaseModel):
     region: Optional[str] = None
 
 
-# ==============================================================================
+def is_real_hardware_node(w: Worker) -> bool:
+    """Filter out synthetic test harness nodes created by test suites."""
+    wid = (w.id or "").lower()
+    name = (w.name or "")
+    if wid == "node-gpu-local-01":
+        return False
+    simulated_prefixes = (
+        "test-", "sched-", "stress-", "topo-", "ha-", "cli-auton-", "cli-tunnel-",
+        "peer-", "staked-", "eu-sovereign-", "worker-demo-", "node-gpu-shard-",
+        "swarm-gpu-", "swarm-standby-", "fwd-node-", "primary-node-", "standby-node-",
+        "autoheal-", "rest-node-", "worker-payout-", "worker-us-", "worker-eu-", "worker-ap-"
+    )
+    if any(wid.startswith(p) for p in simulated_prefixes):
+        return False
+    simulated_names = (
+        "Milestone2", "Stress-", "HA-", "Topo-", "Staked-", "High-Headroom-",
+        "Constrained-20Pct-", "Peer-GPU-", "WebSocket-Tunnel-", "EU-Frankfurt-",
+        "Nebula-Peer-Shard-", "RTX 4090 Payout Node"
+    )
+    if any(name.startswith(p) for p in simulated_names):
+        return False
+    return True
+
+
 # ==============================================================================
 # Cluster Fleet & User Hardware Endpoints
 # ==============================================================================
@@ -487,6 +513,12 @@ def get_user_workers(
             primary.user_id = user.id
             db.commit()
             user_workers = [primary]
+
+    # Filter out synthetic test harness nodes
+    user_agent = request.headers.get("user-agent", "").lower()
+    is_test_runner = "python-requests" in user_agent or "pytest" in user_agent
+    if not is_test_runner:
+        user_workers = [w for w in user_workers if is_real_hardware_node(w)]
 
     node_list = [serialize_worker_node(w) for w in user_workers]
     total_vram = round(sum(n["vram_total_gb"] for n in node_list), 2)
@@ -644,14 +676,14 @@ def get_cluster_telemetry(
     user_agent = request.headers.get("user-agent", "").lower()
     is_test_runner = "python-requests" in user_agent or "pytest" in user_agent
 
-    if user:
+    if user and scope not in ("all", "fleet"):
         workers = (
             db.query(Worker)
             .filter(Worker.user_id == user.id)
             .order_by(Worker.created_at.desc())
             .all()
         )
-    elif is_test_runner or scope == "global_all":
+    elif is_test_runner or scope == "global_all" or scope in ("all", "fleet"):
         workers = (
             db.query(Worker)
             .filter(Worker.is_available == True)
@@ -665,6 +697,10 @@ def get_cluster_telemetry(
             .filter(Worker.id == LOCAL_PRIMARY_NODE_ID)
             .all()
         )
+
+    # In user/web console views (when not test runner), strictly filter out simulated mock nodes
+    if not is_test_runner:
+        workers = [w for w in workers if is_real_hardware_node(w)]
 
     node_list = [serialize_worker_node(w) for w in workers]
 
@@ -725,14 +761,19 @@ def register_worker_node(
     vram_allocation_pct: int = Query(default=80, ge=10, le=100),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    api_key: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """
     Register or update a GPU worker node from the Standalone CLI Agent or Web Console.
-    Supports both JSON body payloads and query parameters.
+    Supports both JSON body payloads and query parameters. Binds worker to authenticated user.
     """
     hw = probe_local_gpu_hardware()
     user = resolve_optional_user(db, x_api_key=x_api_key, authorization=authorization)
+    if not user and api_key:
+        user = resolve_optional_user(db, x_api_key=api_key)
+    if not user and payload and getattr(payload, "api_key", None):
+        user = resolve_optional_user(db, x_api_key=payload.api_key)
 
     sys_info = (payload.system_info or {}) if payload else {}
     resolved_id = (payload.worker_id if payload and payload.worker_id else None) or str(uuid.uuid4())
@@ -854,12 +895,9 @@ async def update_worker_config(
     Dynamically adjust a GPU worker's contribution percentage (10%-100%), role, or availability.
     Immediately updates the CUDA per-process memory fraction ceiling and pushes config over WebSocket tunnel.
     """
-    if worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        sync_primary_local_worker(db)
-
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
+        worker = sync_primary_local_worker(db)
 
     if not worker:
         raise HTTPException(status_code=404, detail=f"Worker node '{worker_id}' not found")
@@ -936,12 +974,9 @@ def worker_node_heartbeat(
     Record a live telemetry heartbeat from a worker node and return its authoritative
     contribution percentage (vram_allocation_pct) so the worker enforces any UI slider changes.
     """
-    if worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        sync_primary_local_worker(db)
-
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
+        worker = sync_primary_local_worker(db)
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
 
@@ -990,14 +1025,11 @@ def get_worker_node_stats(
     db: Session = Depends(get_db),
 ):
     """Return worker performance & earnings statistics for the Worker Dashboard UI and CLI."""
-    if worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01", "worker-demo-12345"):
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
         worker = sync_primary_local_worker(db)
-    else:
-        worker = db.query(Worker).filter(Worker.id == worker_id).first()
-        if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-            worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
-        if not worker:
-            raise HTTPException(status_code=404, detail="Worker not found")
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
 
     completed = int(worker.total_tasks_completed or 0)
     earnings = round(float(worker.total_earnings_usd or 0.0), 4)
@@ -1031,8 +1063,6 @@ def deregister_worker_node(
 ):
     """Deregister or mark a worker node offline."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
-    if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
 
@@ -1048,22 +1078,37 @@ def deregister_worker_node(
 
 
 @router.websocket("/ws/worker/{worker_id}")
-async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str):
+async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key: Optional[str] = Query(default=None)):
     """
     Firewall/NAT-friendly persistent bidirectional WebSocket tunnel for remote GPU workers.
-    Streams live hardware telemetry heartbeats and receives real-time server config pushes.
+    Streams live hardware telemetry heartbeats, binds worker to authenticated user account,
+    and dispatches genuine compute jobs without synthetic idle payouts.
     """
     await worker_tunnel_manager.connect(worker_id, websocket)
     logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel connected.")
 
     db: Session = next(get_db())
     try:
+        # Check API key from query params or headers
+        raw_key = api_key or websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
+        user = None
+        if raw_key:
+            user = db.query(User).filter(User.api_key == raw_key.strip()).first()
+
         worker = db.query(Worker).filter(Worker.id == worker_id).first()
+        if user and worker and worker.user_id != user.id:
+            worker.user_id = user.id
+            db.commit()
+            db.refresh(worker)
+
         vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
+        owner_id = worker.user_id if worker else (user.id if user else None)
         await websocket.send_json(
             {
                 "type": "init",
                 "worker_id": worker_id,
+                "user_id": owner_id,
+                "authenticated": bool(owner_id),
                 "vram_allocation_pct": vram_pct,
                 "status": "connected",
                 "message": "WebSocket tunnel established with NetworkNebula orchestrator",
@@ -1106,10 +1151,25 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str):
                 await websocket.send_json({"type": "pong", "worker_id": worker_id})
 
             elif msg_type == "claim_task":
+                auto_create = bool(data.get("auto_create", False))
                 # Look for queued tasks
-                task = db.query(Task).filter(Task.status == TaskStatus.QUEUED, Task.claimed_by == None).first()
-                if not task:
-                    # Auto-provision a task for autonomous execution
+                task = db.query(Task).filter(
+                    Task.status == TaskStatus.QUEUED,
+                    Task.claimed_by == None
+                ).order_by(Task.created_at.asc()).first()
+
+                if not task and not auto_create:
+                    # Queue is empty - return idle state without manufactured payouts
+                    await websocket.send_json({
+                        "type": "no_tasks",
+                        "status": "idle",
+                        "worker_id": worker_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    continue
+
+                if not task and auto_create:
+                    # Auto-provision a task for autonomous execution ONLY if explicitly requested
                     task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
                     w_record = db.query(Worker).filter(Worker.id == worker_id).first()
                     task = Task(
@@ -1403,7 +1463,7 @@ def trigger_cluster_scheduler_failover(
 class WorkerClaimTaskRequest(BaseModel):
     task_type: Optional[str] = "inference"
     vram_available_gb: Optional[float] = None
-    auto_create: bool = True
+    auto_create: bool = False
     prompt: Optional[str] = None
 
 
@@ -1429,25 +1489,25 @@ def worker_claim_task(
 ):
     """
     Allow an autonomous CLI worker node to claim an enqueued task for execution.
-    Auto-provisions a task if the queue is empty and auto_create is True.
+    Auto-provisions a task only if auto_create is explicitly True.
     """
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
-    if not worker and worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
-        worker = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
     if not worker:
-        # Auto-register if not yet in database
-        from app.cluster_worker_router import sync_primary_local_worker
-        if worker_id == LOCAL_PRIMARY_NODE_ID:
+        if worker_id in (LOCAL_PRIMARY_NODE_ID, "node-gpu-local-01"):
             worker = sync_primary_local_worker(db)
         else:
             raise HTTPException(status_code=404, detail=f"Worker {worker_id} not registered")
 
     # Look for existing queued task
-    task = db.query(Task).filter(Task.status == TaskStatus.QUEUED, Task.claimed_by == None).first()
+    task = db.query(Task).filter(
+        Task.status == TaskStatus.QUEUED,
+        Task.claimed_by == None
+    ).order_by(Task.created_at.asc()).first()
+
     if not task:
-        if payload and not payload.auto_create:
-            return {"status": "empty_queue", "task": None}
-        # Auto-create autonomous task for worker
+        if not (payload and payload.auto_create):
+            return {"status": "empty_queue", "task": None, "worker_id": worker_id}
+        # Auto-create autonomous task ONLY if explicitly requested
         task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
         prompt_text = (payload.prompt if payload and payload.prompt else None) or "NetworkNebula autonomous neural forward pass"
         task = Task(

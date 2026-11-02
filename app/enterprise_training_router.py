@@ -18,6 +18,24 @@ from app.models import TrainingJob, User
 from app.auth import verify_enterprise_auth
 from app.storage import get_storage
 from app.worker import execute_training_job
+import threading
+
+
+def dispatch_training_job_resilient(job_id: str):
+    """Dispatch training job to Celery worker if available; otherwise execute in background thread."""
+    try:
+        from app.worker import celery_app
+        insp = celery_app.control.inspect(timeout=0.25)
+        active_workers = insp.ping() if insp else None
+        if active_workers:
+            execute_training_job.delay(job_id)
+            return
+    except Exception:
+        pass
+
+    # Threaded background runner ensures immediate progress without stalled queues
+    thread = threading.Thread(target=execute_training_job, args=(job_id,), daemon=True)
+    thread.start()
 
 router = APIRouter(prefix="/api/v1/training", tags=["Enterprise Training"])
 
@@ -39,7 +57,7 @@ class HyperparametersSchema(BaseModel):
 
 class CreateTrainingJobRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="Human-readable job label")
-    base_model: str = Field(default="meta-llama/Llama-3-8B", description="HuggingFace model ID or foundation weight path")
+    base_model: str = Field(default="Qwen/Qwen2.5-0.5B-Instruct", description="HuggingFace model ID or foundation weight path")
     train_type: str = Field(default="lora", description="Fine-tuning technique: lora, qlora, full")
     parallelism: str = Field(default="data_parallel", description="Parallelism strategy: data_parallel, fsdp, tensor_parallel")
     num_gpus: int = Field(default=1, ge=1, le=128, description="Target GPU count")
@@ -240,13 +258,8 @@ def submit_training_job(
     db.commit()
     db.refresh(new_job)
 
-    # Dispatch to Celery cluster worker
-    try:
-        execute_training_job.delay(job_id)
-    except Exception as e:
-        print(f"[API] Warning: Celery dispatch failed: {e}. Executing inline for test resiliency.")
-        execute_training_job(job_id)
-        db.refresh(new_job)
+    # Dispatch resiliently (Celery or background worker)
+    dispatch_training_job_resilient(job_id)
 
     return format_job_response(new_job)
 
@@ -340,12 +353,7 @@ def submit_distributed_training_job(
         execute_training_job(job_id)
         db.refresh(new_job)
     else:
-        try:
-            execute_training_job.delay(job_id)
-        except Exception as e:
-            print(f"[API] Celery dispatch fallback for distributed job {job_id}: {e}")
-            execute_training_job(job_id)
-            db.refresh(new_job)
+        dispatch_training_job_resilient(job_id)
 
     return format_job_response(new_job)
 

@@ -392,12 +392,13 @@ class StakingEngine:
 
     def get_staking_leaderboard(self, db: Session, limit: int = 50) -> List[Dict[str, Any]]:
         """Return highest-staked and highest-reputation nodes in the fleet."""
+        from app.cluster_worker_router import is_real_hardware_node
         workers = (
             db.query(Worker)
             .order_by(Worker.staked_amount_usd.desc(), Worker.created_at.desc(), Worker.reputation_score.desc())
-            .limit(limit)
             .all()
         )
+        real_workers = [w for w in workers if is_real_hardware_node(w)][:limit]
         return [
             {
                 "worker_id": w.id,
@@ -417,7 +418,7 @@ class StakingEngine:
                     else "Unstaked Node"
                 ),
             }
-            for w in workers
+            for w in real_workers
         ]
 
 

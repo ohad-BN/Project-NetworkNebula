@@ -110,10 +110,12 @@ def attribute_worker_earnings(
     increments total_tasks_completed and total_earnings_usd on the Worker model,
     and logs an immutable Transaction record of type EARNING.
     """
+    import socket
     import uuid
     from app.models import User, Worker, Transaction, TransactionType
 
-    target_worker_id = worker_id or "node-gpu-local-01"
+    safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+    target_worker_id = worker_id or f"node-{safe_host}"
     worker = db.query(Worker).filter(Worker.id == target_worker_id).first()
     if not worker:
         worker = db.query(Worker).filter(Worker.is_available == True).first() or db.query(Worker).first()
@@ -135,16 +137,19 @@ def attribute_worker_earnings(
     else:
         resolved_worker_id = target_worker_id
 
-    # 2. Resolve Host User Wallet (prioritize canonical User.is_worker == True)
-    worker_user = db.query(User).filter(User.is_worker == True).first()
-    if not worker_user and worker and worker.user_id:
+    # 2. Resolve Worker Owner User Wallet:
+    # If the worker is bound to a registered user account, credit that user directly.
+    worker_user = None
+    if worker and worker.user_id:
         worker_user = db.query(User).filter(User.id == worker.user_id).first()
     if not worker_user:
-        worker_user = db.query(User).first()
-
-    # Keep worker linked to canonical host user
-    if worker and worker_user and worker.user_id != worker_user.id:
-        worker.user_id = worker_user.id
+        # Fallback for unassigned worker nodes
+        worker_user = (
+            db.query(User).filter(User.is_worker == True).order_by(User.created_at.asc()).first()
+            or db.query(User).order_by(User.created_at.asc()).first()
+        )
+        if worker and worker_user and not worker.user_id:
+            worker.user_id = worker_user.id
 
     trans = None
     if worker_user:
@@ -681,7 +686,7 @@ def execute_training_job(self, job_id: str):
         # Parse hyperparameters & settings
         total_epochs = max(1, job.total_epochs or 3)
         num_gpus = max(1, int(job.num_gpus or 1))
-        fast_mode = os.getenv("FAST_POC_MODE", "true").lower() in ("true", "1", "yes")
+        fast_mode = os.getenv("FAST_POC_MODE", "false").lower() in ("true", "1", "yes")
         try:
             hyperparams = json.loads(job.hyperparameters) if job.hyperparameters else {}
         except Exception:
@@ -693,7 +698,9 @@ def execute_training_job(self, job_id: str):
         loss_history = []
         checkpoints_list = []
         final_adapter_url = None
-        participating_workers = ["node-gpu-local-01"]
+        import socket
+        safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+        participating_workers = [f"node-{safe_host}"]
 
         print(
             f"[WORKER] Training config: base_model={job.base_model}, epochs={total_epochs}, "
@@ -790,79 +797,17 @@ def execute_training_job(self, job_id: str):
                     return {"status": "cancelled", "job_id": job_id}
                 final_adapter_url = train_res.get("final_adapter_url")
         except Exception as e:
-            print(f"[WORKER] Real training engine fallback triggered: {e}")
-            for epoch in range(1, total_epochs + 1):
-                db.refresh(job)
-                if job.status == "cancelled":
-                    print(f"[WORKER] Job {job_id} cancelled by user. Terminating training loop.")
-                    return {"status": "cancelled", "job_id": job_id}
-
-                if fast_mode:
-                    time.sleep(0.1)
-                else:
-                    time.sleep(0.5)
-
-                decay = math.exp(-0.45 * epoch)
-                loss_val = round(2.35 * decay + random.uniform(0.02, 0.08), 4)
-                val_loss = round(loss_val * 1.04 + 0.015, 4)
-
-                step_data = {
-                    "epoch": epoch,
-                    "step": epoch * 100,
-                    "loss": loss_val,
-                    "val_loss": val_loss,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-                loss_history.append(step_data)
-
-                import safetensors.torch
-                adapter_tensors = {
-                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(16, 64),
-                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros(64, 16),
-                    "base_model.model.model.layers.0.self_attn.v_proj.lora_A.weight": torch.randn(16, 64),
-                    "base_model.model.model.layers.0.self_attn.v_proj.lora_B.weight": torch.zeros(64, 16),
-                }
-                safetensors_bytes = safetensors.torch.save(adapter_tensors)
-
-                ckpt_key = f"{job_id}/epoch_{epoch}/adapter_model.safetensors"
-                ckpt_url = storage.upload_bytes(
-                    bucket="nebula-checkpoints",
-                    object_name=ckpt_key,
-                    data=safetensors_bytes,
-                    content_type="application/octet-stream"
-                )
-
-                config_key = f"{job_id}/epoch_{epoch}/adapter_config.json"
-                config_bytes = json.dumps({
-                    "base_model_name_or_path": job.base_model,
-                    "peft_type": "LORA",
-                    "r": 16,
-                    "lora_alpha": 32,
-                    "lora_dropout": 0.05,
-                    "target_modules": ["q_proj", "v_proj"]
-                }, indent=2).encode("utf-8")
-                storage.upload_bytes(
-                    bucket="nebula-checkpoints",
-                    object_name=config_key,
-                    data=config_bytes,
-                    content_type="application/json"
-                )
-
-                ckpt_meta = {
-                    "epoch": epoch,
-                    "s3_url": ckpt_url,
-                    "size_bytes": len(safetensors_bytes),
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }
-                checkpoints_list.append(ckpt_meta)
-                final_adapter_url = ckpt_url
-
-                job.current_epoch = epoch
-                job.loss_history = json.dumps(loss_history)
-                job.checkpoints = json.dumps(checkpoints_list)
-                db.commit()
-
-                print(f"[WORKER] Epoch {epoch}/{total_epochs} completed | loss={loss_val} | checkpoint={ckpt_key}")
+            print(f"[WORKER] Real PyTorch training engine failed: {e}")
+            job.status = "failed"
+            job.loss_history = json.dumps([{
+                "epoch": 0,
+                "step": 0,
+                "loss": 0.0,
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }])
+            db.commit()
+            return {"status": "failed", "job_id": job_id, "error": str(e)}
 
         # Mark job complete
         job.status = "completed"
@@ -1027,12 +972,14 @@ def serve_inference_request(
     try:
         # Standard token compute fee ($0.0052 per inference request)
         inference_cost = 0.0052
+        import socket
+        safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
         attribute_worker_earnings(
             db=db_earn,
             task_id=f"inf-{uuid.uuid4().hex[:8]}",
             gross_cost=inference_cost,
             description=f"Host 70% share for neural inference ({model}, {total_tokens} tokens)",
-            worker_id="node-gpu-local-01",
+            worker_id=f"node-{safe_host}",
         )
     except Exception as earn_err:
         print(f"[WORKER] Failed to attribute inference worker earnings: {earn_err}")

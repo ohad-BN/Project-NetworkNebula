@@ -105,7 +105,7 @@ export function MoeStudioPage() {
 
   // Worker Payout Dialog
   const [payoutDialogOpen, setPayoutDialogOpen] = useState<boolean>(false);
-  const [payoutWorkerId, setPayoutWorkerId] = useState<string>("worker-host-gpu-01");
+  const [payoutWorkerId, setPayoutWorkerId] = useState<string>("node-skorp");
   const [payoutAmount, setPayoutAmount] = useState<number>(30);
   const [payoutMethod, setPayoutMethod] = useState<string>("usdc_base");
   const [payoutDest, setPayoutDest] = useState<string>("0x71C...49b2");
@@ -532,34 +532,45 @@ export function MoeStudioPage() {
                     })}
                   </div>
 
-                  {/* Worker Pairing Summary Cards */}
-                  <div className="space-y-2">
-                    <h4 className="text-sm font-semibold text-foreground">
-                      Consumer 8GB Worker Assignments
-                    </h4>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {[
-                        { pair: "[0, 1]", worker: "worker-us-east-01", vram: "6.85 GB / 8.0 GB", status: "ONLINE", topHits: "38.2%" },
-                        { pair: "[2, 3]", worker: "worker-eu-west-02", vram: "6.85 GB / 8.0 GB", status: "ONLINE", topHits: "24.5%" },
-                        { pair: "[4, 5]", worker: "worker-ap-east-03", vram: "6.85 GB / 8.0 GB", status: "ONLINE", topHits: "19.8%" },
-                        { pair: "[6, 7]", worker: "worker-us-west-04", vram: "6.85 GB / 8.0 GB", status: "ONLINE", topHits: "17.5%" },
-                      ].map((item, idx) => (
-                        <div
-                          key={idx}
-                          className="flex items-center justify-between p-3 rounded-lg border bg-muted/20 text-xs"
-                        >
-                          <div>
-                            <span className="font-mono font-bold text-purple-400">Experts {item.pair}</span>
-                            <div className="text-muted-foreground">{item.worker}</div>
-                          </div>
-                          <div className="text-right">
-                            <span className="text-foreground font-mono">{item.vram}</span>
-                            <div className="text-emerald-400 font-semibold">{item.status}</div>
-                          </div>
+                    {/* Worker Pairing Summary Cards */}
+                    <div className="space-y-2">
+                      <h4 className="text-sm font-semibold text-foreground">
+                        Consumer 8GB Worker Assignments
+                      </h4>
+                      {activePipeline?.worker_assignments && Object.keys(activePipeline.worker_assignments).length > 0 ? (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {Object.values(activePipeline.worker_assignments).map((item, idx) => (
+                            <div
+                              key={idx}
+                              className="flex items-center justify-between p-3 rounded-lg border bg-muted/20 text-xs"
+                            >
+                              <div>
+                                <span className="font-mono font-bold text-purple-400">
+                                  Experts [{item.expert_pair?.[0] ?? idx * 2}, {item.expert_pair?.[1] ?? idx * 2 + 1}]
+                                </span>
+                                <div className="text-muted-foreground">{item.worker_id}</div>
+                              </div>
+                              <div className="text-right">
+                                <span className="text-foreground font-mono">{item.vram_gb || 6.8} GB VRAM</span>
+                                <div className="text-emerald-400 font-semibold">{item.status || "ONLINE"}</div>
+                              </div>
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      ) : (
+                        <div className="p-3.5 rounded-lg border bg-muted/20 text-xs flex items-center justify-between">
+                          <div>
+                            <span className="font-mono font-bold text-primary">Primary Host Node (node-skorp)</span>
+                            <div className="text-muted-foreground text-[11px] mt-0.5">
+                              NVIDIA GeForce RTX 4070 Laptop GPU • 8.0 GB VRAM
+                            </div>
+                          </div>
+                          <Badge variant="outline" className="text-emerald-400 border-emerald-500/30 font-mono text-[10px]">
+                            ONLINE
+                          </Badge>
+                        </div>
+                      )}
                     </div>
-                  </div>
                 </CardContent>
               </Card>
 
