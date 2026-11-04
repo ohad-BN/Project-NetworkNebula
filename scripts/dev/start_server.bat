@@ -6,6 +6,9 @@ echo   🌌 Project NetworkNebula — Dedicated Server Stack Startup
 echo ==============================================================================
 echo.
 
+:: Switch to repository root directory
+cd /d "%~dp0..\.."
+
 :: Check Docker installation
 docker --version >nul 2>&1
 if %errorlevel% neq 0 (

@@ -97,7 +97,7 @@ export function TrainingStudioPage() {
 
   const fetchClusterNodes = async () => {
     try {
-      const res = await apiClient.get("/api/v1/cluster/telemetry");
+      const res = await apiClient.get("/api/v1/cluster/telemetry?scope=all");
       const nodes = (res.data?.nodes || []) as ClusterNodeItem[];
       setClusterNodes(nodes);
       const onlineIds = nodes.filter((n) => n.status === "online").map((n) => n.node_id);
@@ -320,7 +320,13 @@ export function TrainingStudioPage() {
 
                     <button
                       type="button"
-                      onClick={() => setDistributionMode("distributed")}
+                      onClick={() => {
+                        setDistributionMode("distributed");
+                        const onlineIds = clusterNodes.filter((n) => n.status === "online").map((n) => n.node_id);
+                        if (onlineIds.length > 0) {
+                          setSelectedWorkerIds(onlineIds);
+                        }
+                      }}
                       className={`flex items-center gap-2 rounded-md border p-2.5 text-left text-xs transition-colors cursor-pointer ${
                         distributionMode === "distributed"
                           ? "border-primary bg-primary/10 text-primary font-medium"

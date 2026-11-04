@@ -63,6 +63,11 @@ class Task(Base):
         String(20), default="celery", nullable=False
     )  # "celery" or "standalone"
     claimed_by = Column(String(36), nullable=True, index=True)
+    total_slices = Column(Integer, default=1)
+    completed_slices = Column(Integer, default=0)
+    total_compute_seconds = Column(Float, default=0.0)
+    earned_so_far_usd = Column(Float, default=0.0)
+    last_checkpoint_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -132,6 +137,14 @@ class Worker(Base):
     gpus_json = Column(Text, default="[]", nullable=True)
     region = Column(String(64), default="us-east", nullable=False)
     latency_ping_ms = Column(Float, default=15.0, nullable=False)
+    compute_architecture = Column(String(32), default="cuda", nullable=False)
+    hardware_tier = Column(String(32), default="consumer_gpu", nullable=False)
+    device_brand = Column(String(100), nullable=True)
+    country = Column(String(64), nullable=True)
+    city = Column(String(100), nullable=True)
+    public_ip = Column(String(64), nullable=True)
+    is_unified_memory = Column(Boolean, default=False)
+    supported_task_types = Column(String(255), default="inference,training")
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -233,5 +246,21 @@ class AuditLog(Base):
     details = Column(Text, default="{}", nullable=False)
     ip_address = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ComputeSlice(Base):
+    __tablename__ = "compute_slices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slice_id = Column(String(64), unique=True, index=True, nullable=False)
+    task_id = Column(String(255), index=True, nullable=False)
+    worker_id = Column(String(36), index=True, nullable=False)
+    slice_index = Column(Integer, nullable=False)
+    compute_time_sec = Column(Float, nullable=False)
+    reward_usd = Column(Float, nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    checkpoint_url = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 
 

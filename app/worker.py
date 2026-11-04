@@ -1,9 +1,18 @@
 import json
 import os
+import sys
 import time
 import zipfile
 import io
 import random
+
+# Suppress Windows modal error dialog popups for broken third-party DLLs (e.g. xformers mismatch)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
+    except Exception:
+        pass
 
 import torch
 from celery import Celery
@@ -66,9 +75,12 @@ def load_stable_diffusion_pipeline(model_id: str = "runwayml/stable-diffusion-v1
     pipe = pipe.to(device)
 
     if device == "cuda":
+        # PyTorch 2.x natively enables Scaled Dot-Product Attention (SDPA)
+        # Avoid forcing xformers if not available or incompatible
         try:
+            import xformers  # Only attempt enable if module cleanly loads without C-extension errors
             pipe.enable_xformers_memory_efficient_attention()
-        except Exception:
+        except (ImportError, Exception):
             pass
         try:
             pipe.enable_vae_slicing()

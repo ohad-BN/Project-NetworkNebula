@@ -96,3 +96,17 @@ desktop.ini
 # Agent scratch & local run artifacts
 .gemini/
 scratch/
+docs/temp/scratchpad/*
+!docs/temp/scratchpad/.gitkeep
+docs/temp/reports/*
+!docs/temp/reports/.gitkeep
+
+# Binaries, native libraries & tools
+*.exe
+*.dll
+*.dylib
+*.so
+bin/
+.bin/
+cloudflared.exe
+

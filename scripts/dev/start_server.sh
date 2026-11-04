@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
+# Switch to repository root directory
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
 echo "=============================================================================="
 echo "  🌌 Project NetworkNebula — Dedicated Server Stack Startup"
 echo "=============================================================================="

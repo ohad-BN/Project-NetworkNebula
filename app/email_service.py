@@ -12,9 +12,10 @@ import logging
 import os
 import smtplib
 import sys
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
+from typing import Dict, Optional
 
 import dotenv
 import requests
@@ -47,12 +48,85 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 SMTP_USER = os.environ.get("SMTP_USER")
 
 
+# Deduplication cache: email -> timestamp of last dispatch
+_recent_dispatches: Dict[str, float] = {}
+
+def is_test_or_synthetic_email(email: str) -> bool:
+    """
+    Detect synthetic test emails used in automated test suites and agent verification.
+    Prevents outbound SMTP / Resend spam and bounce-back emails during testing.
+    """
+    if not email or "@" not in email:
+        return True
+
+    # Global testing flag
+    if os.environ.get("TESTING", "").lower() in ("true", "1", "yes") or \
+       os.environ.get("NEBULA_MOCK_EMAIL", "").lower() in ("true", "1", "yes"):
+        return True
+
+    clean = email.strip().lower()
+    local_part, domain = clean.split("@", 1)
+
+    # Test/internal domains
+    test_domains = (
+        "nebula.ai",
+        "nebula.io",
+        "example.com",
+        "example.org",
+        "test.com",
+        "test.io",
+        "localhost",
+        "networknebula.internal",
+        "networknebula.org",
+    )
+    if domain in test_domains or domain.endswith((".test", ".example", ".invalid", ".localhost")):
+        return True
+
+    # Automated test prefixes
+    test_prefixes = (
+        "poc_user_",
+        "quick_qa_",
+        "alpha_qa_",
+        "test_",
+        "mock_",
+        "qa_",
+        "automated_",
+    )
+    if any(local_part.startswith(prefix) for prefix in test_prefixes):
+        return True
+
+    return False
+
+
 def send_verification_email(email: str, code: str, initial_credits: float = 100.0) -> bool:
     """
     Send a 6-digit email verification OTP code to the newly registered user.
-    Uses Resend API if configured, SMTP if configured, or logs to console for local testing.
+    - Test/synthetic accounts: simulated locally (no live SMTP or Resend dispatch).
+    - Real users: dispatched via SMTP (with 45s deduplication cooldown to prevent duplicate emails).
     """
     dotenv.load_dotenv(dotenv.find_dotenv(), override=True)
+
+    clean_email = email.strip().lower()
+
+    # 1. Automated Test & Synthetic Email Guard
+    if is_test_or_synthetic_email(clean_email):
+        print("\n" + "=" * 76)
+        print("  [NEBULA AUTH DISPATCH] TEST / SIMULATED VERIFICATION EMAIL")
+        print("=" * 76)
+        print(f"  Recipient          : {clean_email} (Simulated - Outbound email suppressed)")
+        print(f"  Verification Code  : {code}")
+        print(f"  Alpha Grant        : +${initial_credits:.2f} Free Compute Credits")
+        print("=" * 76 + "\n")
+        logger.info(f"[EMAIL SIMULATION] Suppressed live email for test recipient: {clean_email}")
+        return True
+
+    # 2. Duplicate Dispatch Prevention (45-second cooldown per email)
+    now = time.time()
+    last_sent = _recent_dispatches.get(clean_email, 0.0)
+    if (now - last_sent) < 45.0:
+        logger.info(f"[EMAIL DEDUPLICATION] Verification email already dispatched to {clean_email} within last 45s. Skipping duplicate.")
+        print(f"  ℹ️ [EMAIL DEDUPLICATION] Active OTP already sent to {clean_email} recently. Skipping duplicate send.")
+        return True
 
     resend_api_key = os.environ.get("RESEND_API_KEY")
     resend_from_email = os.environ.get("RESEND_FROM_EMAIL", "NetworkNebula <onboarding@resend.dev>")
@@ -123,6 +197,7 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
                 server.starttls()
                 server.login(smtp_user, clean_pw)
                 server.sendmail(smtp_user, [email], msg.as_string())
+            _recent_dispatches[clean_email] = time.time()
             logger.info(f"[SMTP] Verification email sent to {email}")
             try:
                 print(f"  ✅ [GMAIL SMTP] Live email delivered to {email}!")
@@ -154,6 +229,7 @@ def send_verification_email(email: str, code: str, initial_credits: float = 100.
                 timeout=10,
             )
             if resp.status_code in [200, 201]:
+                _recent_dispatches[clean_email] = time.time()
                 logger.info(f"[RESEND] Verification email sent to {email} (ID: {resp.json().get('id')})")
                 try:
                     print(f"  ✅ [RESEND API] Live email delivered to {email}!")

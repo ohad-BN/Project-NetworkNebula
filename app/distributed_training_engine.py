@@ -514,7 +514,14 @@ class DistributedTrainingEngine:
                             w_db.total_tasks_completed = (w_db.total_tasks_completed or 0) + 1
                             w_weight = float(worker_weights.get(wid, 1.0))
                             reward = round(0.015 * total_epochs * (w_weight / tot_weight), 4)
-                            attribute_worker_earnings(wid, reward, f"Distributed training shard for job {job_id[:8]}", db=db)
+                            attribute_worker_earnings(
+                                db=db,
+                                task_id=job_id,
+                                gross_cost=round(reward / 0.70, 4),
+                                description=f"Distributed training shard for job {job_id[:8]}",
+                                worker_id=wid,
+                                share_pct=0.70,
+                            )
                     db.commit()
             except Exception as e:
                 print(f"[DIST_ENGINE] Note: worker credit error: {e}")

@@ -182,15 +182,18 @@ Project NetworkNebula/
 │   ├── vite.config.ts                # Vite frontend bundler configuration
 │   └── Dockerfile                    # Multi-stage production Nginx container
 │
-├── docs/                             # University-Standard SE Documentation Suite
-│   ├── SOW.md                        # Scope of Work (Why, What, Milestones)
-│   ├── SRS.md                        # Software Requirements Spec & Use Cases
-│   ├── SDD.md                        # System Design Document (Architecture)
-│   ├── EDD.md                        # Engineering Design Document (Worker Engine)
-│   ├── API.md                        # Complete API Reference & Developer Contract
-│   ├── STP.md                        # Software Test Plan
-│   ├── STD.md                        # Software Test Description (Concrete Test Cases)
-│   └── TRACEABILITY.md               # End-to-End Bidirectional Traceability Matrix
+├── docs/                             # 📚 Central Documentation & Artifacts Hub
+│   ├── README.md                     # Master Documentation Catalog Index
+│   ├── long-term/                    # Permanent specifications, architecture & API
+│   │   ├── architecture/             # ARCHITECTURE.md, SDD.md, EDD.md
+│   │   ├── specifications/           # SRS.md, SOW.md, TRACEABILITY.md
+│   │   ├── api/                      # API.md
+│   │   ├── testing/                  # STP.md, STD.md
+│   │   └── product/                  # ROADMAP.md, SKILLS.md
+│   └── temp/                         # Temporary working artifacts & scratchpad
+│       ├── execution-plans/          # EXEC_PLANS.md
+│       ├── scratchpad/               # Ephemeral scratch & debug logs
+│       └── reports/                  # Benchmark runs & test reports
 │
 ├── nebula_worker.py                  # Standalone GPU host worker daemon
 ├── test_suite.py                     # Master test suite runner
@@ -202,24 +205,28 @@ Project NetworkNebula/
 
 ## 📚 Software Engineering Documentation Suite
 
-This repository implements the formal software engineering documentation chain taught in **Intro2SE** (School of Computer Science, Ariel University · Prof. Boaz Ben-Moshe):
+All specifications, architectural designs, and QA test plans are consolidated in [`docs/`](docs/README.md), following university-standard software engineering practices (Intro2SE · Prof. Boaz Ben-Moshe):
 
 | Document | Purpose | File Link |
 | :--- | :--- | :--- |
-| **SOW** | Scope of Work: objectives, deliverables, milestones, and acceptance | [`docs/SOW.md`](docs/SOW.md) |
-| **SRS** | Software Requirements Specification: functional/NFR requirements & use cases | [`docs/SRS.md`](docs/SRS.md) |
-| **SDD** | System Design Document: decomposition, components, database & deployment | [`docs/SDD.md`](docs/SDD.md) |
-| **EDD** | Engineering Design Document: worker engine internals, algorithms & state machine | [`docs/EDD.md`](docs/EDD.md) |
-| **API** | API Reference: contract, error envelopes, and OpenAI drop-in specs | [`docs/API.md`](docs/API.md) |
-| **STP** | Software Test Plan: strategy, levels, entry/exit criteria | [`docs/STP.md`](docs/STP.md) |
-| **STD** | Software Test Description: concrete test cases and automated procedures | [`docs/STD.md`](docs/STD.md) |
-| **Traceability** | Bidirectional matrix linking SOW &rarr; SRS &rarr; SDD &rarr; EDD &rarr; STD | [`docs/TRACEABILITY.md`](docs/TRACEABILITY.md) |
+| **Documentation Index** | Complete documentation catalog and directory guide | [`docs/README.md`](docs/README.md) |
+| **SOW** | Scope of Work: objectives, deliverables, milestones, and acceptance | [`docs/long-term/specifications/SOW.md`](docs/long-term/specifications/SOW.md) |
+| **SRS** | Software Requirements Specification: functional/NFR requirements & use cases | [`docs/long-term/specifications/SRS.md`](docs/long-term/specifications/SRS.md) |
+| **SDD** | System Design Document: decomposition, components, database & deployment | [`docs/long-term/architecture/SDD.md`](docs/long-term/architecture/SDD.md) |
+| **EDD** | Engineering Design Document: worker engine internals, algorithms & state machine | [`docs/long-term/architecture/EDD.md`](docs/long-term/architecture/EDD.md) |
+| **API** | API Reference: contract, error envelopes, and OpenAI drop-in specs | [`docs/long-term/api/API.md`](docs/long-term/api/API.md) |
+| **STP** | Software Test Plan: strategy, levels, entry/exit criteria | [`docs/long-term/testing/STP.md`](docs/long-term/testing/STP.md) |
+| **STD** | Software Test Description: concrete test cases and automated procedures | [`docs/long-term/testing/STD.md`](docs/long-term/testing/STD.md) |
+| **Traceability** | Bidirectional matrix linking SOW &rarr; SRS &rarr; SDD &rarr; EDD &rarr; STD | [`docs/long-term/specifications/TRACEABILITY.md`](docs/long-term/specifications/TRACEABILITY.md) |
+| **Architecture** | System architecture, cluster topologies, and tensor flow | [`docs/long-term/architecture/ARCHITECTURE.md`](docs/long-term/architecture/ARCHITECTURE.md) |
+| **Roadmap** | Multi-phase development roadmap and deliverables | [`docs/long-term/product/ROADMAP.md`](docs/long-term/product/ROADMAP.md) |
+| **Execution Plans** | Multi-worker dispatch & payout hardening plan | [`docs/temp/execution-plans/EXEC_PLANS.md`](docs/temp/execution-plans/EXEC_PLANS.md) |
 
 ---
 
 ## 🤝 How to Contribute
 
-1. **Docs-as-Code Rule:** Any functional modification or endpoint addition must be reflected in `docs/SRS.md`, `docs/API.md`, and `docs/STD.md` in the same pull request.
+1. **Docs-as-Code Rule:** Any functional modification or endpoint addition must be reflected in `docs/long-term/specifications/SRS.md`, `docs/long-term/api/API.md`, and `docs/long-term/testing/STD.md` in the same pull request.
 2. **Regression Check:** All pull requests must achieve a 100% green pass in `python test_suite.py` before merge.
 3. **Branching Strategy:** Work in dedicated feature branches (`feature/<feature-name>`) and target `main`.
 

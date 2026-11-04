@@ -80,6 +80,8 @@ class ClusterScheduler:
         hourly_rate = round(float(worker.hourly_rate_usd or 0.45), 4)
         worker_region = (getattr(worker, "region", None) or "us-east").strip()
         worker_latency = round(float(getattr(worker, "latency_ping_ms", 15.0) or 15.0), 2)
+        arch = (getattr(worker, "compute_architecture", None) or "cuda").lower()
+        supported_tasks = [t.strip().lower() for t in (getattr(worker, "supported_task_types", None) or "").split(",") if t.strip()]
 
         # Eligibility checks
         eligible = True
@@ -91,6 +93,9 @@ class ClusterScheduler:
         elif not worker.is_available or (worker.status or "").lower() in ("offline", "failed", "maintenance"):
             eligible = False
             disqualification_reason = f"Node unavailable (status={worker.status}, is_available={worker.is_available})"
+        elif supported_tasks and task_type and task_type.lower() not in supported_tasks:
+            eligible = False
+            disqualification_reason = f"Architecture '{arch}' does not support task type '{task_type}'"
         elif allocated_vram_gb < required_vram_gb:
             eligible = False
             disqualification_reason = (
@@ -159,6 +164,12 @@ class ClusterScheduler:
             "gpu_utilization_pct": util_pct,
             "total_tasks_completed": tasks_done,
             "hourly_rate_usd": hourly_rate,
+            "compute_architecture": getattr(worker, "compute_architecture", "cuda"),
+            "hardware_tier": getattr(worker, "hardware_tier", "consumer_gpu"),
+            "device_brand": getattr(worker, "device_brand", None),
+            "country": getattr(worker, "country", None),
+            "city": getattr(worker, "city", None),
+            "is_unified_memory": bool(getattr(worker, "is_unified_memory", False)),
             "score": total_score,
             "score_breakdown": {
                 "vram_headroom_score": vram_score,
@@ -330,6 +341,10 @@ class ClusterScheduler:
             "replacement_score": standby_workers[0]["score"] if standby_workers else 0.0,
             "reason": reason,
             "rebound_entity": rebound_entity or "virtual_task",
+            "completed_slices": int(task_obj.completed_slices or 0) if task_obj else 0,
+            "total_slices": int(task_obj.total_slices or 1) if task_obj else 1,
+            "resume_slice_index": (int(task_obj.completed_slices or 0) + 1) if task_obj else 1,
+            "last_checkpoint_url": getattr(task_obj, "last_checkpoint_url", None) if task_obj else None,
             "status": "rerouted",
             "timestamp": datetime.utcnow().isoformat(),
         }

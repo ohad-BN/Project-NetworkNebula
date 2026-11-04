@@ -39,4 +39,13 @@ echo "[*] Connecting to http://${SERVER_IP}:8000 as '${NODE_NAME}' (${WORKER_ID}
 echo "[*] Press Ctrl+C at any time to disconnect gracefully."
 echo ""
 
-python3 nebula_worker.py join --server "http://${SERVER_IP}:8000" --name "${NODE_NAME}" --worker-id "${WORKER_ID}" --vram-pct "${VRAM_PCT}" --tunnel
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+
+if [ -f "worker/nebula_worker.py" ]; then
+    WORKER_SCRIPT="worker/nebula_worker.py"
+else
+    WORKER_SCRIPT="nebula_worker.py"
+fi
+
+python3 $WORKER_SCRIPT join --server "http://${SERVER_IP}:8000" --name "${NODE_NAME}" --worker-id "${WORKER_ID}" --vram-pct "${VRAM_PCT}" --tunnel

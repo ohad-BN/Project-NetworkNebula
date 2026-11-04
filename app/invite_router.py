@@ -181,6 +181,18 @@ def resend_code(payload: ResendCodeRequest, db: Session = Depends(get_db)) -> Di
             "is_verified": True,
         }
 
+    # 45-second cooldown guard: prevent rapid resend button spam
+    now = datetime.now(timezone.utc)
+    if user.verification_expires_at:
+        exp = user.verification_expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if (exp - now).total_seconds() > 855:
+            return {
+                "status": "cooldown",
+                "message": "A verification code was recently sent. Please check your inbox or wait 45 seconds before requesting another.",
+            }
+
     otp = f"{random.randint(100000, 999999)}"
     user.verification_code = otp
     user.verification_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)

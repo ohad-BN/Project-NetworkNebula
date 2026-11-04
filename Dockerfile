@@ -12,9 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend application source
+# Copy backend and worker source
 COPY app/ ./app/
-COPY nebula_worker.py .
+COPY worker/ ./worker/
+RUN cp worker/nebula_worker.py ./nebula_worker.py
 
 EXPOSE 8000
 

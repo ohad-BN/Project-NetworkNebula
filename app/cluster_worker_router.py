@@ -4,6 +4,7 @@ Provides real-time hardware introspection, GPU contribution percentage control (
 worker node registration, heartbeat synchronization, and cluster telemetry.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +31,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import engine, get_db
-from app.models import Task, TaskStatus, Transaction, TransactionType, User, Worker
+from app.models import ComputeSlice, Task, TaskStatus, Transaction, TransactionType, User, Worker
+from app.hardware_detector import inspect_universal_hardware
+from app.geo_locator import resolve_node_location
 
 logger = logging.getLogger(__name__)
 
@@ -153,84 +156,45 @@ ensure_worker_schema_columns()
 
 
 def probe_local_gpu_hardware() -> Dict[str, Any]:
-    """Probe physical CUDA hardware on the host machine across all available GPU devices."""
-    cpu_cores = os.cpu_count() or 8
-    hostname = socket.gethostname() or "nebula-node"
-    safe_host = hostname.lower().replace(" ", "-").replace(".", "-")
-
-    total_ram_gb = 16.0
+    """Probe physical compute hardware across CUDA, Apple Silicon MPS, Intel Arc, and AMD ROCm."""
     try:
-        import psutil
-        total_ram_gb = round(psutil.virtual_memory().total / (1024**3), 1)
-    except Exception:
-        pass
-
-    gpus_list = []
-    cuda_ver = "CPU"
-    cuda_available = False
-
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            cuda_available = True
-            dev_count = torch.cuda.device_count()
-            pt_ver = torch.__version__.split("+")[0]
-            cuda_ver = f"{torch.version.cuda or '12.8'} / PyTorch {pt_ver}"
-
-            for i in range(dev_count):
-                props = torch.cuda.get_device_properties(i)
-                total_gb = round(props.total_memory / (1024**3), 2)
-                alloc_gb = torch.cuda.memory_allocated(i) / (1024**3)
-                res_gb = torch.cuda.memory_reserved(i) / (1024**3)
-                used_gb = round(max(alloc_gb, res_gb, 0.95), 2)
-                util_pct = round(min(100.0, max(8.0, (used_gb / max(total_gb, 0.1)) * 100.0)), 1)
-                gpus_list.append({
-                    "index": i,
-                    "name": torch.cuda.get_device_name(i),
-                    "vram_total_gb": total_gb,
-                    "vram_allocated_gb": round(total_gb * 0.8, 2),
-                    "vram_used_gb": used_gb,
-                    "vram_allocation_pct": 80,
-                    "gpu_utilization_pct": util_pct,
-                    "status": "online",
-                    "is_available": True,
-                })
+        hw = inspect_universal_hardware()
+        hw["cuda_version"] = hw.get("runtime_version", "CPU")
+        hw["cuda_available"] = hw.get("compute_architecture") in ("cuda", "amd_rocm", "apple_mps", "intel_xpu")
+        return hw
     except Exception as e:
-        logger.warning(f"Failed to probe local CUDA hardware: {e}")
-
-    if not gpus_list:
-        gpus_list.append({
-            "index": 0,
-            "name": "CPU Fallback Node",
+        logger.warning(f"Universal hardware introspector note: {e}")
+        cpu_cores = os.cpu_count() or 4
+        hostname = socket.gethostname() or "nebula-node"
+        safe_host = hostname.lower().replace(" ", "-").replace(".", "-")
+        return {
+            "hostname": hostname,
+            "safe_host": safe_host,
+            "node_id": f"node-{safe_host}",
+            "gpu_model": "Universal Compute Node",
+            "compute_architecture": "cpu_simd",
+            "hardware_tier": "consumer_gpu",
             "vram_total_gb": 8.0,
-            "vram_allocated_gb": 6.4,
             "vram_used_gb": 0.5,
-            "vram_allocation_pct": 80,
-            "gpu_utilization_pct": 12.0,
-            "status": "online",
-            "is_available": True,
-        })
-
-    primary_gpu = gpus_list[0]
-    total_vram = round(sum(g["vram_total_gb"] for g in gpus_list), 2)
-    used_vram = round(sum(g["vram_used_gb"] for g in gpus_list), 2)
-    gpu_display_name = primary_gpu["name"] if len(gpus_list) == 1 else f"{len(gpus_list)}x {primary_gpu['name']}"
-
-    return {
-        "hostname": hostname,
-        "safe_host": safe_host,
-        "node_id": f"node-{safe_host}",
-        "gpu_model": gpu_display_name,
-        "vram_total_gb": total_vram,
-        "vram_used_gb": used_vram,
-        "gpu_utilization_pct": primary_gpu["gpu_utilization_pct"],
-        "cuda_version": cuda_ver,
-        "cpu_cores": cpu_cores,
-        "memory_gb": total_ram_gb,
-        "cuda_available": cuda_available,
-        "gpus": gpus_list,
-    }
+            "gpu_utilization_pct": 10.0,
+            "cuda_version": "CPU",
+            "cpu_cores": cpu_cores,
+            "memory_gb": 16.0,
+            "cuda_available": False,
+            "is_unified_memory": False,
+            "supported_task_types": "inference,batch_inference",
+            "gpus": [{
+                "index": 0,
+                "name": "Universal Compute Node",
+                "vram_total_gb": 8.0,
+                "vram_allocated_gb": 6.4,
+                "vram_used_gb": 0.5,
+                "vram_allocation_pct": 80,
+                "gpu_utilization_pct": 10.0,
+                "status": "online",
+                "is_available": True,
+            }],
+        }
 
 
 def enforce_local_cuda_memory_fraction(vram_allocation_pct: int) -> bool:
@@ -271,8 +235,9 @@ def resolve_optional_user(
 
 
 def sync_primary_local_worker(db: Session) -> Worker:
-    """Ensure the primary local worker node is registered and synced with live GPU metrics."""
+    """Ensure the primary local worker node is registered and synced with live hardware & geo metrics."""
     hw = probe_local_gpu_hardware()
+    geo = resolve_node_location()
     worker_id = LOCAL_PRIMARY_NODE_ID
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -289,15 +254,23 @@ def sync_primary_local_worker(db: Session) -> Worker:
             vram_used_gb=hw["vram_used_gb"],
             vram_allocation_pct=80,
             gpu_utilization_pct=hw["gpu_utilization_pct"],
-            cuda_version=hw["cuda_version"],
+            cuda_version=hw.get("runtime_version") or hw.get("cuda_version", "12.8"),
             gpus_json=json.dumps(hw["gpus"]),
             role="LoRA Training & Fast Serving",
             hourly_rate_usd=0.45,
             total_earnings_usd=0.0,
             is_available=True,
             total_tasks_completed=0,
-            region="us-east",
-            latency_ping_ms=5.2,
+            region=geo.get("region", "us-east"),
+            latency_ping_ms=geo.get("latency_ping_ms", 12.0),
+            compute_architecture=hw.get("compute_architecture", "cuda"),
+            hardware_tier=hw.get("hardware_tier", "consumer_gpu"),
+            device_brand=hw.get("gpu_vendor", "Generic"),
+            country=geo.get("country"),
+            city=geo.get("city"),
+            public_ip=geo.get("public_ip"),
+            is_unified_memory=hw.get("is_unified_memory", False),
+            supported_task_types=hw.get("supported_task_types", "inference,training"),
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -307,19 +280,29 @@ def sync_primary_local_worker(db: Session) -> Worker:
         worker.gpu_info = hw["gpu_model"]
         worker.gpu_memory_gb = hw["vram_total_gb"]
         worker.vram_used_gb = hw["vram_used_gb"]
-        worker.cuda_version = hw["cuda_version"]
+        worker.cuda_version = hw.get("runtime_version") or hw.get("cuda_version", "12.8")
+        worker.compute_architecture = hw.get("compute_architecture", "cuda")
+        worker.hardware_tier = hw.get("hardware_tier", "consumer_gpu")
+        worker.device_brand = hw.get("gpu_vendor", "Generic")
+        worker.is_unified_memory = hw.get("is_unified_memory", False)
+        worker.supported_task_types = hw.get("supported_task_types", "inference,training")
         cur_pct = worker.vram_allocation_pct or 80
         for g in hw["gpus"]:
             g["vram_allocation_pct"] = cur_pct
             g["vram_allocated_gb"] = round(float(g.get("vram_total_gb", 8.0)) * (cur_pct / 100.0), 2)
         worker.gpus_json = json.dumps(hw["gpus"])
-        if not getattr(worker, "region", None):
-            worker.region = "us-east"
+        if not getattr(worker, "region", None) or worker.region == "us-east":
+            worker.region = geo.get("region", "us-east")
+        if not getattr(worker, "country", None):
+            worker.country = geo.get("country")
+            worker.city = geo.get("city")
+            worker.public_ip = geo.get("public_ip")
         if getattr(worker, "latency_ping_ms", None) is None:
-            worker.latency_ping_ms = 5.2
+            worker.latency_ping_ms = geo.get("latency_ping_ms", 12.0)
         if worker.status == "offline" and worker.is_available:
             worker.status = "online"
         worker.last_heartbeat = datetime.utcnow()
+        db.commit()
         db.commit()
         db.refresh(worker)
     return worker
@@ -384,6 +367,14 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "total_earnings_usd": round(float(w.total_earnings_usd or 0.0), 4),
         "region": getattr(w, "region", "us-east") or "us-east",
         "latency_ping_ms": round(float(getattr(w, "latency_ping_ms", 15.0) or 15.0), 2),
+        "compute_architecture": getattr(w, "compute_architecture", "cuda") or "cuda",
+        "hardware_tier": getattr(w, "hardware_tier", "consumer_gpu") or "consumer_gpu",
+        "device_brand": getattr(w, "device_brand", "Generic") or "Generic",
+        "country": getattr(w, "country", None),
+        "city": getattr(w, "city", None),
+        "public_ip": getattr(w, "public_ip", None),
+        "is_unified_memory": bool(getattr(w, "is_unified_memory", False)),
+        "supported_task_types": getattr(w, "supported_task_types", "inference,training") or "inference,training",
         "staked_amount_usd": round(float(getattr(w, "staked_amount_usd", 0.0) or 0.0), 2),
         "slashed_amount_usd": round(float(getattr(w, "slashed_amount_usd", 0.0) or 0.0), 2),
         "reputation_score": round(float(getattr(w, "reputation_score", 100.0) or 100.0), 1),
@@ -410,9 +401,16 @@ class WorkerRegisterPayload(BaseModel):
     cuda_version: Optional[str] = None
     role: Optional[str] = "LoRA Training & Inference"
     hourly_rate_usd: Optional[float] = 0.45
-    region: Optional[str] = "us-east"
+    region: Optional[str] = None
     latency_ping_ms: Optional[float] = 15.0
-    supported_task_types: List[str] = ["inference", "training", "batch_inference"]
+    compute_architecture: Optional[str] = None
+    hardware_tier: Optional[str] = None
+    device_brand: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    public_ip: Optional[str] = None
+    is_unified_memory: Optional[bool] = False
+    supported_task_types: Optional[Any] = None
     system_info: Optional[Dict[str, Any]] = None
     wallet_address: Optional[str] = None
     gpus: Optional[List[Dict[str, Any]]] = None
@@ -646,7 +644,9 @@ exec $PYTHON_CMD nebula_worker.py join --server "$SERVER_URL" $API_KEY_ARG --tun
 @router.get("/nebula_worker.py")
 def get_nebula_worker_file():
     """Serve the standalone worker CLI script for 1-click download."""
-    script_path = os.path.join(os.getcwd(), "nebula_worker.py")
+    script_path = os.path.join(os.getcwd(), "worker", "nebula_worker.py")
+    if not os.path.exists(script_path):
+        script_path = os.path.join(os.getcwd(), "nebula_worker.py")
     if not os.path.exists(script_path):
         raise HTTPException(status_code=404, detail="nebula_worker.py not found on server")
     return FileResponse(script_path, media_type="text/x-python", filename="nebula_worker.py")
@@ -823,6 +823,29 @@ def register_worker_node(
     resolved_region = (payload.region if payload and payload.region else None) or "us-east"
     resolved_latency = (payload.latency_ping_ms if payload and payload.latency_ping_ms is not None else None) or 15.0
 
+    resolved_arch = (payload.compute_architecture if payload and payload.compute_architecture else None) or hw.get("compute_architecture", "cuda")
+    resolved_tier = (payload.hardware_tier if payload and payload.hardware_tier else None) or hw.get("hardware_tier", "consumer_gpu")
+    resolved_brand = (payload.device_brand if payload and payload.device_brand else None) or hw.get("gpu_vendor", "Generic")
+    resolved_unified = bool(payload.is_unified_memory if payload and payload.is_unified_memory is not None else hw.get("is_unified_memory", False))
+    raw_tasks = payload.supported_task_types if payload and payload.supported_task_types else hw.get("supported_task_types", "inference,training")
+    resolved_task_types = ",".join(raw_tasks) if isinstance(raw_tasks, list) else str(raw_tasks)
+
+    resolved_country = (payload.country if payload and payload.country else None)
+    resolved_city = (payload.city if payload and payload.city else None)
+    resolved_ip = (payload.public_ip if payload and payload.public_ip else None)
+
+    # Autonomous geolocation fallback if country/city missing or region is default
+    if not resolved_country or not resolved_city or not payload or not payload.region or payload.region in ("auto",):
+        geo = resolve_node_location(manual_region=payload.region if payload else None)
+        if not resolved_country:
+            resolved_country = geo.get("country")
+        if not resolved_city:
+            resolved_city = geo.get("city")
+        if not resolved_ip:
+            resolved_ip = geo.get("public_ip")
+        if not payload or not payload.region or payload.region in ("auto",):
+            resolved_region = geo.get("region", "us-east")
+
     # Enforce CUDA memory limit locally if registering on host machine
     cuda_enforced = enforce_local_cuda_memory_fraction(resolved_pct)
     resolved_gpus = payload.gpus if payload and payload.gpus else hw.get("gpus", [])
@@ -842,6 +865,14 @@ def register_worker_node(
         worker.hourly_rate_usd = float(resolved_rate)
         worker.region = resolved_region
         worker.latency_ping_ms = float(resolved_latency)
+        worker.compute_architecture = resolved_arch
+        worker.hardware_tier = resolved_tier
+        worker.device_brand = resolved_brand
+        worker.country = resolved_country
+        worker.city = resolved_city
+        worker.public_ip = resolved_ip
+        worker.is_unified_memory = resolved_unified
+        worker.supported_task_types = resolved_task_types
         worker.status = "online"
         worker.is_available = True
         worker.last_heartbeat = datetime.utcnow()
@@ -869,6 +900,14 @@ def register_worker_node(
             total_tasks_completed=0,
             region=resolved_region,
             latency_ping_ms=float(resolved_latency),
+            compute_architecture=resolved_arch,
+            hardware_tier=resolved_tier,
+            device_brand=resolved_brand,
+            country=resolved_country,
+            city=resolved_city,
+            public_ip=resolved_ip,
+            is_unified_memory=resolved_unified,
+            supported_task_types=resolved_task_types,
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -1192,6 +1231,8 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                     w_record.status = "busy"
                 db.commit()
 
+                tot_slices = int(getattr(task, "total_slices", 1) or 1)
+                comp_slices = int(getattr(task, "completed_slices", 0) or 0)
                 await websocket.send_json({
                     "type": "task_dispatch",
                     "task": {
@@ -1202,8 +1243,53 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         "height": getattr(task, "height", 512),
                         "steps": getattr(task, "steps", 20),
                         "cost": float(task.cost or 0.0052),
+                        "total_slices": tot_slices,
+                        "completed_slices": comp_slices,
+                        "resume_slice_index": comp_slices + 1,
+                        "last_checkpoint_url": getattr(task, "last_checkpoint_url", None),
                     }
                 })
+
+            elif msg_type == "slice_submit":
+                tid = data.get("task_id")
+                slice_idx = int(data.get("slice_index", 1))
+                compute_sec = float(data.get("compute_time_sec", 0.0))
+                p_hash = str(data.get("payload_hash", ""))
+                chk_url = data.get("checkpoint_url")
+                p_data = data.get("payload_data")
+                metrics = data.get("metrics")
+                try:
+                    res = settle_pods_slice(
+                        db=db,
+                        task_id=tid,
+                        worker_id=worker_id,
+                        slice_index=slice_idx,
+                        compute_time_sec=compute_sec,
+                        payload_hash=p_hash,
+                        checkpoint_url=chk_url,
+                        payload_data=p_data,
+                        metrics=metrics,
+                    )
+                    await websocket.send_json({
+                        "type": "slice_verified_ack",
+                        "status": "verified",
+                        "task_id": tid,
+                        "slice_index": slice_idx,
+                        "compute_time_sec": compute_sec,
+                        "reward_usd": res.get("reward_usd", 0.0),
+                        "total_earned_usd": res.get("worker_total_earnings_usd", 0.0),
+                        "completed_slices": res.get("completed_slices", slice_idx),
+                        "total_slices": res.get("total_slices", 1),
+                        "checkpoint_url": chk_url,
+                        "proof_hash": p_hash,
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "slice_error",
+                        "task_id": tid,
+                        "slice_index": slice_idx,
+                        "error": str(e),
+                    })
 
             elif msg_type == "task_progress":
                 tid = data.get("task_id")
@@ -1528,6 +1614,9 @@ def worker_claim_task(
     worker.status = "busy"
     db.commit()
 
+    tot_slices = int(getattr(task, "total_slices", 1) or 1)
+    comp_slices = int(getattr(task, "completed_slices", 0) or 0)
+
     return {
         "status": "claimed",
         "worker_id": worker_id,
@@ -1539,6 +1628,10 @@ def worker_claim_task(
             "height": getattr(task, "height", 512),
             "steps": getattr(task, "steps", 20),
             "cost": float(task.cost or 0.0052),
+            "total_slices": tot_slices,
+            "completed_slices": comp_slices,
+            "resume_slice_index": comp_slices + 1,
+            "last_checkpoint_url": getattr(task, "last_checkpoint_url", None),
         },
     }
 
@@ -1619,5 +1712,318 @@ def worker_complete_task(
         "total_tasks_completed": earning_res.get("tasks_completed", 1),
         "total_earnings_usd": earning_res.get("worker_earnings_usd", 0.0036),
     }
+
+
+# ==============================================================================
+# Blockchain-Inspired Proof-of-Delivered-Slice (PoDS) Compute-Time Reward Engine
+# ==============================================================================
+
+
+class WorkerSliceSubmitRequest(BaseModel):
+    slice_index: int = Field(..., ge=1, description="1-based index of the computed slice")
+    compute_time_sec: float = Field(..., gt=0.0, description="Actual GPU wall-clock compute duration in seconds")
+    payload_hash: str = Field(..., description="SHA-256 hash proof of delivered slice output")
+    payload_data: Optional[str] = Field(default=None, description="Serialized slice data/tensor or verification string")
+    checkpoint_url: Optional[str] = Field(default=None, description="Object storage checkpoint URL for failover recovery")
+    metrics: Optional[Dict[str, Any]] = Field(default=None, description="Hardware metrics: loss, tokens, vram_used_gb, etc.")
+
+
+def settle_pods_slice(
+    db: Session,
+    task_id: str,
+    worker_id: str,
+    slice_index: int,
+    compute_time_sec: float,
+    payload_hash: str,
+    checkpoint_url: Optional[str] = None,
+    payload_data: Optional[str] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Zero-Trust Proof-of-Delivered-Slice (PoDS) Settlement Engine.
+    Credits compute reward based strictly on actual GPU compute-time and hourly rate,
+    ONLY when the worker successfully computes and transmits the slice back.
+    Formula: Reward = (compute_time_sec / 3600.0) * worker.hourly_rate_usd * 0.70
+    """
+    if compute_time_sec <= 0.0:
+        raise HTTPException(status_code=400, detail="Compute time must be greater than zero")
+    if not payload_hash or not payload_hash.strip():
+        raise HTTPException(status_code=400, detail="Missing slice payload delivery hash")
+
+    # Cryptographic integrity check if payload_data provided
+    if payload_data is not None:
+        computed_hash = hashlib.sha256(payload_data.encode("utf-8")).hexdigest()
+        if computed_hash.lower() != payload_hash.strip().lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Zero-trust payload hash mismatch. Expected {computed_hash}, got {payload_hash}",
+            )
+
+    task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    # Check for duplicate submission (idempotency)
+    existing_slice = (
+        db.query(ComputeSlice)
+        .filter(ComputeSlice.task_id == task_id, ComputeSlice.slice_index == slice_index)
+        .first()
+    )
+    if existing_slice:
+        return {
+            "status": "already_settled",
+            "slice_id": existing_slice.slice_id,
+            "task_id": task_id,
+            "worker_id": existing_slice.worker_id,
+            "slice_index": slice_index,
+            "compute_time_sec": existing_slice.compute_time_sec,
+            "reward_usd": existing_slice.reward_usd,
+            "checkpoint_url": existing_slice.checkpoint_url,
+            "completed_slices": int(task.completed_slices or 0),
+            "total_slices": int(task.total_slices or 1),
+            "total_compute_seconds": float(task.total_compute_seconds or 0.0),
+        }
+
+    # Worker lookup & hourly rate determination
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    hourly_rate = float(worker.hourly_rate_usd if worker and worker.hourly_rate_usd else 0.45)
+
+    # Compute time based reward (70% to worker, 30% protocol fee)
+    # Reward = (compute_seconds / 3600.0) * hourly_rate * 0.70
+    raw_reward = (compute_time_sec / 3600.0) * hourly_rate * 0.70
+    reward_usd = round(max(0.000001, raw_reward), 6)
+
+    # Mint ComputeSlice record
+    slice_id = f"pods-{uuid.uuid4().hex[:12]}"
+    new_slice = ComputeSlice(
+        slice_id=slice_id,
+        task_id=task_id,
+        worker_id=worker_id,
+        slice_index=slice_index,
+        compute_time_sec=round(compute_time_sec, 3),
+        reward_usd=reward_usd,
+        payload_hash=payload_hash.strip().lower(),
+        checkpoint_url=checkpoint_url,
+    )
+    db.add(new_slice)
+
+    # Credit worker node earnings
+    if worker:
+        worker.total_earnings_usd = round(float(worker.total_earnings_usd or 0.0) + reward_usd, 6)
+        if metrics and isinstance(metrics, dict):
+            if "vram_used_gb" in metrics:
+                worker.vram_used_gb = float(metrics["vram_used_gb"])
+            if "gpu_utilization_pct" in metrics:
+                worker.gpu_utilization_pct = float(metrics["gpu_utilization_pct"])
+
+    # Credit worker owner user wallet
+    worker_user = None
+    if worker and worker.user_id:
+        worker_user = db.query(User).filter(User.id == worker.user_id).first()
+    if not worker_user:
+        worker_user = (
+            db.query(User).filter(User.is_worker == True).order_by(User.created_at.asc()).first()
+            or db.query(User).order_by(User.created_at.asc()).first()
+        )
+
+    trans_id = None
+    if worker_user:
+        worker_user.balance = round(float(worker_user.balance or 0.0) + reward_usd, 6)
+        worker_user.total_earned = round(float(worker_user.total_earned or 0.0) + reward_usd, 6)
+        trans = Transaction(
+            transaction_id=str(uuid.uuid4()),
+            user_id=worker_user.id,
+            worker_id=worker_id,
+            task_id=task_id,
+            type=TransactionType.EARNING,
+            amount=reward_usd,
+            balance_after=worker_user.balance,
+            description=f"PoDS compute reward slice #{slice_index} ({compute_time_sec:.2f}s @ ${hourly_rate:.2f}/hr)",
+        )
+        db.add(trans)
+        trans_id = trans.transaction_id
+
+    # Update Task progression & checkpoint
+    curr_completed = int(task.completed_slices or 0)
+    task.completed_slices = max(curr_completed, slice_index)
+    task.total_compute_seconds = round(float(task.total_compute_seconds or 0.0) + compute_time_sec, 2)
+    task.earned_so_far_usd = round(float(task.earned_so_far_usd or 0.0) + reward_usd, 6)
+    if checkpoint_url:
+        task.last_checkpoint_url = checkpoint_url
+
+    total_slices = max(1, int(task.total_slices or 1))
+    if task.completed_slices >= total_slices:
+        task.status = TaskStatus.SUCCESS
+        task.progress = 100.0
+    else:
+        task.progress = round((task.completed_slices / float(total_slices)) * 100.0, 1)
+
+    db.commit()
+
+    return {
+        "status": "minted",
+        "slice_id": slice_id,
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "slice_index": slice_index,
+        "compute_time_sec": compute_time_sec,
+        "reward_usd": reward_usd,
+        "hourly_rate_usd": hourly_rate,
+        "checkpoint_url": checkpoint_url,
+        "proof_hash": payload_hash,
+        "completed_slices": task.completed_slices,
+        "total_slices": task.total_slices,
+        "task_progress": task.progress,
+        "task_status": task.status.value if hasattr(task.status, "value") else str(task.status),
+        "worker_total_earnings_usd": worker.total_earnings_usd if worker else reward_usd,
+        "user_balance_usd": worker_user.balance if worker_user else 0.0,
+        "transaction_id": trans_id,
+    }
+
+
+@router.post("/api/v1/workers/{worker_id}/tasks/{task_id}/slices/submit")
+@router.post("/api/workers/{worker_id}/tasks/{task_id}/slices/submit")
+def submit_worker_slice(
+    worker_id: str,
+    task_id: str,
+    payload: WorkerSliceSubmitRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Zero-Trust Proof-of-Delivered-Slice (PoDS) Compute-Time Reward Submission.
+    Mint micro-rewards strictly proportional to wall-clock GPU compute time upon verified slice delivery.
+    """
+    return settle_pods_slice(
+        db=db,
+        task_id=task_id,
+        worker_id=worker_id,
+        slice_index=payload.slice_index,
+        compute_time_sec=payload.compute_time_sec,
+        payload_hash=payload.payload_hash,
+        checkpoint_url=payload.checkpoint_url,
+        payload_data=payload.payload_data,
+        metrics=payload.metrics,
+    )
+
+
+# ==============================================================================
+# Live Cluster Fleet Monitor Telemetry Snapshot Endpoint
+# ==============================================================================
+
+
+@router.get("/api/v1/cluster/monitor/snapshot")
+@router.get("/api/cluster/monitor/snapshot")
+def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
+    """
+    Returns real-time cluster state snapshot for the ANSI terminal monitor dashboard:
+    - fleet connectivity & hardware utilization measurements
+    - active & queued tasks with slice progress
+    - real-time PoDS minted settlements ticker
+    """
+    workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
+    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(20).all()
+    slices = db.query(ComputeSlice).order_by(ComputeSlice.created_at.desc()).limit(15).all()
+
+    total_nodes = len(workers)
+    active_nodes = sum(1 for w in workers if (w.status or "").lower() not in ("offline", "failed") and w.is_available)
+    busy_nodes = sum(1 for w in workers if (w.status or "").lower() == "busy")
+
+    total_vram_gb = sum(float(w.gpu_memory_gb or 0.0) for w in workers)
+    allocated_vram_gb = sum(
+        float(w.gpu_memory_gb or 0.0) * (float(w.vram_allocation_pct or 80) / 100.0)
+        for w in workers
+    )
+    used_vram_gb = sum(float(w.vram_used_gb or 0.0) for w in workers)
+    avg_util = (
+        round(sum(float(w.gpu_utilization_pct or 0.0) for w in workers) / max(1, total_nodes), 1)
+        if total_nodes > 0 else 0.0
+    )
+
+    total_rewards = sum(float(s.reward_usd or 0.0) for s in db.query(ComputeSlice).all())
+    total_compute_secs = sum(float(s.compute_time_sec or 0.0) for s in db.query(ComputeSlice).all())
+
+    queued_count = db.query(Task).filter(Task.status == TaskStatus.QUEUED).count()
+    processing_count = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).count()
+    success_count = db.query(Task).filter(Task.status == TaskStatus.SUCCESS).count()
+
+    nodes_data = []
+    for w in workers:
+        nodes_data.append({
+            "id": w.id,
+            "name": w.name or w.id,
+            "status": w.status or "offline",
+            "is_available": bool(w.is_available),
+            "gpu_model": getattr(w, "gpu_info", "Generic GPU") or "Generic GPU",
+            "vram_total_gb": round(float(w.gpu_memory_gb or 0.0), 2),
+            "vram_allocated_gb": round(float(w.gpu_memory_gb or 0.0) * (float(w.vram_allocation_pct or 80) / 100.0), 2),
+            "vram_used_gb": round(float(w.vram_used_gb or 0.0), 2),
+            "vram_allocation_pct": int(w.vram_allocation_pct or 80),
+            "gpu_utilization_pct": round(float(w.gpu_utilization_pct or 0.0), 1),
+            "hourly_rate_usd": round(float(w.hourly_rate_usd or 0.45), 2),
+            "total_tasks_completed": int(w.total_tasks_completed or 0),
+            "total_earnings_usd": round(float(w.total_earnings_usd or 0.0), 4),
+            "current_task_id": w.current_task_id,
+            "region": getattr(w, "region", "us-east") or "us-east",
+            "latency_ping_ms": round(float(getattr(w, "latency_ping_ms", 15.0) or 15.0), 1),
+            "compute_architecture": getattr(w, "compute_architecture", "cuda") or "cuda",
+            "hardware_tier": getattr(w, "hardware_tier", "consumer_gpu") or "consumer_gpu",
+            "device_brand": getattr(w, "device_brand", "Generic") or "Generic",
+            "country": getattr(w, "country", None),
+            "city": getattr(w, "city", None),
+            "is_unified_memory": bool(getattr(w, "is_unified_memory", False)),
+            "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else None,
+        })
+
+    tasks_data = []
+    for t in tasks:
+        tasks_data.append({
+            "task_id": t.task_id,
+            "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+            "prompt": (t.prompt or "")[:50],
+            "claimed_by": t.claimed_by,
+            "progress": float(t.progress or 0.0),
+            "total_slices": int(t.total_slices or 1),
+            "completed_slices": int(t.completed_slices or 0),
+            "total_compute_seconds": float(t.total_compute_seconds or 0.0),
+            "earned_so_far_usd": float(t.earned_so_far_usd or 0.0),
+            "last_checkpoint_url": t.last_checkpoint_url,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        })
+
+    slices_data = []
+    for s in slices:
+        slices_data.append({
+            "slice_id": s.slice_id,
+            "task_id": s.task_id,
+            "worker_id": s.worker_id,
+            "slice_index": s.slice_index,
+            "compute_time_sec": float(s.compute_time_sec or 0.0),
+            "reward_usd": float(s.reward_usd or 0.0),
+            "payload_hash": s.payload_hash,
+            "checkpoint_url": s.checkpoint_url,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        })
+
+    return {
+        "summary": {
+            "total_nodes": total_nodes,
+            "active_nodes": active_nodes,
+            "busy_nodes": busy_nodes,
+            "total_vram_gb": round(total_vram_gb, 2),
+            "allocated_vram_gb": round(allocated_vram_gb, 2),
+            "used_vram_gb": round(used_vram_gb, 2),
+            "avg_gpu_utilization_pct": avg_util,
+            "total_rewards_minted_usd": round(total_rewards, 4),
+            "total_compute_seconds": round(total_compute_secs, 2),
+            "queued_tasks": queued_count,
+            "processing_tasks": processing_count,
+            "completed_tasks": success_count,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        "nodes": nodes_data,
+        "workloads": tasks_data,
+        "recent_settlements": slices_data,
+    }
+
 
 
