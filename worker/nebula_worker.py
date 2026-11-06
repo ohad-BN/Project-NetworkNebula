@@ -28,6 +28,17 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
+# Ensure project root and worker directories are in sys.path
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+_parent_dir = os.path.dirname(_current_dir)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+_worker_sub = os.path.join(_parent_dir, "worker")
+if os.path.isdir(_worker_sub) and _worker_sub not in sys.path:
+    sys.path.insert(0, _worker_sub)
+
 # Suppress Windows modal error dialog popups for broken third-party DLLs (e.g. xformers mismatch)
 if sys.platform == "win32":
     try:
@@ -51,6 +62,20 @@ except ImportError:
         except ImportError:
             inspect_universal_hardware = None
             resolve_node_location = None
+
+# Always Silent Stealth Presence & Thermal Governor
+try:
+    from worker.stealth_sensor import StealthPresenceSensor, get_stealth_sensor
+    from worker.silent_governor import SilentThermalGovernor, get_silent_governor
+except ImportError:
+    try:
+        from stealth_sensor import StealthPresenceSensor, get_stealth_sensor
+        from silent_governor import SilentThermalGovernor, get_silent_governor
+    except ImportError:
+        StealthPresenceSensor = None
+        get_stealth_sensor = None
+        SilentThermalGovernor = None
+        get_silent_governor = None
 
 try:
     import requests
@@ -334,6 +359,19 @@ def cmd_join(args: argparse.Namespace) -> int:
     server_url = args.server.rstrip("/")
     vram_pct = max(10, min(100, int(args.vram_pct)))
 
+    always_silent = bool(getattr(args, "always_silent", False))
+    sensor = None
+    governor = None
+    if always_silent and StealthPresenceSensor is not None:
+        sensor = StealthPresenceSensor(
+            cooldown_seconds=float(getattr(args, "cooldown_sec", 60.0))
+        )
+        if SilentThermalGovernor is not None:
+            governor = SilentThermalGovernor(
+                sensor=sensor,
+                target_temp_c=float(getattr(args, "target_temp", 62.0))
+            )
+
     hw = discover_hardware()
     limit_info = apply_vram_limit(vram_pct)
 
@@ -396,6 +434,12 @@ def cmd_join(args: argparse.Namespace) -> int:
         "gpus": hw.get("gpus", []),
         "api_key": api_key,
     }
+    if always_silent and sensor:
+        tel = sensor.get_telemetry()
+        reg_payload["is_always_silent"] = True
+        reg_payload["work_capacity_state"] = tel["state"]
+        reg_payload["input_idle_sec"] = tel["idle_sec"]
+        reg_payload["gpu_temp_c"] = tel["gpu_temp_c"]
 
     try:
         res = requests.post(
@@ -427,6 +471,13 @@ def cmd_join(args: argparse.Namespace) -> int:
         "city": geo.get("city"),
         "gpus": hw.get("gpus", []),
     }
+    if always_silent and sensor:
+        tel = sensor.get_telemetry()
+        hb_payload["is_always_silent"] = True
+        hb_payload["work_capacity_state"] = tel["state"]
+        hb_payload["input_idle_sec"] = tel["idle_sec"]
+        hb_payload["gpu_temp_c"] = tel["gpu_temp_c"]
+        hb_payload["duty_cycle_pct"] = 100 if tel["state"] == "unleashed" else (0 if tel["state"] == "restricted_pause" else 33)
     try:
         hb_res = requests.post(
             f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
@@ -457,6 +508,12 @@ def cmd_join(args: argparse.Namespace) -> int:
         "cuda_version": hw["cuda_version"],
         "server": server_url,
     }
+    if always_silent and sensor:
+        tel = sensor.get_telemetry()
+        result_summary["always_silent"] = True
+        result_summary["work_capacity_state"] = tel["state"]
+        result_summary["input_idle_sec"] = tel["idle_sec"]
+        result_summary["gpu_temp_c"] = tel["gpu_temp_c"]
 
     if getattr(args, "tunnel", False):
         try:
@@ -482,6 +539,10 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(f"  Geographic Region  : {result_summary['region']}")
         print(f"  RTT Ping Latency   : {result_summary['latency_ping_ms']} ms")
         print(f"  CUDA Cap Enforced  : {result_summary['cuda_fraction_enforced']}")
+        if always_silent:
+            print(f"  Always Silent Mode : ACTIVE (Ceiling: {getattr(args, 'target_temp', 62.0)}°C, Cooldown: {getattr(args, 'cooldown_sec', 60.0)}s)")
+            print(f"  Presence State     : {result_summary.get('work_capacity_state')}")
+            print(f"  OS Input Idle      : {result_summary.get('input_idle_sec')} s")
         print(f"  Orchestrator URL   : {server_url}")
         print("=" * 68 + "\n")
 
@@ -494,15 +555,24 @@ def cmd_join(args: argparse.Namespace) -> int:
             time.sleep(args.interval)
             live_hw = discover_hardware()
             live_lat = measure_server_latency(server_url)
+            hb_data_loop = {
+                "vram_used_gb": live_hw["vram_used_gb"],
+                "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
+                "latency_ping_ms": live_lat,
+                "region": region,
+                "status": "online",
+            }
+            if always_silent and sensor:
+                tel = sensor.get_telemetry()
+                hb_data_loop["is_always_silent"] = True
+                hb_data_loop["work_capacity_state"] = tel["state"]
+                hb_data_loop["input_idle_sec"] = tel["idle_sec"]
+                hb_data_loop["gpu_temp_c"] = tel["gpu_temp_c"]
+                hb_data_loop["duty_cycle_pct"] = 100 if tel["state"] == "unleashed" else (0 if tel["state"] == "restricted_pause" else 33)
             r_hb = requests.post(
                 f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
                 headers=headers,
-                json={
-                    "vram_used_gb": live_hw["vram_used_gb"],
-                    "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
-                    "latency_ping_ms": live_lat,
-                    "region": region,
-                },
+                json=hb_data_loop,
                 timeout=10,
             )
             if r_hb.status_code == 200:
@@ -622,20 +692,26 @@ def resolve_tensor_device():
     return None, "cpu"
 
 
-def execute_tensor_compute_slice(device, dev_type: str):
+def execute_tensor_compute_slice(device, dev_type: str, stream: Optional[Any] = None):
     """Execute hardware-accelerated matrix multiplication on CUDA, Apple Silicon MPS, Intel Arc XPU, or CPU."""
     try:
         import torch
         if device is not None:
             size = 1024 if dev_type in ("cuda", "apple_mps", "intel_xpu") else 256
-            x = torch.randn(size, size, device=device)
-            _ = torch.matmul(x, x).sum()
-            if dev_type == "cuda":
-                torch.cuda.synchronize()
-            elif dev_type == "apple_mps" and hasattr(torch, "mps"):
-                torch.mps.synchronize()
-            elif dev_type == "intel_xpu" and hasattr(torch, "xpu"):
-                torch.xpu.synchronize()
+            if stream is not None and dev_type == "cuda":
+                with torch.cuda.stream(stream):
+                    x = torch.randn(size, size, device=device)
+                    _ = torch.matmul(x, x).sum()
+                stream.synchronize()
+            else:
+                x = torch.randn(size, size, device=device)
+                _ = torch.matmul(x, x).sum()
+                if dev_type == "cuda":
+                    torch.cuda.synchronize()
+                elif dev_type == "apple_mps" and hasattr(torch, "mps"):
+                    torch.mps.synchronize()
+                elif dev_type == "intel_xpu" and hasattr(torch, "xpu"):
+                    torch.xpu.synchronize()
         else:
             time.sleep(0.04)
     except Exception:
@@ -659,6 +735,19 @@ def cmd_work(args: argparse.Namespace) -> int:
     vram_pct = max(10, min(100, int(args.vram_pct)))
     limit_info = apply_vram_limit(vram_pct)
 
+    always_silent = bool(getattr(args, "always_silent", False))
+    sensor = None
+    governor = None
+    if always_silent and StealthPresenceSensor is not None:
+        sensor = StealthPresenceSensor(
+            cooldown_seconds=float(getattr(args, "cooldown_sec", 60.0))
+        )
+        if SilentThermalGovernor is not None:
+            governor = SilentThermalGovernor(
+                sensor=sensor,
+                target_temp_c=float(getattr(args, "target_temp", 62.0))
+            )
+
     headers: Dict[str, str] = {"Content-Type": "application/json"}
     api_key = getattr(args, "api_key", None) or os.environ.get("NEBULA_API_KEY")
     if api_key:
@@ -680,6 +769,12 @@ def cmd_work(args: argparse.Namespace) -> int:
         "role": "Autonomous CLI Worker",
         "api_key": api_key,
     }
+    if always_silent and sensor:
+        tel = sensor.get_telemetry()
+        reg_payload["is_always_silent"] = True
+        reg_payload["work_capacity_state"] = tel["state"]
+        reg_payload["input_idle_sec"] = tel["idle_sec"]
+        reg_payload["gpu_temp_c"] = tel["gpu_temp_c"]
     try:
         requests.post(f"{server_url}/api/v1/workers/register", headers=headers, json=reg_payload, timeout=10)
     except Exception as e:
@@ -729,6 +824,19 @@ def cmd_work(args: argparse.Namespace) -> int:
                     print(f"[*] Connected over WebSocket tunnel as {auth_state} | Node ID: {worker_id}")
 
                 while max_tasks <= 0 or tasks_completed < max_tasks:
+                    # Restricted gaming pause check
+                    if always_silent and sensor:
+                        p_state = sensor.evaluate_presence_state()
+                        if p_state == "restricted_pause":
+                            if not args.json:
+                                print(f"[STEALTH] Restricted pause active (exclusive 3D application running). Yielding 100% compute.")
+                            if governor:
+                                governor.reclaim_vram_headroom()
+                            await asyncio.sleep(2.0)
+                            if max_tasks > 0 and getattr(args, "once", False):
+                                break
+                            continue
+
                     # Request / claim task
                     auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
                     await ws.send(json.dumps({"type": "claim_task", "auto_create": auto_claim_flag}))
@@ -769,15 +877,22 @@ def cmd_work(args: argparse.Namespace) -> int:
                     for s_idx in range(start_slice, tot_slices + 1):
                         slice_t0 = time.time()
                         dev_obj, dev_type = resolve_tensor_device()
-                        execute_tensor_compute_slice(dev_obj, dev_type)
+                        stream = governor.get_compute_stream(dev_obj) if governor else None
+                        execute_tensor_compute_slice(dev_obj, dev_type, stream=stream)
                         compute_sec = round(max(0.02, time.time() - slice_t0), 3)
                         last_compute_sec = compute_sec
+
+                        pacing_res = None
+                        if always_silent and governor:
+                            pacing_res = governor.yield_gpu_queue(compute_sec)
+                            if not args.json and pacing_res.get("yield_duration_s", 0) > 0:
+                                print(f"[STEALTH PACER] Slice #{s_idx} compute: {compute_sec:.3f}s | Yield: {pacing_res['yield_duration_s']:.3f}s | State: {pacing_res['state']} | Duty: {pacing_res['effective_duty_cycle_pct']}% | Temp: {pacing_res['gpu_temp_c']}°C")
 
                         payload_str = f"pods_slice_{task_id}_{s_idx}_{worker_id}"
                         payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
                         chk_url = f"http://localhost:9000/nebula-renders/checkpoints/{task_id}_s{s_idx}.pt"
 
-                        await ws.send(json.dumps({
+                        slice_msg = {
                             "type": "slice_submit",
                             "task_id": task_id,
                             "slice_index": s_idx,
@@ -785,7 +900,11 @@ def cmd_work(args: argparse.Namespace) -> int:
                             "payload_hash": payload_hash,
                             "payload_data": payload_str,
                             "checkpoint_url": chk_url,
-                        }))
+                        }
+                        if always_silent and sensor:
+                            slice_msg["work_capacity_state"] = sensor.evaluate_presence_state()
+
+                        await ws.send(json.dumps(slice_msg))
                         slice_ack = json.loads(await ws.recv())
                         s_earned = float(slice_ack.get("reward_usd", 0.0))
                         task_slice_earned += s_earned
@@ -815,7 +934,7 @@ def cmd_work(args: argparse.Namespace) -> int:
                     if not args.json:
                         print(f"[WORKER] Task {task_id[:12]} completed via tunnel | +${earned:.4f} | Total: ${total_earnings:.4f}")
 
-            return {
+            res_tunnel_dict = {
                 "status": "completed",
                 "worker_id": worker_id,
                 "mode": "websocket_tunnel",
@@ -825,6 +944,10 @@ def cmd_work(args: argparse.Namespace) -> int:
                 "cuda_fraction_enforced": limit_info["cuda_enforced"],
                 "shard_layers": shard_layers,
             }
+            if always_silent and sensor:
+                res_tunnel_dict["always_silent"] = True
+                res_tunnel_dict["work_capacity_state"] = sensor.evaluate_presence_state()
+            return res_tunnel_dict
 
         try:
             summary = asyncio.run(_work_over_tunnel())
@@ -844,6 +967,19 @@ def cmd_work(args: argparse.Namespace) -> int:
         # REST Polling Execution Mode
         while max_tasks <= 0 or tasks_completed < max_tasks:
             try:
+                # Restricted gaming pause check
+                if always_silent and sensor:
+                    p_state = sensor.evaluate_presence_state()
+                    if p_state == "restricted_pause":
+                        if not args.json:
+                            print(f"[STEALTH] Restricted pause active (exclusive 3D application running). Yielding 100% compute.")
+                        if governor:
+                            governor.reclaim_vram_headroom()
+                        time.sleep(2.0)
+                        if max_tasks > 0 and getattr(args, "once", False):
+                            break
+                        continue
+
                 auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
                 claim_res = requests.post(
                     f"{server_url}/api/v1/workers/{worker_id}/claim-task",
@@ -886,24 +1022,35 @@ def cmd_work(args: argparse.Namespace) -> int:
                 for s_idx in range(start_slice, tot_slices + 1):
                     slice_t0 = time.time()
                     dev_obj, dev_type = resolve_tensor_device()
-                    execute_tensor_compute_slice(dev_obj, dev_type)
+                    stream = governor.get_compute_stream(dev_obj) if governor else None
+                    execute_tensor_compute_slice(dev_obj, dev_type, stream=stream)
                     compute_sec = round(max(0.02, time.time() - slice_t0), 3)
                     last_compute_sec = compute_sec
+
+                    pacing_res = None
+                    if always_silent and governor:
+                        pacing_res = governor.yield_gpu_queue(compute_sec)
+                        if not args.json and pacing_res.get("yield_duration_s", 0) > 0:
+                            print(f"[STEALTH PACER] Slice #{s_idx} compute: {compute_sec:.3f}s | Yield: {pacing_res['yield_duration_s']:.3f}s | State: {pacing_res['state']} | Duty: {pacing_res['effective_duty_cycle_pct']}% | Temp: {pacing_res['gpu_temp_c']}°C")
 
                     payload_str = f"pods_slice_{task_id}_{s_idx}_{worker_id}"
                     payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
                     chk_url = f"http://localhost:9000/nebula-renders/checkpoints/{task_id}_s{s_idx}.pt"
 
+                    slice_body = {
+                        "slice_index": s_idx,
+                        "compute_time_sec": compute_sec,
+                        "payload_hash": payload_hash,
+                        "payload_data": payload_str,
+                        "checkpoint_url": chk_url,
+                    }
+                    if always_silent and sensor:
+                        slice_body["work_capacity_state"] = sensor.evaluate_presence_state()
+
                     s_res = requests.post(
                         f"{server_url}/api/v1/workers/{worker_id}/tasks/{task_id}/slices/submit",
                         headers=headers,
-                        json={
-                            "slice_index": s_idx,
-                            "compute_time_sec": compute_sec,
-                            "payload_hash": payload_hash,
-                            "payload_data": payload_str,
-                            "checkpoint_url": chk_url,
-                        },
+                        json=slice_body,
                         timeout=5,
                     )
                     if s_res.status_code == 200:
@@ -955,6 +1102,9 @@ def cmd_work(args: argparse.Namespace) -> int:
             "cuda_fraction_enforced": limit_info["cuda_enforced"],
             "shard_layers": shard_layers,
         }
+        if always_silent and sensor:
+            summary["always_silent"] = True
+            summary["work_capacity_state"] = sensor.evaluate_presence_state()
         if args.json:
             print(json.dumps(summary))
         else:
@@ -1056,6 +1206,9 @@ def build_parser() -> argparse.ArgumentParser:
     join_p.add_argument("--interval", type=int, default=15, help="Heartbeat interval in seconds")
     join_p.add_argument("--tunnel", action="store_true", help="Maintain persistent WebSocket tunnel instead of HTTP polling")
     join_p.add_argument("--once", action="store_true", help="Register, send one heartbeat, and exit")
+    join_p.add_argument("--always-silent", "-S", action="store_true", default=False, help="Enable autonomous presence sensing and silent thermal compute regulation")
+    join_p.add_argument("--target-temp", type=float, default=62.0, help="Target acoustic GPU junction ceiling in °C (default: 62.0)")
+    join_p.add_argument("--cooldown-sec", type=float, default=60.0, help="Inactivity duration required before ramping back to unleashed (default: 60.0)")
     join_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # status command
@@ -1084,6 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
     work_p.add_argument("--tunnel", action="store_true", help="Execute tasks over persistent WebSocket tunnel")
     work_p.add_argument("--shard-layers", default=None, help="Layer slice range to host for swarm sharding, e.g. 0:19")
     work_p.add_argument("--pipeline-id", default=None, help="Active swarm pipeline ID to bind to")
+    work_p.add_argument("--always-silent", "-S", action="store_true", default=False, help="Enable autonomous presence sensing and silent thermal compute regulation")
+    work_p.add_argument("--target-temp", type=float, default=62.0, help="Target acoustic GPU junction ceiling in °C (default: 62.0)")
+    work_p.add_argument("--cooldown-sec", type=float, default=60.0, help="Inactivity duration required before ramping back to unleashed (default: 60.0)")
     work_p.add_argument("--json", action="store_true", help="Output result as machine-readable JSON")
 
     # ping command (Phase 4.3)

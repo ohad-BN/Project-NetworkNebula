@@ -11,7 +11,7 @@ import os
 import socket
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -31,7 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import engine, get_db
-from app.models import ComputeSlice, Task, TaskStatus, Transaction, TransactionType, User, Worker
+from app.models import ComputeSlice, Task, TaskStatus, TrainingJob, Transaction, TransactionType, User, Worker
 from app.hardware_detector import inspect_universal_hardware
 from app.geo_locator import resolve_node_location
 
@@ -134,6 +134,11 @@ def ensure_worker_schema_columns() -> None:
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS slash_history TEXT DEFAULT '[]'",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS region VARCHAR(64) DEFAULT 'us-east'",
         "ALTER TABLE workers ADD COLUMN IF NOT EXISTS latency_ping_ms FLOAT DEFAULT 15.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_always_silent BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS work_capacity_state VARCHAR(32) DEFAULT 'unleashed'",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS input_idle_sec FLOAT DEFAULT 300.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS gpu_temp_c FLOAT DEFAULT 50.0",
+        "ALTER TABLE workers ADD COLUMN IF NOT EXISTS duty_cycle_pct INTEGER DEFAULT 100",
         "ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS region VARCHAR(64)",
         "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'STAKE'",
         "ALTER TYPE transactiontype ADD VALUE IF NOT EXISTS 'UNSTAKE'",
@@ -222,15 +227,16 @@ def resolve_optional_user(
     authorization: Optional[str] = None,
 ) -> Optional[User]:
     """Resolve user from X-API-Key or Bearer token if provided."""
-    if x_api_key:
-        user = db.query(User).filter(User.api_key == x_api_key).first()
+    if isinstance(x_api_key, str) and x_api_key.strip():
+        user = db.query(User).filter(User.api_key == x_api_key.strip()).first()
         if user:
             return user
-    if authorization and authorization.startswith("Bearer "):
+    if isinstance(authorization, str) and authorization.startswith("Bearer "):
         raw_token = authorization.replace("Bearer ", "").strip()
-        user = db.query(User).filter(User.api_key == raw_token).first()
-        if user:
-            return user
+        if raw_token:
+            user = db.query(User).filter(User.api_key == raw_token).first()
+            if user:
+                return user
     return None
 
 
@@ -378,6 +384,11 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "staked_amount_usd": round(float(getattr(w, "staked_amount_usd", 0.0) or 0.0), 2),
         "slashed_amount_usd": round(float(getattr(w, "slashed_amount_usd", 0.0) or 0.0), 2),
         "reputation_score": round(float(getattr(w, "reputation_score", 100.0) or 100.0), 1),
+        "is_always_silent": bool(getattr(w, "is_always_silent", False)),
+        "work_capacity_state": getattr(w, "work_capacity_state", "unleashed") or "unleashed",
+        "input_idle_sec": round(float(getattr(w, "input_idle_sec", 300.0) or 300.0), 1),
+        "gpu_temp_c": round(float(getattr(w, "gpu_temp_c", 50.0) or 50.0), 1),
+        "duty_cycle_pct": int(getattr(w, "duty_cycle_pct", 100) or 100),
         "tunnel_active": worker_tunnel_manager.is_connected(w.id),
         "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else datetime.utcnow().isoformat(),
     }
@@ -411,6 +422,11 @@ class WorkerRegisterPayload(BaseModel):
     public_ip: Optional[str] = None
     is_unified_memory: Optional[bool] = False
     supported_task_types: Optional[Any] = None
+    is_always_silent: Optional[bool] = False
+    work_capacity_state: Optional[str] = "unleashed"
+    input_idle_sec: Optional[float] = 300.0
+    gpu_temp_c: Optional[float] = 50.0
+    duty_cycle_pct: Optional[int] = 100
     system_info: Optional[Dict[str, Any]] = None
     wallet_address: Optional[str] = None
     gpus: Optional[List[Dict[str, Any]]] = None
@@ -424,6 +440,8 @@ class WorkerConfigUpdatePayload(BaseModel):
     role: Optional[str] = None
     region: Optional[str] = None
     is_available: Optional[bool] = None
+    is_always_silent: Optional[bool] = None
+    always_silent: Optional[bool] = None
     hourly_rate_usd: Optional[float] = None
     gpus: Optional[List[Dict[str, Any]]] = None
 
@@ -435,6 +453,11 @@ class WorkerHeartbeatPayload(BaseModel):
     status: Optional[str] = None
     latency_ping_ms: Optional[float] = None
     region: Optional[str] = None
+    is_always_silent: Optional[bool] = None
+    work_capacity_state: Optional[str] = None
+    input_idle_sec: Optional[float] = None
+    gpu_temp_c: Optional[float] = None
+    duty_cycle_pct: Optional[int] = None
 
 
 def is_real_hardware_node(w: Worker) -> bool:
@@ -523,7 +546,7 @@ def get_user_workers(
     allocated_vram = round(sum(n["vram_allocated_gb"] for n in node_list), 2)
     used_vram = round(sum(n["vram_used_gb"] for n in node_list), 2)
     total_earnings = round(sum(n["total_earnings_usd"] for n in node_list), 4)
-    active_count = sum(1 for n in node_list if n["status"] == "online")
+    active_count = sum(1 for n in node_list if n.get("status") in ("online", "busy") and n.get("is_available"))
 
     return {
         "status": "success",
@@ -787,29 +810,31 @@ def register_worker_node(
         (payload.gpu_info if payload and payload.gpu_info else None)
         or gpu_info
         or sys_info.get("gpu_model")
-        or hw["gpu_model"]
+        or hw.get("gpu_model", "Universal Compute Node")
     )
     resolved_cores = (
         (payload.cpu_cores if payload and payload.cpu_cores is not None else None)
         or cpu_cores
         or sys_info.get("cpu_cores")
-        or hw["cpu_cores"]
+        or hw.get("cpu_cores")
+        or hw.get("cpu_logical_cores")
+        or 8
     )
     resolved_ram = (
         (payload.memory_gb if payload and payload.memory_gb is not None else None)
         or memory_gb
         or sys_info.get("ram_gb")
-        or hw["memory_gb"]
+        or hw.get("memory_gb", 16.0)
     )
     resolved_vram = (
         (payload.gpu_memory_gb if payload and payload.gpu_memory_gb is not None else None)
         or gpu_memory_gb
-        or hw["vram_total_gb"]
+        or hw.get("vram_total_gb", 8.0)
     )
     resolved_used_vram = (
         payload.vram_used_gb
         if payload and payload.vram_used_gb is not None
-        else hw["vram_used_gb"]
+        else hw.get("vram_used_gb", 0.0)
     )
     resolved_pct = (
         payload.vram_allocation_pct
@@ -817,7 +842,7 @@ def register_worker_node(
         else vram_allocation_pct
     )
     resolved_pct = max(10, min(100, int(resolved_pct)))
-    resolved_cuda = (payload.cuda_version if payload and payload.cuda_version else None) or hw["cuda_version"]
+    resolved_cuda = (payload.cuda_version if payload and payload.cuda_version else None) or hw.get("cuda_version", "Universal")
     resolved_role = (payload.role if payload and payload.role else None) or "LoRA Training & Inference"
     resolved_rate = (payload.hourly_rate_usd if payload and payload.hourly_rate_usd is not None else None) or 0.45
     resolved_region = (payload.region if payload and payload.region else None) or "us-east"
@@ -829,6 +854,11 @@ def register_worker_node(
     resolved_unified = bool(payload.is_unified_memory if payload and payload.is_unified_memory is not None else hw.get("is_unified_memory", False))
     raw_tasks = payload.supported_task_types if payload and payload.supported_task_types else hw.get("supported_task_types", "inference,training")
     resolved_task_types = ",".join(raw_tasks) if isinstance(raw_tasks, list) else str(raw_tasks)
+    resolved_always_silent = bool(payload.is_always_silent) if payload and payload.is_always_silent is not None else False
+    resolved_capacity_state = (payload.work_capacity_state if payload and payload.work_capacity_state else "unleashed")
+    resolved_input_idle = float(payload.input_idle_sec if payload and payload.input_idle_sec is not None else 300.0)
+    resolved_gpu_temp = float(payload.gpu_temp_c if payload and payload.gpu_temp_c is not None else 50.0)
+    resolved_duty_cycle = int(payload.duty_cycle_pct if payload and payload.duty_cycle_pct is not None else 100)
 
     resolved_country = (payload.country if payload and payload.country else None)
     resolved_city = (payload.city if payload and payload.city else None)
@@ -873,6 +903,11 @@ def register_worker_node(
         worker.public_ip = resolved_ip
         worker.is_unified_memory = resolved_unified
         worker.supported_task_types = resolved_task_types
+        worker.is_always_silent = resolved_always_silent
+        worker.work_capacity_state = resolved_capacity_state
+        worker.input_idle_sec = resolved_input_idle
+        worker.gpu_temp_c = resolved_gpu_temp
+        worker.duty_cycle_pct = resolved_duty_cycle
         worker.status = "online"
         worker.is_available = True
         worker.last_heartbeat = datetime.utcnow()
@@ -908,6 +943,11 @@ def register_worker_node(
             public_ip=resolved_ip,
             is_unified_memory=resolved_unified,
             supported_task_types=resolved_task_types,
+            is_always_silent=resolved_always_silent,
+            work_capacity_state=resolved_capacity_state,
+            input_idle_sec=resolved_input_idle,
+            gpu_temp_c=resolved_gpu_temp,
+            duty_cycle_pct=resolved_duty_cycle,
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -972,9 +1012,17 @@ async def update_worker_config(
         worker.region = payload.region
     if payload.is_available is not None:
         worker.is_available = payload.is_available
-        worker.status = "online" if payload.is_available else "offline"
+        if payload.is_available:
+            worker.status = "busy" if worker.current_task_id else "online"
+        else:
+            worker.status = "offline"
     if payload.hourly_rate_usd is not None:
         worker.hourly_rate_usd = payload.hourly_rate_usd
+    if payload.is_always_silent is not None or payload.always_silent is not None:
+        val = payload.is_always_silent if payload.is_always_silent is not None else payload.always_silent
+        worker.is_always_silent = bool(val)
+        if not worker.is_always_silent and worker.work_capacity_state == "stealth_regulated":
+            worker.work_capacity_state = "unleashed"
 
     worker.last_heartbeat = datetime.utcnow()
     db.commit()
@@ -992,6 +1040,7 @@ async def update_worker_config(
             "role": worker.role,
             "name": worker.name,
             "is_available": worker.is_available,
+            "is_always_silent": worker.is_always_silent,
         },
     )
 
@@ -1020,7 +1069,9 @@ def worker_node_heartbeat(
         raise HTTPException(status_code=404, detail="Worker not found")
 
     worker.last_heartbeat = datetime.utcnow()
-    task_id = (payload.current_task_id if payload and payload.current_task_id is not None else None) or current_task_id
+    task_id = payload.current_task_id if payload and payload.current_task_id is not None else None
+    if task_id is None and isinstance(current_task_id, str):
+        task_id = current_task_id.strip() or None
     worker.current_task_id = task_id
 
     if payload:
@@ -1032,12 +1083,27 @@ def worker_node_heartbeat(
             worker.latency_ping_ms = float(payload.latency_ping_ms)
         if payload.region:
             worker.region = payload.region
-        if payload.status:
+        if payload.is_always_silent is not None:
+            worker.is_always_silent = bool(payload.is_always_silent)
+        if payload.work_capacity_state is not None:
+            worker.work_capacity_state = str(payload.work_capacity_state)
+        if payload.input_idle_sec is not None:
+            worker.input_idle_sec = float(payload.input_idle_sec)
+        if payload.gpu_temp_c is not None:
+            worker.gpu_temp_c = float(payload.gpu_temp_c)
+        if payload.duty_cycle_pct is not None:
+            worker.duty_cycle_pct = int(payload.duty_cycle_pct)
+        if not worker.is_available:
+            worker.status = "offline"
+        elif payload.status:
             worker.status = payload.status
         else:
             worker.status = "busy" if task_id else "online"
     else:
-        worker.status = "busy" if task_id else "online"
+        if not worker.is_available:
+            worker.status = "offline"
+        else:
+            worker.status = "busy" if task_id else "online"
 
     db.commit()
     db.refresh(worker)
@@ -1050,6 +1116,11 @@ def worker_node_heartbeat(
         "vram_allocated_gb": round(float(worker.gpu_memory_gb or 8.0) * (int(worker.vram_allocation_pct or 80) / 100.0), 2),
         "region": getattr(worker, "region", "us-east") or "us-east",
         "latency_ping_ms": round(float(getattr(worker, "latency_ping_ms", 15.0) or 15.0), 2),
+        "is_always_silent": bool(getattr(worker, "is_always_silent", False)),
+        "work_capacity_state": getattr(worker, "work_capacity_state", "unleashed") or "unleashed",
+        "input_idle_sec": round(float(getattr(worker, "input_idle_sec", 300.0) or 300.0), 1),
+        "gpu_temp_c": round(float(getattr(worker, "gpu_temp_c", 50.0) or 50.0), 1),
+        "duty_cycle_pct": int(getattr(worker, "duty_cycle_pct", 100) or 100),
         "timestamp": worker.last_heartbeat.isoformat(),
     }
 
@@ -1910,44 +1981,122 @@ def submit_worker_slice(
 # Live Cluster Fleet Monitor Telemetry Snapshot Endpoint
 # ==============================================================================
 
+HEARTBEAT_TIMEOUT_SECONDS = 45.0  # 3 missed heartbeats (15s * 3) = offline node
+TASK_STALE_TIMEOUT_SECONDS = 180.0  # 3 minutes without heartbeat = failed task
+
 
 @router.get("/api/v1/cluster/monitor/snapshot")
 @router.get("/api/cluster/monitor/snapshot")
 def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
     """
     Returns real-time cluster state snapshot for the ANSI terminal monitor dashboard:
-    - fleet connectivity & hardware utilization measurements
-    - active & queued tasks with slice progress
+    - fleet connectivity & hardware utilization measurements with heartbeat staleness reaper
+    - active & queued tasks with slice progress + enterprise LoRA/QLoRA training jobs
     - real-time PoDS minted settlements ticker
     """
+    now = datetime.now(timezone.utc)
+    dirty = False
+
+    # 1. Autonomous Heartbeat Staleness Reaper
+    all_workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
+    for w in all_workers:
+        if (w.status or "").lower() not in ("offline", "failed") and w.last_heartbeat:
+            hb = w.last_heartbeat
+            if hb.tzinfo is None:
+                hb = hb.replace(tzinfo=timezone.utc)
+            age_sec = (now - hb).total_seconds()
+            if age_sec > HEARTBEAT_TIMEOUT_SECONDS:
+                w.status = "offline"
+                # Preserve user's administrative availability (do NOT set w.is_available = False)
+                if w.current_task_id:
+                    w.current_task_id = None
+                dirty = True
+
+        # Orphan task watchdog: release workers bound to finished/cancelled jobs
+        if w.current_task_id:
+            tid = str(w.current_task_id)
+            if tid.startswith("train-"):
+                job_uuid_prefix = tid.replace("train-", "")
+                j_rec = db.query(TrainingJob).filter(TrainingJob.id.like(f"{job_uuid_prefix}%")).first()
+                if not j_rec or j_rec.status in ("completed", "failed", "cancelled"):
+                    w.current_task_id = None
+                    if w.is_available and (w.status or "").lower() == "busy":
+                        w.status = "online"
+                    dirty = True
+            else:
+                t_rec = db.query(Task).filter(Task.task_id == tid).first()
+                if not t_rec or t_rec.status in (TaskStatus.SUCCESS, TaskStatus.FAILURE):
+                    w.current_task_id = None
+                    if w.is_available and (w.status or "").lower() == "busy":
+                        w.status = "online"
+                    dirty = True
+
+    # 2. Stale Processing Task Watchdog
+    processing_tasks_db = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).all()
+    for t in processing_tasks_db:
+        t_ref = t.updated_at or t.created_at
+        if t_ref:
+            if t_ref.tzinfo is None:
+                t_ref = t_ref.replace(tzinfo=timezone.utc)
+            if (now - t_ref).total_seconds() > TASK_STALE_TIMEOUT_SECONDS:
+                t.status = TaskStatus.FAILURE
+                dirty = True
+
+    if dirty:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    # Re-query workers, tasks, training jobs, and compute slices
     workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
-    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(20).all()
+    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(15).all()
+    training_jobs = db.query(TrainingJob).order_by(TrainingJob.created_at.desc()).limit(10).all()
     slices = db.query(ComputeSlice).order_by(ComputeSlice.created_at.desc()).limit(15).all()
 
-    total_nodes = len(workers)
-    active_nodes = sum(1 for w in workers if (w.status or "").lower() not in ("offline", "failed") and w.is_available)
+    active_nodes = sum(1 for w in workers if (w.status or "").lower() in ("online", "busy") and w.is_available)
     busy_nodes = sum(1 for w in workers if (w.status or "").lower() == "busy")
+    total_nodes = len(workers)
+    unleashed_nodes = sum(1 for w in workers if (getattr(w, "work_capacity_state", None) or "unleashed") == "unleashed" and (w.status or "").lower() in ("online", "busy"))
+    stealth_nodes = sum(1 for w in workers if (getattr(w, "work_capacity_state", None) or "unleashed") == "stealth_regulated" and (w.status or "").lower() in ("online", "busy"))
+    paused_nodes = sum(1 for w in workers if (getattr(w, "work_capacity_state", None) or "unleashed") == "restricted_pause" or (w.status or "").lower() == "offline")
 
-    total_vram_gb = sum(float(w.gpu_memory_gb or 0.0) for w in workers)
+    live_workers = [w for w in workers if (w.status or "").lower() != "offline"]
+    total_vram_gb = sum(float(w.gpu_memory_gb or 0.0) for w in live_workers)
     allocated_vram_gb = sum(
         float(w.gpu_memory_gb or 0.0) * (float(w.vram_allocation_pct or 80) / 100.0)
-        for w in workers
+        for w in live_workers
     )
-    used_vram_gb = sum(float(w.vram_used_gb or 0.0) for w in workers)
+    used_vram_gb = sum(float(w.vram_used_gb or 0.0) for w in live_workers)
     avg_util = (
-        round(sum(float(w.gpu_utilization_pct or 0.0) for w in workers) / max(1, total_nodes), 1)
-        if total_nodes > 0 else 0.0
+        round(sum(float(w.gpu_utilization_pct or 0.0) for w in live_workers) / max(1, len(live_workers)), 1)
+        if live_workers else 0.0
     )
 
     total_rewards = sum(float(s.reward_usd or 0.0) for s in db.query(ComputeSlice).all())
     total_compute_secs = sum(float(s.compute_time_sec or 0.0) for s in db.query(ComputeSlice).all())
 
-    queued_count = db.query(Task).filter(Task.status == TaskStatus.QUEUED).count()
-    processing_count = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).count()
-    success_count = db.query(Task).filter(Task.status == TaskStatus.SUCCESS).count()
+    # Unified queue counts (Tasks + Training Jobs)
+    t_queued = db.query(Task).filter(Task.status == TaskStatus.QUEUED).count()
+    t_proc = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).count()
+    t_done = db.query(Task).filter(Task.status == TaskStatus.SUCCESS).count()
+
+    j_queued = sum(1 for j in training_jobs if (j.status or "").lower() in ("queued", "pending"))
+    j_proc = sum(1 for j in training_jobs if (j.status or "").lower() in ("running", "processing"))
+    j_done = sum(1 for j in training_jobs if (j.status or "").lower() == "completed")
+
+    queued_count = t_queued + j_queued
+    processing_count = t_proc + j_proc
+    success_count = t_done + j_done
 
     nodes_data = []
     for w in workers:
+        hb = w.last_heartbeat
+        hb_age = 999999.0
+        if hb:
+            hb_utc = hb.replace(tzinfo=timezone.utc) if hb.tzinfo is None else hb
+            hb_age = round((now - hb_utc).total_seconds(), 0)
+
         nodes_data.append({
             "id": w.id,
             "name": w.name or w.id,
@@ -1971,16 +2120,62 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
             "country": getattr(w, "country", None),
             "city": getattr(w, "city", None),
             "is_unified_memory": bool(getattr(w, "is_unified_memory", False)),
+            "is_always_silent": bool(getattr(w, "is_always_silent", False)),
+            "work_capacity_state": getattr(w, "work_capacity_state", "unleashed") or "unleashed",
+            "input_idle_sec": round(float(getattr(w, "input_idle_sec", 300.0) or 300.0), 1),
+            "gpu_temp_c": round(float(getattr(w, "gpu_temp_c", 50.0) or 50.0), 1),
+            "duty_cycle_pct": int(getattr(w, "duty_cycle_pct", 100) or 100),
             "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else None,
+            "heartbeat_age_sec": hb_age,
         })
 
-    tasks_data = []
+    workloads_data = []
+    # 1. Enterprise LoRA/QLoRA Training Jobs
+    for j in training_jobs:
+        tot_ep = max(1, j.total_epochs or 1)
+        cur_ep = min(tot_ep, j.current_epoch or 0)
+        pct = round((cur_ep / tot_ep) * 100.0, 1) if tot_ep > 0 else 0.0
+        st = (j.status or "queued").upper()
+        if st in ("RUNNING", "PROCESSING"):
+            status_label = "TRAINING"
+        elif st == "COMPLETED":
+            status_label = "SUCCESS"
+        else:
+            status_label = st
+
+        assigned_worker = "cluster-mesh"
+        try:
+            h_params = json.loads(j.hyperparameters) if j.hyperparameters else {}
+            w_list = h_params.get("worker_ids", [])
+            if w_list:
+                assigned_worker = ", ".join(w_list[:2])
+        except Exception:
+            pass
+
+        workloads_data.append({
+            "task_id": f"train-{j.id[:8]}",
+            "task_type": "training",
+            "status": status_label,
+            "prompt": f"LoRA: {j.name} ({j.base_model.split('/')[-1]})",
+            "claimed_by": assigned_worker,
+            "progress": pct,
+            "total_slices": tot_ep,
+            "completed_slices": cur_ep,
+            "total_compute_seconds": round(float(j.cost or 0.0) * 120.0, 1),
+            "earned_so_far_usd": round(float(j.cost or 0.0) * 0.70, 4),
+            "last_checkpoint_url": j.final_adapter_url,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        })
+
+    # 2. PoDS Sliced Inference Tasks
     for t in tasks:
-        tasks_data.append({
+        st_val = t.status.value if hasattr(t.status, "value") else str(t.status)
+        workloads_data.append({
             "task_id": t.task_id,
-            "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+            "task_type": "inference",
+            "status": st_val,
             "prompt": (t.prompt or "")[:50],
-            "claimed_by": t.claimed_by,
+            "claimed_by": t.claimed_by or "unassigned",
             "progress": float(t.progress or 0.0),
             "total_slices": int(t.total_slices or 1),
             "completed_slices": int(t.completed_slices or 0),
@@ -1989,6 +2184,9 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
             "last_checkpoint_url": t.last_checkpoint_url,
             "created_at": t.created_at.isoformat() if t.created_at else None,
         })
+
+    # Sort workloads by created_at descending
+    workloads_data.sort(key=lambda x: x.get("created_at") or "", reverse=True)
 
     slices_data = []
     for s in slices:
@@ -2009,6 +2207,9 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
             "total_nodes": total_nodes,
             "active_nodes": active_nodes,
             "busy_nodes": busy_nodes,
+            "unleashed_nodes": unleashed_nodes,
+            "stealth_nodes": stealth_nodes,
+            "paused_nodes": paused_nodes,
             "total_vram_gb": round(total_vram_gb, 2),
             "allocated_vram_gb": round(allocated_vram_gb, 2),
             "used_vram_gb": round(used_vram_gb, 2),
@@ -2018,10 +2219,10 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
             "queued_tasks": queued_count,
             "processing_tasks": processing_count,
             "completed_tasks": success_count,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": now.isoformat(),
         },
         "nodes": nodes_data,
-        "workloads": tasks_data,
+        "workloads": workloads_data,
         "recent_settlements": slices_data,
     }
 

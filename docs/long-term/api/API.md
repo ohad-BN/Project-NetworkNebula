@@ -292,7 +292,63 @@ Invoked by `nebula_worker.py` daemon to register hardware specs into the active 
   "status": "ready",
   "heartbeat_interval_sec": 30,
   "allocated_vram_gb": 9.6,
-  "reputation_score": 100.0
+  "reputation_score": 100.0,
+  "always_silent_supported": true
+}
+```
+
+### 5.2 Worker Telemetry & Adaptive Regulation Heartbeat
+`POST /api/v1/workers/{worker_id}/heartbeat`
+
+Periodic ping transmitted every 10–30s reporting live utilization, input idle timestamps, and "Always Silent" regulation state.
+
+#### Request Body
+```json
+{
+  "status": "online",
+  "work_capacity_state": "stealth",
+  "input_idle_sec": 1.4,
+  "vram_used_gb": 3.2,
+  "gpu_utilization_pct": 28.5,
+  "gpu_temp_c": 59.0,
+  "duty_cycle_pct": 30,
+  "latency_ping_ms": 14.2
+}
+```
+
+#### Response (200 OK)
+```json
+{
+  "status": "ok",
+  "vram_allocation_pct": 80,
+  "assigned_work_mode": "async_inference",
+  "slice_timeout_sec": 60,
+  "always_silent_active": true
+}
+```
+
+### 5.3 Worker Configuration & Silent Mode Toggle
+`PATCH /api/v1/workers/{worker_id}/config`
+
+Enables users to dynamically toggle "Always Silent" regulation and adjust VRAM ceilings without restarting the worker daemon.
+
+#### Request Body
+```json
+{
+  "always_silent": true,
+  "vram_allocation_pct": 80,
+  "target_temp_c": 62.0
+}
+```
+
+#### Response (200 OK)
+```json
+{
+  "worker_id": "wrk-49102",
+  "always_silent": true,
+  "vram_allocation_pct": 80,
+  "target_temp_c": 62.0,
+  "effective_state": "stealth"
 }
 ```
 

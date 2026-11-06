@@ -52,6 +52,11 @@ export interface ClusterNodeTelemetry {
   min_stake_required?: number;
   region?: string;
   latency_ping_ms?: number;
+  is_always_silent?: boolean;
+  work_capacity_state?: "unleashed" | "stealth_regulated" | "restricted_pause" | string;
+  input_idle_sec?: number;
+  gpu_temp_c?: number;
+  duty_cycle_pct?: number;
 }
 
 export interface ClusterTelemetryResponse {
@@ -138,6 +143,8 @@ export const workersService = {
       gpu_index?: number;
       is_available?: boolean;
       hourly_rate_usd?: number;
+      is_always_silent?: boolean;
+      always_silent?: boolean;
     }
   ): Promise<WorkerConfigUpdateResponse> => {
     const response = await apiClient.patch(

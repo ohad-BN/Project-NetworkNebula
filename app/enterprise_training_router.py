@@ -61,6 +61,7 @@ class CreateTrainingJobRequest(BaseModel):
     train_type: str = Field(default="lora", description="Fine-tuning technique: lora, qlora, full")
     parallelism: str = Field(default="data_parallel", description="Parallelism strategy: data_parallel, fsdp, tensor_parallel")
     num_gpus: int = Field(default=1, ge=1, le=128, description="Target GPU count")
+    worker_ids: Optional[List[str]] = Field(default=None, description="Optional worker node IDs override (auto-routed if omitted)")
     dataset_s3_url: str = Field(..., description="MinIO/S3 URI to training dataset (jsonl)")
     hyperparameters: Optional[Dict[str, Any]] = Field(default=None, description="Custom hyperparameter overrides")
     total_epochs: Optional[int] = Field(default=3, ge=1, le=100, description="Total training epochs")
@@ -230,11 +231,25 @@ def submit_training_job(
     hyperparams = payload.hyperparameters or {}
     epochs = payload.total_epochs or hyperparams.get("epochs", 3)
 
-    if payload.num_gpus >= 2:
+    if payload.worker_ids:
+        hyperparams["worker_ids"] = payload.worker_ids
+    elif payload.num_gpus >= 2:
         from app.distributed_training_engine import distributed_training_engine
         worker_ids = distributed_training_engine.resolve_worker_fleet(db, num_gpus=payload.num_gpus)
         hyperparams["distributed_mode"] = True
         hyperparams["worker_ids"] = worker_ids
+    else:
+        from app.scheduler import cluster_scheduler
+        sched_res = cluster_scheduler.select_optimal_workers(
+            db=db,
+            required_vram_gb=2.0,
+            num_gpus=1,
+            task_type="training",
+            record_dispatch=True,
+        )
+        selected_ids = sched_res.get("selected_worker_ids", [])
+        if selected_ids:
+            hyperparams["worker_ids"] = [selected_ids[0]]
 
     new_job = TrainingJob(
         id=job_id,
@@ -478,6 +493,18 @@ def cancel_training_job(
 
     job.status = "cancelled"
     job.completed_at = datetime.now(timezone.utc)
+
+    # Release any worker nodes bound to this cancelled job
+    from app.models import Worker
+    bound_workers = db.query(Worker).filter(
+        (Worker.current_task_id == f"train-{job_id[:8]}") | (Worker.current_task_id == job_id)
+    ).all()
+    for w in bound_workers:
+        w.current_task_id = None
+        if w.is_available:
+            w.status = "online"
+            w.gpu_utilization_pct = 10.0
+
     db.commit()
     return {"status": "cancelled", "job_id": job_id}
 

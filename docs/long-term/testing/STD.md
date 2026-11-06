@@ -28,6 +28,10 @@
 | **TC-012** | Worker Staking & Malicious Slashing Penalty | REQ-19 | Unit / Integ | Phase 3 Infrastructure (Lines 261-290) | **PASS** |
 | **TC-013** | React 19 Frontend Web Console Build | INT-01 | Build / E2E | Phase 4 Enterprise (Lines 680-740) | **PASS** |
 | **TC-014** | Full End-to-End B2B Customer Journey Simulation | REQ-01..19, D-1..D-7 | System E2E | Phase 5 Enterprise (Lines 741-999) | **PASS** |
+| **TC-015** | Zero-Privilege OS Presence Sensing Latency | REQ-20, UC-08 | Unit / System | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **TC-016** | Micro-Duty GPU Yielding & 144Hz Frame Preservation | REQ-21, REQ-23, NFR-11 | System E2E | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **TC-017** | Software Acoustic-Thermal Governor (<62°C) | REQ-22, NFR-12 | Integration | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **TC-018** | PoDS Paced Micro-Slice Delivery & Extended Grace | REQ-24, UC-08 | System E2E | `tests/test_stealth_regulation.py` | **PLANNED** |
 
 ---
 
@@ -198,3 +202,63 @@
   9. Confirm response quality, latency headers, and ledger settlement.
 - **Expected Result:** Complete 9-step customer journey completes with 100% success without manual intervention.
 - **Result:** **PASS** (Automated in `test_suite.py` Phase 5)
+
+---
+
+### TC-015: Zero-Privilege OS Presence Sensing Latency & Debounce Hysteresis
+- **Test ID:** `TC-015`
+- **Title:** Verify sub-microsecond OS-level input idle detection across platforms without root privileges
+- **Verifies:** REQ-20, UC-08
+- **Preconditions:** Worker agent running on Windows, macOS, or Linux.
+- **Test Steps:**
+  1. Call `StealthPresenceSensor.get_os_idle_seconds()`.
+  2. Measure execution duration across 1,000 continuous samples.
+  3. Simulate user keyboard/mouse event and verify detected idle duration resets to $<0.05\text{s}$.
+  4. Verify debounce hysteresis: instant throttle to `stealth` upon input; requires 60s continuous idle before transitioning to `unleashed`.
+- **Expected Result:** Sensing execution duration $\le 200\mu\text{s}$; state transition triggers in $<200\text{ms}$; zero keylogging hooks installed.
+- **Result:** **PLANNED** (Target: `tests/test_stealth_regulation.py`)
+
+---
+
+### TC-016: Micro-Duty GPU Yielding & 144 Hz Frame Preservation
+- **Test ID:** `TC-016`
+- **Title:** Verify desktop window compositing maintains 60–144 Hz refresh deadlines during compute execution
+- **Verifies:** REQ-21, REQ-23, NFR-11
+- **Preconditions:** GPU compute workload executing tensor forward passes; monitor display active.
+- **Test Steps:**
+  1. Trigger human input event to place worker in `stealth_regulated` mode.
+  2. Measure time between consecutive GPU compute dispatches ($T_{\text{yield}} \ge 15\text{ms}$).
+  3. Verify Desktop Window Manager (`dwm.exe` / `WindowServer`) composition frame intervals.
+  4. Check physical unreserved VRAM: ensure $\ge 4.5\text{ GB}$ remains free for desktop applications.
+- **Expected Result:** DWM composition latency $\le 16.6\text{ms}$ (zero frame drops); desktop dragging and typing remain completely smooth.
+- **Result:** **PLANNED** (Target: `tests/test_stealth_regulation.py`)
+
+---
+
+### TC-017: Software Acoustic-Thermal Governor & Fan Curve Ceiling
+- **Test ID:** `TC-017`
+- **Title:** Verify closed-loop thermal duty-cycle governor keeps GPU core $<62^\circ\text{C}$ (<32 dBA noise)
+- **Verifies:** REQ-22, NFR-12
+- **Preconditions:** Continuous background compute loop running for 10+ minutes.
+- **Test Steps:**
+  1. Sample GPU junction temperature via NVML / Metal metrics.
+  2. Artificially simulate rising core temperature towards $65^\circ\text{C}$.
+  3. Verify `SilentThermalGovernor` automatically increases yield sleep ($+10\text{ms}/^\circ\text{C}$).
+  4. Monitor temperature equilibrium and physical fan acoustic levels.
+- **Expected Result:** GPU junction temperature stabilizes between $58^\circ\text{C}$ and $62^\circ\text{C}$; cooling fans do not exceed whisper zone (<32 dBA).
+- **Result:** **PLANNED** (Target: `tests/test_stealth_regulation.py`)
+
+---
+
+### TC-018: PoDS Paced Micro-Slice Delivery & Extended Grace Period
+- **Test ID:** `TC-018`
+- **Title:** Verify paced PoDS micro-slice submissions succeed with extended timeout window and zero slashing
+- **Verifies:** REQ-24, UC-08
+- **Preconditions:** Worker connected to orchestrator with `--always-silent` in `stealth_regulated` state.
+- **Test Steps:**
+  1. Orchestrator assigns a 10-slice task to the stealth worker.
+  2. Worker processes slices with interleaved yield sleeps ($T_{\text{slice}} \approx 2.5\text{s}$ vs $0.8\text{s}$ in unleashed).
+  3. Worker submits cryptographic SHA-256 slice proofs to `/tasks/{id}/slices/submit`.
+  4. Verify orchestrator accepts paced slices without triggering worker timeout or stake slashing.
+- **Expected Result:** All micro-slices cryptographically verified; pro-rata PoDS rewards minted successfully; zero reputation penalty.
+- **Result:** **PLANNED** (Target: `tests/test_stealth_regulation.py`)

@@ -1,12 +1,18 @@
-# Project NetworkNebula — Execution Plans
+# Project NetworkNebula Execution Plans
 
-## Multi-Worker Task Dispatch & Payout Hardening
-1. **User Authentication & Hardware Binding**:
-   - Every worker node connecting via CLI or WebSocket tunnel authenticates using an assigned API key.
-   - Payout transactions and earnings attribution are bound directly to the verified owner's account balance.
-2. **Elimination of Fake Payouts**:
-   - Idle worker nodes receive explicit idle status without synthetic tasks or phantom revenue credits.
-   - Payouts are exclusively generated from verified, completed client training and inference tasks.
-3. **Horsepower-Aware Batch Sharding**:
-   - High-throughput CUDA GPUs handle the majority share of training micro-batches (e.g. 80%+).
-   - CPU and consumer fallback nodes receive proportional sub-shards without bottlenecking the cluster.
+## Active & Milestone Execution Plans
+
+### 1. PoDS Micro-Reward Minting & Unified Slicing Execution Plan
+- Real-time tensor compute slice verification and delivery.
+- Proof-of-Delivered-Slice (PoDS) SHA-256 cryptographic proof generation.
+- Instant wallet micro-reward minting per delivered slice.
+
+### 2. Multi-Architecture Universal Hardware & Geolocation Engine
+- Deep CPU feature detection (AVX-512, AVX2, AMX, Neon).
+- Universal GPU recognition: NVIDIA CUDA, Apple Metal (MPS), Intel Arc (XPU), AMD ROCm.
+- Ultra-low latency round-trip time (RTT) ping measurement and sovereign regional binding.
+
+### 3. Multi-Node Concurrent Availability & Execution Architecture
+- Strict decoupling of transient operational lifecycle (`online`, `busy`, `offline`) from administrative intent (`is_available`).
+- Resilient heartbeat revival and orphan task clearing.
+- Bidirectional WebSocket telemetry tunnel integration.

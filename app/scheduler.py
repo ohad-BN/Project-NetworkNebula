@@ -83,6 +83,23 @@ class ClusterScheduler:
         arch = (getattr(worker, "compute_architecture", None) or "cuda").lower()
         supported_tasks = [t.strip().lower() for t in (getattr(worker, "supported_task_types", None) or "").split(",") if t.strip()]
 
+        is_always_silent = bool(getattr(worker, "is_always_silent", False))
+        work_capacity_state = (getattr(worker, "work_capacity_state", None) or "unleashed").lower()
+        duty_cycle_pct = int(getattr(worker, "duty_cycle_pct", 100) or 100)
+        gpu_temp_c = float(getattr(worker, "gpu_temp_c", 50.0) or 50.0)
+        input_idle_sec = float(getattr(worker, "input_idle_sec", 300.0) or 300.0)
+
+        # Task compatibility check
+        task_norm = (task_type or "").lower().strip()
+        task_supported = True
+        if supported_tasks and task_norm:
+            if task_norm in ("training", "distributed_training"):
+                task_supported = any(t in supported_tasks for t in ("training", "distributed_training"))
+            elif task_norm in ("inference", "batch_inference", "single_inference", "dataset_validation"):
+                task_supported = any(t in supported_tasks for t in ("inference", "batch_inference", "single_inference", "dataset_validation"))
+            else:
+                task_supported = task_norm in supported_tasks
+
         # Eligibility checks
         eligible = True
         disqualification_reason = None
@@ -93,7 +110,16 @@ class ClusterScheduler:
         elif not worker.is_available or (worker.status or "").lower() in ("offline", "failed", "maintenance"):
             eligible = False
             disqualification_reason = f"Node unavailable (status={worker.status}, is_available={worker.is_available})"
-        elif supported_tasks and task_type and task_type.lower() not in supported_tasks:
+        elif work_capacity_state == "restricted_pause":
+            eligible = False
+            disqualification_reason = "Worker is in restricted pause mode (gaming/fullscreen 3D activity active)"
+        elif task_type and task_type.lower() in ("training", "distributed_training") and work_capacity_state == "stealth_regulated":
+            eligible = False
+            disqualification_reason = (
+                "Stealth regulated worker excluded from synchronous distributed training "
+                "to prevent Ring All-Reduce straggler delays"
+            )
+        elif not task_supported:
             eligible = False
             disqualification_reason = f"Architecture '{arch}' does not support task type '{task_type}'"
         elif allocated_vram_gb < required_vram_gb:
@@ -121,7 +147,12 @@ class ClusterScheduler:
         vram_score = round(min(35.0, headroom_ratio * 14.0 + (alloc_pct / 100.0) * 10.0), 2)
 
         # 2. Load & Utilization Score (0 - 20 points)
-        load_score = round(20.0 * (1.0 - min(util_pct, 100.0) / 100.0), 2)
+        base_load_score = 20.0 * (1.0 - min(util_pct, 100.0) / 100.0)
+        if work_capacity_state == "stealth_regulated":
+            duty_factor = max(0.2, min(1.0, duty_cycle_pct / 100.0))
+            load_score = round(base_load_score * duty_factor, 2)
+        else:
+            load_score = round(base_load_score, 2)
 
         # 3. SLA Reputation & Reliability Score (0 - 15 points)
         rep_score = round(min(12.0, math.log1p(tasks_done) * 3.5), 2)
@@ -170,6 +201,12 @@ class ClusterScheduler:
             "country": getattr(worker, "country", None),
             "city": getattr(worker, "city", None),
             "is_unified_memory": bool(getattr(worker, "is_unified_memory", False)),
+            "is_always_silent": is_always_silent,
+            "work_capacity_state": work_capacity_state,
+            "duty_cycle_pct": duty_cycle_pct,
+            "gpu_temp_c": gpu_temp_c,
+            "input_idle_sec": input_idle_sec,
+            "slice_timeout_seconds": 60.0 if work_capacity_state == "stealth_regulated" else 15.0,
             "score": total_score,
             "score_breakdown": {
                 "vram_headroom_score": vram_score,
@@ -237,6 +274,12 @@ class ClusterScheduler:
             else 0.0
         )
 
+        slice_timeout_seconds = (
+            60.0
+            if any(c.get("work_capacity_state") == "stealth_regulated" for c in selected)
+            else 15.0
+        )
+
         dispatch_record = {
             "dispatch_id": f"dsp-{uuid.uuid4().hex[:8]}",
             "task_type": task_type,
@@ -250,6 +293,7 @@ class ClusterScheduler:
             "enforce_region": enforce_region,
             "max_latency_ms": effective_max_latency,
             "avg_cluster_latency_ms": avg_cluster_latency,
+            "slice_timeout_seconds": slice_timeout_seconds,
             "topology_aware": topology_aware or (effective_max_latency is not None),
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -275,28 +319,34 @@ class ClusterScheduler:
         required_vram_gb: float = 2.0,
         task_type: str = "training",
         reason: str = "worker_heartbeat_timeout",
+        exclude_worker_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Handle mid-task worker disconnection or heartbeat timeout by:
-        1. Marking `failed_worker_id` offline/unavailable
+        1. Marking `failed_worker_id` offline/unavailable (or clearing current task if stealth/gaming)
         2. Selecting the highest-scoring healthy standby worker node
         3. Re-binding the active Task or TrainingJob to the standby worker node
         """
         failed_worker = db.query(Worker).filter(Worker.id == failed_worker_id).first()
         if failed_worker:
-            failed_worker.status = "offline"
-            failed_worker.is_available = False
-            if failed_worker.current_task_id == task_id:
-                failed_worker.current_task_id = None
+            if "stealth" in reason.lower() or "gaming" in reason.lower() or "pause" in reason.lower():
+                # Worker is not dead, but disqualified from this synchronous job; keep online
+                if failed_worker.current_task_id == task_id:
+                    failed_worker.current_task_id = None
+            else:
+                failed_worker.status = "offline"
+                if failed_worker.current_task_id == task_id:
+                    failed_worker.current_task_id = None
             db.commit()
 
         # Select next best healthy candidate excluding the failed worker
+        effective_exclusions = list(set([failed_worker_id] + (exclude_worker_ids or [])))
         selection = self.select_optimal_workers(
             db=db,
             required_vram_gb=required_vram_gb,
             num_gpus=1,
             task_type=task_type,
-            exclude_worker_ids=[failed_worker_id],
+            exclude_worker_ids=effective_exclusions,
             record_dispatch=True,
         )
         standby_workers = selection.get("selected_workers", [])

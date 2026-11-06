@@ -127,18 +127,36 @@ class DistributedTrainingEngine:
                     weights[wid] = 1.0
                     continue
                 gpu_name = (w.gpu_info or "").lower()
+                arch = (getattr(w, "compute_architecture", None) or "").lower()
                 alloc_pct = float(w.vram_allocation_pct or 80) / 100.0
                 tot_vram = float(w.gpu_memory_gb or 8.0)
                 is_cuda = (
-                    "nvidia" in gpu_name
+                    arch == "cuda"
+                    or "nvidia" in gpu_name
                     or "geforce" in gpu_name
                     or "rtx" in gpu_name
                     or "a100" in gpu_name
                     or "h100" in gpu_name
                     or "cuda" in (w.cuda_version or "").lower()
                 )
+                is_mps = (
+                    arch == "mps"
+                    or "apple" in gpu_name
+                    or "metal" in gpu_name
+                    or any(m in gpu_name for m in ["m1", "m2", "m3", "m4"])
+                )
+                is_xpu = (
+                    arch == "xpu"
+                    or "intel" in gpu_name
+                    or "arc" in gpu_name
+                    or "xpu" in gpu_name
+                )
                 if is_cuda:
                     base_weight = max(3.0, tot_vram * alloc_pct)
+                elif is_mps:
+                    base_weight = max(2.5, tot_vram * alloc_pct * 0.85)
+                elif is_xpu:
+                    base_weight = max(2.0, tot_vram * alloc_pct * 0.70)
                 else:
                     base_weight = 1.0
                 weights[wid] = round(base_weight, 2)

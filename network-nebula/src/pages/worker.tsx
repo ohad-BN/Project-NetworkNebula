@@ -26,6 +26,12 @@ import {
   Trash2,
   Laptop,
   Monitor,
+  Moon,
+  Zap,
+  Gamepad2,
+  Thermometer,
+  VolumeX,
+  Clock,
 } from "lucide-react";
 import {
   workersService,
@@ -129,6 +135,43 @@ export function WorkerDashboardPage() {
     }
   };
 
+  // Handle remote Always Silent toggle
+  const handleToggleAlwaysSilent = async (targetWorkerId: string, currentSilent: boolean) => {
+    // Optimistic UI update
+    setMyNodes((prev) =>
+      prev.map((n) => {
+        if (n.node_id === targetWorkerId || n.id === targetWorkerId) {
+          return {
+            ...n,
+            is_always_silent: !currentSilent,
+            work_capacity_state: !currentSilent ? "stealth_regulated" : "unleashed",
+            duty_cycle_pct: !currentSilent ? 33 : 100,
+          };
+        }
+        return n;
+      })
+    );
+
+    try {
+      setIsUpdating(true);
+      await workersService.updateConfig(targetWorkerId, {
+        always_silent: !currentSilent,
+      });
+      toast.success(
+        !currentSilent
+          ? "Always Silent activated (Whisper acoustic governor & gaming auto-yield)"
+          : "Always Silent disabled (Unleashed burst performance)"
+      );
+      await loadWorkerData();
+    } catch (err) {
+      console.error("Failed to toggle Always Silent mode:", err);
+      toast.error("Failed to update Always Silent configuration");
+      loadWorkerData();
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
   // Handle Deregister
   const handleDeregister = async (targetWorkerId: string) => {
     if (!confirm(`Are you sure you want to remove machine '${targetWorkerId}' from your account?`)) return;
@@ -152,13 +195,13 @@ export function WorkerDashboardPage() {
   const totalUserVram = myNodes.reduce((acc, n) => acc + (n.vram_total_gb || n.gpu_memory_gb || 0), 0);
   const allocatedUserVram = myNodes.reduce((acc, n) => acc + (n.vram_allocated_gb || 0), 0);
   const totalUserEarnings = myNodes.reduce((acc, n) => acc + (n.total_earnings_usd || 0), 0);
-  const activeNodesCount = myNodes.filter((n) => n.status === "online" && n.is_available).length;
+  const activeNodesCount = myNodes.filter((n) => (n.status === "online" || n.status === "busy") && (n.is_available ?? true)).length;
   const combinedHourlyRate = myNodes.reduce((acc, n) => acc + (n.hourly_rate_usd || 0.45), 0);
   const totalGpusCount = myNodes.reduce((acc, n) => acc + (n.gpus?.length || 1), 0);
 
   // Connection commands
-  const originUrl = window.location.origin.includes("localhost:5173")
-    ? "http://localhost:8000"
+  const originUrl = window.location.port === "5173"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
     : window.location.origin;
 
   const powershellBootstrapper = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
@@ -467,7 +510,11 @@ export function WorkerDashboardPage() {
         {/* COMPACT CARD BLOCKS GRID (PREVIOUS BLOCK DESIGN) */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {myNodes.map((w) => {
-            const isOnline = w.status === "online" && w.is_available;
+            const isAvailable = w.is_available ?? true;
+            const isBusy = isAvailable && (w.status === "busy" || Boolean(w.current_task_id));
+            const isOnline = isAvailable && w.status === "online" && !isBusy;
+            const isPaused = !isAvailable;
+
             const systemGpus = w.gpus && w.gpus.length > 0
               ? w.gpus
               : [{
@@ -485,17 +532,33 @@ export function WorkerDashboardPage() {
             const vramAlloc = w.vram_allocated_gb || ((w.gpu_memory_gb || 8.0) * (w.vram_allocation_pct || 80)) / 100;
             const vramTotal = w.gpu_memory_gb || w.vram_total_gb || 8.0;
 
+            const highlightColor = isBusy
+              ? "bg-blue-500 animate-pulse"
+              : isOnline
+              ? "bg-emerald-500"
+              : isPaused
+              ? "bg-amber-500/70"
+              : "bg-zinc-600";
+
+            const dotColor = isBusy
+              ? "bg-blue-400 animate-ping"
+              : isOnline
+              ? "bg-emerald-400 animate-pulse"
+              : isPaused
+              ? "bg-amber-500"
+              : "bg-zinc-500";
+
             return (
               <Card key={w.node_id || w.id} className="border-border/80 bg-card/70 backdrop-blur-sm relative overflow-hidden shadow-sm flex flex-col justify-between">
                 <div>
                   {/* Top highlight bar based on status */}
-                  <div className={`h-1.5 w-full ${isOnline ? "bg-emerald-500" : "bg-amber-500/70"}`} />
+                  <div className={`h-1.5 w-full ${highlightColor}`} />
 
                   <CardHeader className="p-4 sm:p-5 pb-3">
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
+                          <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${dotColor}`} />
                           <CardTitle className="text-base font-bold text-foreground truncate">
                             {w.system_name || w.name || w.gpu_model}
                           </CardTitle>
@@ -505,21 +568,78 @@ export function WorkerDashboardPage() {
                         </p>
                       </div>
 
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <Badge variant={isOnline ? "default" : "secondary"} className={isOnline ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]" : "text-[10px]"}>
-                          {isOnline ? "Online • Active" : "Paused • Offline"}
-                        </Badge>
+                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                        {isBusy ? (
+                          <Badge variant="default" className="bg-blue-500/15 text-blue-400 border-blue-500/30 text-[10px] animate-pulse">
+                            Busy • Working
+                          </Badge>
+                        ) : isOnline ? (
+                          <Badge variant="default" className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]">
+                            Online • Ready
+                          </Badge>
+                        ) : isPaused ? (
+                          <Badge variant="secondary" className="bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">
+                            Paused
+                          </Badge>
+                        ) : (
+                          <Badge variant="secondary" className="text-muted-foreground text-[10px]">
+                            Offline
+                          </Badge>
+                        )}
+
+                        {/* Always Silent Mode & Capacity Badge */}
+                        {w.work_capacity_state === "restricted_pause" ? (
+                          <Badge variant="secondary" className="bg-amber-500/20 text-amber-300 border-amber-500/40 text-[10px] font-mono flex items-center gap-1">
+                            <Gamepad2 className="h-3 w-3 text-amber-400" />
+                            Gaming Yield (0%)
+                          </Badge>
+                        ) : w.work_capacity_state === "stealth_regulated" || Boolean(w.is_always_silent) ? (
+                          <Badge variant="secondary" className="bg-cyan-500/15 text-cyan-300 border-cyan-500/30 text-[10px] font-mono flex items-center gap-1">
+                            <Moon className="h-3 w-3 text-cyan-400" />
+                            Whisper Stealth ({w.duty_cycle_pct ?? 33}%)
+                          </Badge>
+                        ) : (
+                          <Badge variant="secondary" className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px] font-mono flex items-center gap-1">
+                            <Zap className="h-3 w-3 text-emerald-400" />
+                            Unleashed (100%)
+                          </Badge>
+                        )}
+
+                        {/* Remote Always Silent Toggle Button */}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className={`h-7 px-2 text-[10px] font-mono gap-1.5 transition-all ${
+                            Boolean(w.is_always_silent)
+                              ? "bg-cyan-500/20 text-cyan-300 border-cyan-500/40 hover:bg-cyan-500/30"
+                              : "text-muted-foreground hover:text-foreground border-border/60"
+                          }`}
+                          title={
+                            Boolean(w.is_always_silent)
+                              ? "Always Silent Mode ON: Whisper acoustic governor & automatic gaming yield active. Click to deactivate."
+                              : "Always Silent Mode OFF: Max burst compute performance without acoustic regulation. Click to activate."
+                          }
+                          onClick={() => handleToggleAlwaysSilent(w.node_id || w.id, Boolean(w.is_always_silent))}
+                          disabled={isUpdating}
+                        >
+                          {Boolean(w.is_always_silent) ? (
+                            <Moon className="h-3 w-3 text-cyan-400 shrink-0" />
+                          ) : (
+                            <Zap className="h-3 w-3 text-muted-foreground shrink-0" />
+                          )}
+                          <span>{Boolean(w.is_always_silent) ? "Silent: ON" : "Silent: OFF"}</span>
+                        </Button>
 
                         {/* Remote Pause / Resume Toggle */}
                         <Button
                           size="sm"
                           variant="outline"
                           className="h-7 w-7 p-0"
-                          title={isOnline ? "Pause Machine (Stop receiving tasks)" : "Resume Machine (Start accepting tasks)"}
-                          onClick={() => handleToggleAvailability(w.node_id || w.id, w.is_available)}
+                          title={isPaused ? "Resume Machine (Start accepting compute jobs)" : "Pause Machine (Stop receiving new tasks)"}
+                          onClick={() => handleToggleAvailability(w.node_id || w.id, isAvailable)}
                           disabled={isUpdating}
                         >
-                          {isOnline ? <Pause className="h-3.5 w-3.5 text-amber-400" /> : <Play className="h-3.5 w-3.5 text-emerald-400" />}
+                          {isPaused ? <Play className="h-3.5 w-3.5 text-emerald-400" /> : <Pause className="h-3.5 w-3.5 text-amber-400" />}
                         </Button>
 
                         {/* Deregister Node */}
@@ -572,6 +692,54 @@ export function WorkerDashboardPage() {
                           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
                           {w.region || "us-east"} • {w.latency_ping_ms ?? 12.0}ms
                         </span>
+                      </div>
+                    </div>
+
+                    {/* Acoustic-Thermal Governor & Presence Telemetry Gauge */}
+                    <div className="p-3 rounded-lg bg-muted/20 border border-border/60 text-xs space-y-2 font-mono">
+                      <div className="flex items-center justify-between text-[11px] font-sans font-semibold text-foreground">
+                        <span className="flex items-center gap-1.5">
+                          <VolumeX className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+                          Acoustic-Thermal Governor & Stealth Sensing
+                        </span>
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                          Boolean(w.is_always_silent)
+                            ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/30"
+                            : "bg-muted/40 text-muted-foreground border-border/40"
+                        }`}>
+                          {Boolean(w.is_always_silent) ? "Closed-Loop Active" : "Unregulated Standby"}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-[11px] text-muted-foreground pt-0.5">
+                        <div className="space-y-0.5">
+                          <span className="text-[9px] uppercase tracking-wider text-muted-foreground/80 block font-sans">
+                            Input Activity
+                          </span>
+                          <span className="text-foreground font-semibold flex items-center gap-1">
+                            <Clock className="h-3 w-3 text-cyan-400 shrink-0" />
+                            {(w.input_idle_sec ?? 300) < 60
+                              ? `${Math.round(w.input_idle_sec ?? 0)}s (Active User)`
+                              : `${Math.round((w.input_idle_sec ?? 300) / 60)}m (Idle)`}
+                          </span>
+                        </div>
+                        <div className="space-y-0.5">
+                          <span className="text-[9px] uppercase tracking-wider text-muted-foreground/80 block font-sans">
+                            GPU Core Temp
+                          </span>
+                          <span className="text-foreground font-semibold flex items-center gap-1">
+                            <Thermometer className="h-3 w-3 text-amber-400 shrink-0" />
+                            {(w.gpu_temp_c ?? 50.0).toFixed(1)}°C <span className="text-[10px] text-muted-foreground font-normal">/ 62°C Whisper Target</span>
+                          </span>
+                        </div>
+                        <div className="space-y-0.5">
+                          <span className="text-[9px] uppercase tracking-wider text-muted-foreground/80 block font-sans">
+                            Compute Duty Cycle
+                          </span>
+                          <span className="text-foreground font-semibold flex items-center gap-1">
+                            <Zap className="h-3 w-3 text-emerald-400 shrink-0" />
+                            {w.duty_cycle_pct ?? 100}% Compute
+                          </span>
+                        </div>
                       </div>
                     </div>
 

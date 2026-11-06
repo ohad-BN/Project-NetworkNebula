@@ -49,12 +49,17 @@ flowchart LR
 | **D-5** Web Console UI | **INT-01** React 19 Frontend Build | **UC-01, UC-02** | SDD §2.1, §5.0 | EDD §3.1 | **TC-013** | Phase 4 Enterprise (Lines 680-740) | **PASSED** |
 | **D-6** Unified Tests | **NFR-10** Automated Test Harness | All | SDD §5.0 | EDD §8.0 | **TC-014** | Phase 5 Full Simulation (Lines 741-999) | **PASSED** |
 | **D-7** Docs as Code | All Documentation Standards | All | All | All | Manual Audit | Ariel Univ Intro2SE Lecture 02a | **PASSED** |
+| **D-8** Always Silent | **REQ-20** Zero-Privilege Input Sensing | **UC-08** | SDD §3.4 | EDD §1.1, §2.4 | **TC-015** | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **D-8** Always Silent | **REQ-21** Micro-Duty GPU Yielding | **UC-08** | SDD §3.4, §6.0 | EDD §2.3, §6.0 | **TC-016** | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **D-8** Always Silent | **REQ-22** Acoustic-Thermal Governor | **UC-08** | SDD §2.0, §3.4 | EDD §1.1, §2.3 | **TC-017** | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **D-8** Always Silent | **REQ-23** Elastic VRAM Reclamation | **UC-08** | SDD §3.4 | EDD §1.1, §6.0 | **TC-016** | `tests/test_stealth_regulation.py` | **PLANNED** |
+| **D-8** Always Silent | **REQ-24** Orchestrator Stealth Routing | **UC-08** | SDD §3.4 | EDD §1.1, §5.1 | **TC-018** | `tests/test_stealth_regulation.py` | **PLANNED** |
 
 ---
 
 ## 3. Coverage Analysis
-- **Total Functional Requirements:** 19
-- **Total Non-Functional Requirements:** 10
-- **Total Use Cases:** 3 detailed + 7 overview
-- **Requirements Covered by Test Cases:** 100% (29 / 29)
-- **Identified Gaps:** Zero gaps identified. All deliverables map directly to automated tests in `test_suite.py` with passing results.
+- **Total Functional Requirements:** 24 (19 Baseline + 5 Always Silent)
+- **Total Non-Functional Requirements:** 12 (10 Baseline + 2 Always Silent)
+- **Total Use Cases:** 4 detailed + 8 overview
+- **Requirements Covered by Test Cases:** 100% (29 Baseline Active, 5 Always Silent Planned)
+- **Identified Gaps:** Zero gaps identified. All baseline deliverables map directly to automated tests in `test_suite.py` with passing results. Phase 5 Always Silent tests specified for implementation.

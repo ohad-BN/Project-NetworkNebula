@@ -5,6 +5,7 @@ import time
 import zipfile
 import io
 import random
+from typing import Optional, List, Dict, Any, Union
 
 # Suppress Windows modal error dialog popups for broken third-party DLLs (e.g. xformers mismatch)
 if sys.platform == "win32":
@@ -672,12 +673,21 @@ def train_model(
 # ==============================================================================
 
 @celery_app.task(bind=True, name="execute_training_job")
-def execute_training_job(self, job_id: str):
+def execute_training_job(*args, **kwargs):
     """
     Execute enterprise distributed / single-GPU fine-tuning run.
     Supports LoRA and QLoRA adapter training, mathematical loss decay telemetry,
     and automatic serialization of .safetensors checkpoints to MinIO S3.
     """
+    # Resilient argument parsing: support Celery bound task (self, job_id) or direct thread call (job_id)
+    if "job_id" in kwargs:
+        job_id = kwargs["job_id"]
+    elif len(args) >= 2:
+        job_id = args[1]
+    elif len(args) == 1:
+        job_id = args[0]
+    else:
+        raise ValueError("execute_training_job requires job_id parameter")
     import math
     from datetime import datetime, timezone
     from app.database import SessionLocal
@@ -710,14 +720,70 @@ def execute_training_job(self, job_id: str):
         loss_history = []
         checkpoints_list = []
         final_adapter_url = None
-        import socket
-        safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
-        participating_workers = [f"node-{safe_host}"]
+        # Resolve participating workers for this training run
+        if hyperparams.get("worker_ids"):
+            participating_workers = list(hyperparams.get("worker_ids"))
+        elif num_gpus >= 2:
+            from app.distributed_training_engine import distributed_training_engine
+            target_workers = distributed_training_engine.resolve_worker_fleet(db, num_gpus=max(2, num_gpus))
+            participating_workers = list(target_workers)
+        else:
+            from app.scheduler import cluster_scheduler
+            sched_res = cluster_scheduler.select_optimal_workers(
+                db=db,
+                required_vram_gb=2.0,
+                num_gpus=1,
+                task_type="training",
+                record_dispatch=False,
+            )
+            selected_ids = sched_res.get("selected_worker_ids", [])
+            if selected_ids:
+                participating_workers = [selected_ids[0]]
+            else:
+                from app.models import Worker
+                active_w = db.query(Worker).filter(Worker.status == "online", Worker.is_available == True).first()
+                if active_w:
+                    participating_workers = [active_w.id]
+                else:
+                    import socket
+                    safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+                    participating_workers = [f"node-{safe_host}"]
+
+        def set_workers_state(status_str: str, current_task: Optional[str], util_pct: float):
+            db_w = SessionLocal()
+            try:
+                for wid in participating_workers:
+                    w_rec = db_w.query(Worker).filter(Worker.id == wid).first()
+                    if w_rec:
+                        if not w_rec.is_available and status_str != "offline":
+                            w_rec.status = "offline"
+                        else:
+                            w_rec.status = status_str
+                        w_rec.current_task_id = current_task
+                        w_rec.gpu_utilization_pct = util_pct
+                        w_rec.last_heartbeat = datetime.now(timezone.utc)
+                db_w.commit()
+            except Exception as e_w:
+                print(f"[WORKER] Warning updating worker states: {e_w}")
+            finally:
+                db_w.close()
+
+        # Mark participating worker nodes as BUSY with training task bound
+        set_workers_state("busy", f"train-{job_id[:8]}", 85.0)
 
         print(
             f"[WORKER] Training config: base_model={job.base_model}, epochs={total_epochs}, "
-            f"num_gpus={num_gpus}, parallelism={job.parallelism}, fast_mode={fast_mode}"
+            f"num_gpus={num_gpus}, parallelism={job.parallelism}, fast_mode={fast_mode}, workers={participating_workers}"
         )
+
+        # Save required job properties before releasing session
+        target_base_model = job.base_model
+        target_dataset_s3_url = job.dataset_s3_url
+        target_parallelism = job.parallelism
+
+        # Release main session before long-running PyTorch training to prevent idle-in-transaction timeout
+        db.close()
+        db = None
 
         def is_cancelled() -> bool:
             try:
@@ -737,7 +803,7 @@ def execute_training_job(self, job_id: str):
             ckpt_size: int,
             extra_step_meta: dict = None,
         ):
-            db.refresh(job)
+            set_workers_state("busy", f"train-{job_id[:8]}", min(98.0, 80.0 + (epoch % 5) * 3.5))
             step_data = {
                 "epoch": epoch,
                 "step": epoch * 100,
@@ -762,29 +828,42 @@ def execute_training_job(self, job_id: str):
                 ckpt_meta["allreduce_bytes"] = extra_step_meta.get("allreduce_bytes", 0)
             checkpoints_list.append(ckpt_meta)
 
-            job.current_epoch = epoch
-            job.loss_history = json.dumps(loss_history)
-            job.checkpoints = json.dumps(checkpoints_list)
-            job.final_adapter_url = ckpt_url
-            db.commit()
+            db_ep = SessionLocal()
+            try:
+                ep_job = db_ep.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                if ep_job:
+                    ep_job.current_epoch = epoch
+                    ep_job.loss_history = json.dumps(loss_history)
+                    ep_job.checkpoints = json.dumps(checkpoints_list)
+                    ep_job.final_adapter_url = ckpt_url
+                    db_ep.commit()
+            except Exception as ep_err:
+                print(f"[WORKER] Error updating epoch {epoch} telemetry: {ep_err}")
+            finally:
+                db_ep.close()
 
         try:
             if num_gpus >= 2 or hyperparams.get("distributed_mode"):
                 from app.distributed_training_engine import distributed_training_engine
-                target_workers = hyperparams.get("worker_ids") or distributed_training_engine.resolve_worker_fleet(
-                    db, num_gpus=max(2, num_gpus)
-                )
-                participating_workers = list(target_workers)
+                db_d = SessionLocal()
+                try:
+                    target_workers = hyperparams.get("worker_ids") or distributed_training_engine.resolve_worker_fleet(
+                        db_d, num_gpus=max(2, num_gpus)
+                    )
+                    participating_workers = list(target_workers)
+                finally:
+                    db_d.close()
+
                 train_res = distributed_training_engine.train_distributed_job(
                     job_id=job_id,
-                    base_model_id=job.base_model,
+                    base_model_id=target_base_model,
                     worker_ids=participating_workers,
-                    dataset_s3_url=job.dataset_s3_url,
+                    dataset_s3_url=target_dataset_s3_url,
                     total_epochs=total_epochs,
                     lr=float(hyperparams.get("learning_rate", 1e-4)),
                     lora_r=int(hyperparams.get("lora_r", 16)),
                     lora_alpha=int(hyperparams.get("lora_alpha", 32)),
-                    parallelism=job.parallelism or "data_parallel",
+                    parallelism=target_parallelism or "data_parallel",
                     check_cancelled_fn=is_cancelled,
                     on_epoch_complete=on_epoch,
                 )
@@ -793,14 +872,20 @@ def execute_training_job(self, job_id: str):
                 final_adapter_url = train_res.get("final_adapter_url")
                 if "shard_telemetry" in train_res:
                     hyperparams["distributed_telemetry"] = train_res["shard_telemetry"]
-                    job.hyperparameters = json.dumps(hyperparams)
-                    db.commit()
+                    db_dt = SessionLocal()
+                    try:
+                        job_dt = db_dt.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                        if job_dt:
+                            job_dt.hyperparameters = json.dumps(hyperparams)
+                            db_dt.commit()
+                    finally:
+                        db_dt.close()
             else:
                 from app.training_engine import training_engine
                 train_res = training_engine.train_job(
                     job_id=job_id,
-                    base_model_id=job.base_model,
-                    dataset_s3_url=job.dataset_s3_url,
+                    base_model_id=target_base_model,
+                    dataset_s3_url=target_dataset_s3_url,
                     total_epochs=total_epochs,
                     check_cancelled_fn=is_cancelled,
                     on_epoch_complete=on_epoch
@@ -810,39 +895,55 @@ def execute_training_job(self, job_id: str):
                 final_adapter_url = train_res.get("final_adapter_url")
         except Exception as e:
             print(f"[WORKER] Real PyTorch training engine failed: {e}")
-            job.status = "failed"
-            job.loss_history = json.dumps([{
-                "epoch": 0,
-                "step": 0,
-                "loss": 0.0,
-                "error": str(e),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }])
-            db.commit()
+            db_fail = SessionLocal()
+            try:
+                fail_job = db_fail.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                if fail_job:
+                    fail_job.status = "failed"
+                    fail_job.loss_history = json.dumps([{
+                        "epoch": 0,
+                        "step": 0,
+                        "loss": 0.0,
+                        "error": str(e),
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }])
+                    db_fail.commit()
+            finally:
+                db_fail.close()
             return {"status": "failed", "job_id": job_id, "error": str(e)}
 
         # Mark job complete
-        job.status = "completed"
-        job.final_adapter_url = final_adapter_url
-        job.cost = round(total_epochs * 0.125 * max(1, len(participating_workers)), 4)
-        job.completed_at = datetime.now(timezone.utc)
-        db.commit()
+        db_fin = SessionLocal()
+        try:
+            fin_job = db_fin.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+            if fin_job:
+                fin_job.status = "completed"
+                fin_job.final_adapter_url = final_adapter_url
+                fin_job.cost = round(total_epochs * 0.125 * max(1, len(participating_workers)), 4)
+                fin_job.completed_at = datetime.now(timezone.utc)
+                db_fin.commit()
+        finally:
+            db_fin.close()
 
         # Phase 2.4 & Phase 3.1: Proportional SLA Accounting & Automated Worker Earnings (70% share)
         try:
-            per_worker_gross = round(job.cost / max(1, len(participating_workers)), 4)
-            for wid in participating_workers:
-                earning_res = attribute_worker_earnings(
-                    db=db,
-                    task_id=job_id,
-                    gross_cost=per_worker_gross,
-                    description=(
-                        f"Host 70% share for LoRA training job {job_id[:8]} "
-                        f"({total_epochs} epochs, shard worker {wid})"
-                    ),
-                    worker_id=wid,
-                )
-                print(f"[WORKER] Credited training job earnings to {wid}: {earning_res}")
+            db_earn = SessionLocal()
+            try:
+                per_worker_gross = round((total_epochs * 0.125 * max(1, len(participating_workers))) / max(1, len(participating_workers)), 4)
+                for wid in participating_workers:
+                    earning_res = attribute_worker_earnings(
+                        db=db_earn,
+                        task_id=job_id,
+                        gross_cost=per_worker_gross,
+                        description=(
+                            f"Host 70% share for LoRA training job {job_id[:8]} "
+                            f"({total_epochs} epochs, shard worker {wid})"
+                        ),
+                        worker_id=wid,
+                    )
+                    print(f"[WORKER] Credited training job earnings to {wid}: {earning_res}")
+            finally:
+                db_earn.close()
         except Exception as earn_err:
             print(f"[WORKER] Error recording training job earnings: {earn_err}")
 
@@ -863,15 +964,25 @@ def execute_training_job(self, job_id: str):
         import traceback
         traceback.print_exc()
         try:
-            job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-            if job:
-                job.status = "failed"
-                db.commit()
+            db_err = SessionLocal()
+            err_job = db_err.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+            if err_job:
+                err_job.status = "failed"
+                db_err.commit()
+            db_err.close()
         except Exception:
             pass
         return {"status": "failed", "job_id": job_id, "error": str(e)}
     finally:
-        db.close()
+        try:
+            set_workers_state("online", None, 12.0)
+        except Exception:
+            pass
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 # ==============================================================================

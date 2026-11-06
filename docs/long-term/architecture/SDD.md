@@ -92,6 +92,8 @@ flowchart TD
     subgraph Execution ["5. Worker Execution Layer"]
         CeleryWorker["Celery Worker Node (app/worker.py)"]
         StandaloneAgent["Nebula Worker CLI (nebula_worker.py)"]
+        StealthSensor["Stealth Presence Sensor (worker/stealth_sensor.py)"]
+        SilentGovernor["Acoustic-Thermal Governor (worker/silent_governor.py)"]
         TorchEngine["PyTorch / PEFT Engine (app/training_engine.py)"]
         InferenceRuntime["Neural Inference Engine (app/inference_engine.py)"]
     end
@@ -128,6 +130,48 @@ The following table summarizes all internal and external network communication i
 | API / Workers | MinIO S3 | HTTP / S3 API | 9000 | Binary Safetensors / JSONL | S3 Access Key & Secret / HMAC |
 | Remote Worker | API Orchestrator | HTTP / WebSocket | 8000 | JSON Heartbeat & Tasks | Worker Secret Token |
 | Worker to Worker | P2P gRPC Mesh | HTTP/2 / gRPC | 50051 | Protocol Buffers (Tensors) | Mutual TLS / Secret Token |
+
+### 3.4 "Always Silent" Adaptive Regulation & Stealth Sensing Architecture
+
+To eliminate desktop micro-stutters and frame drops during concurrent user interaction (Excel, Web browsing, IDEs), the worker daemon integrates a multi-tier adaptive regulation loop:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Jon as Host Desktop User
+    participant OS as OS Input Subsystem (Win32/IOKit)
+    participant Sensor as Stealth Presence Sensor
+    participant Gov as Acoustic-Thermal Governor
+    participant Worker as Nebula Worker Daemon
+    participant DWM as Desktop Window Manager (dwm.exe)
+    participant Orch as Central Orchestrator Scheduler
+
+    Note over Jon,Worker: Night Hours: Idle > 60s (UNLEASHED MODE - 100% Throughput)
+    Worker->>Worker: Full-blast training batch execution
+    
+    Note over Jon,OS: Morning: Jon wakes up & moves mouse in Excel
+    Jon->>OS: Mouse Movement / Keyboard Input
+    Sensor->>OS: Query GetLastInputInfo() / IOKit (Latency < 200us)
+    OS-->>Sensor: elapsed_ms = 45ms (Active human input detected!)
+    Sensor->>Worker: Transition signal -> STEALTH_REGULATED
+    
+    activate Worker
+    Worker->>Gov: Request duty-cycle yield profile
+    Gov-->>Worker: Enforce 30% duty cycle + 25ms yield sleep
+    Worker->>Worker: Deliver current micro-slice & flush VRAM cache
+    Worker->>DWM: YIELD GPU QUEUE: Hardware command queue idle for 25ms
+    DWM->>DWM: Composite Excel UI smoothly @ 144 Hz (0 frame drops!)
+    Worker->>Orch: Heartbeat: status="online", work_mode="stealth"
+    Orch-->>Worker: Route relaxed async inference slices (extended 60s timeout)
+    deactivate Worker
+
+    Note over Jon,OS: Lunchtime: Jon steps away (Idle for 60s)
+    Sensor->>OS: Query input idle timer
+    OS-->>Sensor: elapsed_ms = 60,400ms (Idle confirmed)
+    Sensor->>Worker: Transition signal -> UNLEASHED
+    Worker->>Orch: Heartbeat: work_mode="unleashed"
+    Worker->>Worker: Resume 100% capacity compute burst
+```
 
 ---
 
@@ -325,3 +369,9 @@ flowchart TD
 - **Context:** Co-located workers on the same LAN benefit from low-latency Redis/Celery queues, while remote residential workers reside behind NAT firewalls.
 - **Decision:** Support both native Celery execution (for local nodes) and a standalone CLI polling agent (`nebula_worker.py`) connecting via outbound HTTPS/WebSocket.
 - **Consequence:** Flexibility to recruit both dedicated cloud GPUs and decentralized crowd-sourced GPUs with zero router port forwarding required.
+
+### ADR-05: Interleaved Micro-Duty-Cycle Compute Yielding over Coarse-Grained GPU Preemption
+- **Status:** Accepted
+- **Context:** Monolithic GPU compute dispatches cause Windows DWM and macOS WindowServer compositors to miss VSync deadlines (6.9ms – 16.6ms), resulting in severe desktop UI stutter during background worker execution. Hardware compute preemption cannot guarantee sub-millisecond context switching across consumer architectures.
+- **Decision:** Introduce a software-governed micro-duty-cycle yielding loop ($T_{\text{yield}} \ge 15\text{ms}$) combined with low-priority CUDA execution streams (`priority=0`) and closed-loop thermal governor (<62°C).
+- **Consequence:** Eliminates 100% of human-perceived desktop stutter and fan noise; enables decentralized workers to run 24/7 without manual pausing while maintaining continuous PoDS revenue minting.

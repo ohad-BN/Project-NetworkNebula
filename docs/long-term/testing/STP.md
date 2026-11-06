@@ -19,6 +19,7 @@ The scope of this test plan encompasses the complete end-to-end functionality of
 4. **OpenAI-Compatible Inference Gateway:** `/v1/chat/completions`, streaming SSE tokens, token deduction ledger, and response latency.
 5. **Decentralized Host Fleet & Worker Management:** Node registration, GPU telemetry discovery (`pynvml`), heartbeat maintenance, staking, slashing, and Celery task dispatch.
 6. **Web Console UI:** React 19 / Vite build validation and end-to-end browser flows.
+7. **"Always Silent" Adaptive Regulation & Stealth Sensing:** OS input idle detection latency (<200μs), micro-duty-cycle yielding (<16.6ms DWM composition latency), closed-loop thermal/acoustic ceiling (<62°C, <32 dBA), two-tier elastic VRAM reclamation ($\ge 4.5\text{ GB}$ free), and non-blocking PoDS micro-slice delivery.
 
 ---
 

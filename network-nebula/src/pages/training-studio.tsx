@@ -15,8 +15,11 @@ import {
   UploadCloud,
   Server,
   Network,
-  CheckSquare,
-  Square,
+  Zap,
+  ShieldCheck,
+  ChevronDown,
+  ChevronRight,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -78,10 +81,16 @@ export function TrainingStudioPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGeneratingUpload, setIsGeneratingUpload] = useState(false);
 
-  // Fleet & Multi-Worker State
+  // Fleet & Autonomous Compute Distribution State
   const [clusterNodes, setClusterNodes] = useState<ClusterNodeItem[]>([]);
-  const [distributionMode, setDistributionMode] = useState<"single" | "distributed">("single");
-  const [selectedWorkerIds, setSelectedWorkerIds] = useState<string[]>([]);
+  const [computeStrategy, setComputeStrategy] = useState<"auto_swarm" | "ring_mesh" | "single">("auto_swarm");
+  const [gpuScale, setGpuScale] = useState<"auto" | "2" | "4">("auto");
+  const [devOverrideNodeId, setDevOverrideNodeId] = useState<string>("");
+  const [showDevOverride, setShowDevOverride] = useState<boolean>(false);
+
+  // Derived cluster capacity
+  const onlineNodes = clusterNodes.filter((n) => n.status === "online" && n.is_available !== false);
+  const totalOnlineVram = onlineNodes.reduce((acc, n) => acc + (n.vram_allocated_gb || n.vram_total_gb || 0), 0);
 
   const fetchJobs = async () => {
     try {
@@ -100,10 +109,6 @@ export function TrainingStudioPage() {
       const res = await apiClient.get("/api/v1/cluster/telemetry?scope=all");
       const nodes = (res.data?.nodes || []) as ClusterNodeItem[];
       setClusterNodes(nodes);
-      const onlineIds = nodes.filter((n) => n.status === "online").map((n) => n.node_id);
-      if (onlineIds.length > 0 && selectedWorkerIds.length === 0) {
-        setSelectedWorkerIds(onlineIds);
-      }
     } catch (err) {
       // Ignore telemetry fetch errors
     }
@@ -118,12 +123,6 @@ export function TrainingStudioPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, []);
-
-  const toggleWorkerSelection = (nodeId: string) => {
-    setSelectedWorkerIds((prev) =>
-      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
-    );
-  };
 
   const handleGenerateUploadUrl = async () => {
     try {
@@ -144,16 +143,24 @@ export function TrainingStudioPage() {
     e.preventDefault();
     try {
       setIsSubmitting(true);
-      const isDistributed = distributionMode === "distributed" && selectedWorkerIds.length > 1;
-      const targetWorkerIds = isDistributed ? selectedWorkerIds : undefined;
-      const gpuCount = isDistributed ? selectedWorkerIds.length : 1;
+      const isSingle = computeStrategy === "single";
+      let targetGpus = 1;
+      if (!isSingle) {
+        if (gpuScale === "auto") {
+          targetGpus = Math.max(2, onlineNodes.length);
+        } else {
+          targetGpus = parseInt(gpuScale, 10);
+        }
+      }
+      const isDistributed = !isSingle && targetGpus >= 2;
+      const targetWorkerIds = devOverrideNodeId ? [devOverrideNodeId] : undefined;
 
       const payload = {
         name: jobName.trim() || undefined,
         base_model: baseModel,
         train_type: trainType,
-        parallelism: isDistributed ? "data_parallel" : "data_parallel",
-        num_gpus: gpuCount,
+        parallelism: computeStrategy === "ring_mesh" ? "model_parallel" : "data_parallel",
+        num_gpus: isDistributed ? targetGpus : 1,
         worker_ids: targetWorkerIds,
         dataset_s3_url: datasetUrl,
         total_epochs: parseInt(epochs, 10) || 3,
@@ -162,6 +169,7 @@ export function TrainingStudioPage() {
           batch_size: 4,
           lora_r: parseInt(loraR, 10) || 16,
           lora_alpha: 32,
+          compute_strategy: computeStrategy,
           worker_ids: targetWorkerIds,
         }
       };
@@ -170,8 +178,8 @@ export function TrainingStudioPage() {
       await apiClient.post(endpoint, payload);
       toast.success(
         isDistributed
-          ? `Distributed training run dispatched across ${selectedWorkerIds.length} nodes!`
-          : "Training run submitted to GPU compute fleet"
+          ? `Decentralized training job dispatched across ${targetGpus} nodes via autonomous consensus!`
+          : "Training job submitted to optimal sovereign worker node"
       );
       setIsSubmitModalOpen(false);
       setJobName("");
@@ -289,106 +297,190 @@ export function TrainingStudioPage() {
                   </div>
                 </div>
 
-                {/* Compute Fleet & Distribution Selector */}
+                {/* Autonomous Decentralized Compute Distribution */}
                 <div className="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3.5">
                   <div className="flex items-center justify-between">
                     <Label className="text-sm font-semibold flex items-center gap-1.5">
                       <Network className="h-4 w-4 text-primary" />
-                      Compute Fleet Distribution
+                      Autonomous Compute Fleet Strategy
+                      <Sparkles className="h-3.5 w-3.5 text-amber-400" />
                     </Label>
-                    <Badge variant="outline" className="text-xs">
-                      {clusterNodes.filter((n) => n.status === "online").length} Nodes Available
+                    <Badge variant="outline" className="text-xs font-mono bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                      <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-1.5" />
+                      {onlineNodes.length} Verified Online
                     </Badge>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2">
+                  {/* 3 Strategy Cards */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                     <button
                       type="button"
-                      onClick={() => setDistributionMode("single")}
-                      className={`flex items-center gap-2 rounded-md border p-2.5 text-left text-xs transition-colors cursor-pointer ${
-                        distributionMode === "single"
-                          ? "border-primary bg-primary/10 text-primary font-medium"
-                          : "border-border/60 hover:bg-muted/50 text-muted-foreground"
+                      onClick={() => setComputeStrategy("auto_swarm")}
+                      className={`relative flex flex-col p-3 rounded-lg border text-left transition-all cursor-pointer ${
+                        computeStrategy === "auto_swarm"
+                          ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary/40"
+                          : "border-border/60 hover:bg-muted/40 text-muted-foreground"
                       }`}
                     >
-                      <Cpu className="h-4 w-4 shrink-0" />
-                      <div>
-                        <div className="font-semibold text-foreground">Single Best GPU</div>
-                        <div className="text-[11px] opacity-80">Auto-routes to highest VRAM node</div>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5 text-foreground font-semibold text-xs">
+                          <Zap className="h-3.5 w-3.5 text-amber-400" />
+                          <span>Auto-Swarm</span>
+                        </div>
+                        <Badge variant="secondary" className="text-[10px] px-1.5 py-0 bg-primary/20 text-primary">
+                          Recommended
+                        </Badge>
                       </div>
+                      <p className="text-[11px] text-muted-foreground leading-snug">
+                        Dynamic multi-node dataset sharding across decentralized workers.
+                      </p>
                     </button>
 
                     <button
                       type="button"
-                      onClick={() => {
-                        setDistributionMode("distributed");
-                        const onlineIds = clusterNodes.filter((n) => n.status === "online").map((n) => n.node_id);
-                        if (onlineIds.length > 0) {
-                          setSelectedWorkerIds(onlineIds);
-                        }
-                      }}
-                      className={`flex items-center gap-2 rounded-md border p-2.5 text-left text-xs transition-colors cursor-pointer ${
-                        distributionMode === "distributed"
-                          ? "border-primary bg-primary/10 text-primary font-medium"
-                          : "border-border/60 hover:bg-muted/50 text-muted-foreground"
+                      onClick={() => setComputeStrategy("ring_mesh")}
+                      className={`relative flex flex-col p-3 rounded-lg border text-left transition-all cursor-pointer ${
+                        computeStrategy === "ring_mesh"
+                          ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary/40"
+                          : "border-border/60 hover:bg-muted/40 text-muted-foreground"
                       }`}
                     >
-                      <Server className="h-4 w-4 shrink-0" />
-                      <div>
-                        <div className="font-semibold text-foreground">Distributed Mesh</div>
-                        <div className="text-[11px] opacity-80">Ring All-Reduce multi-node split</div>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5 text-foreground font-semibold text-xs">
+                          <Server className="h-3.5 w-3.5 text-cyan-400" />
+                          <span>Ring Mesh</span>
+                        </div>
+                        <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                          &lt;25ms RTT
+                        </Badge>
                       </div>
+                      <p className="text-[11px] text-muted-foreground leading-snug">
+                        Low-latency Ring All-Reduce synchronous peer-to-peer gradient topology.
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setComputeStrategy("single")}
+                      className={`relative flex flex-col p-3 rounded-lg border text-left transition-all cursor-pointer ${
+                        computeStrategy === "single"
+                          ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary/40"
+                          : "border-border/60 hover:bg-muted/40 text-muted-foreground"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5 text-foreground font-semibold text-xs">
+                          <Cpu className="h-3.5 w-3.5 text-purple-400" />
+                          <span>Single Sovereign GPU</span>
+                        </div>
+                        <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                          Single Node
+                        </Badge>
+                      </div>
+                      <p className="text-[11px] text-muted-foreground leading-snug">
+                        Auto-routes to the highest-reputation, lowest-cost available node.
+                      </p>
                     </button>
                   </div>
 
-                  {distributionMode === "distributed" && (
-                    <div className="space-y-2 pt-1 border-t border-border/40">
-                      <div className="text-xs text-muted-foreground flex items-center justify-between">
-                        <span>Select worker nodes to join this distributed training run:</span>
-                        <span className="font-mono text-primary">{selectedWorkerIds.length} selected</span>
+                  {/* Parallel Scale Selector (shown when not single) */}
+                  {computeStrategy !== "single" && (
+                    <div className="space-y-1.5 pt-2 border-t border-border/40">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>Target Compute Scale:</span>
+                        <span className="font-mono text-primary font-medium">
+                          {gpuScale === "auto" ? `Auto-Scale (${Math.max(2, onlineNodes.length)} Nodes)` : `${gpuScale} Nodes`}
+                        </span>
                       </div>
-                      <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                        {clusterNodes.map((node) => {
-                          const isSelected = selectedWorkerIds.includes(node.node_id);
-                          const isOnline = node.status === "online";
-                          return (
-                            <div
-                              key={node.node_id}
-                              onClick={() => toggleWorkerSelection(node.node_id)}
-                              className={`flex items-center justify-between p-2 rounded border text-xs cursor-pointer transition-colors ${
-                                isSelected
-                                  ? "border-primary/60 bg-primary/5"
-                                  : "border-border/40 hover:bg-muted/40"
-                              }`}
-                            >
-                              <div className="flex items-center gap-2">
-                                {isSelected ? (
-                                  <CheckSquare className="h-4 w-4 text-primary" />
-                                ) : (
-                                  <Square className="h-4 w-4 text-muted-foreground" />
-                                )}
-                                <div>
-                                  <div className="font-medium text-foreground">{node.name || node.node_id}</div>
-                                  <div className="text-[11px] text-muted-foreground">
-                                    {node.gpu_model || "CPU Fallback"} • {node.vram_allocated_gb || node.vram_total_gb || 8} GB VRAM
-                                  </div>
-                                </div>
-                              </div>
-                              <Badge
-                                variant={isOnline ? "default" : "outline"}
-                                className={`text-[10px] ${isOnline ? "bg-emerald-600" : "text-muted-foreground"}`}
-                              >
-                                {node.status || "offline"}
-                              </Badge>
-                            </div>
-                          );
-                        })}
+                      <div className="grid grid-cols-3 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setGpuScale("auto")}
+                          className={`px-2.5 py-1.5 rounded border text-xs font-medium transition-colors cursor-pointer text-center ${
+                            gpuScale === "auto"
+                              ? "border-primary bg-primary/20 text-primary font-semibold"
+                              : "border-border/50 hover:bg-muted/40 text-muted-foreground"
+                          }`}
+                        >
+                          ⚡ Auto-Scale (All Available)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGpuScale("2")}
+                          className={`px-2.5 py-1.5 rounded border text-xs font-medium transition-colors cursor-pointer text-center ${
+                            gpuScale === "2"
+                              ? "border-primary bg-primary/20 text-primary font-semibold"
+                              : "border-border/50 hover:bg-muted/40 text-muted-foreground"
+                          }`}
+                        >
+                          2 Nodes (Dual Mesh)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGpuScale("4")}
+                          className={`px-2.5 py-1.5 rounded border text-xs font-medium transition-colors cursor-pointer text-center ${
+                            gpuScale === "4"
+                              ? "border-primary bg-primary/20 text-primary font-semibold"
+                              : "border-border/50 hover:bg-muted/40 text-muted-foreground"
+                          }`}
+                        >
+                          4 Nodes (Quad Swarm)
+                        </button>
                       </div>
-                      <p className="text-[11px] text-muted-foreground italic">
-                        ⚡ Micro-batch dataset shards will be partitioned proportionally based on node compute horsepower (CUDA VRAM vs CPU) and merged each epoch.
-                      </p>
                     </div>
                   )}
+
+                  {/* Decentralized Swarm Protocol Cockpit */}
+                  <div className="p-2.5 rounded-md bg-background/60 border border-border/40 space-y-1.5 text-[11px]">
+                    <div className="flex items-center justify-between text-foreground font-medium">
+                      <span className="flex items-center gap-1.5">
+                        <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                        Decentralized Swarm Consensus Protocol
+                      </span>
+                      <span className="font-mono text-xs text-emerald-400">PoDS v1.7 Active</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-muted-foreground">
+                      <div>🌐 Fleet Pool: <span className="text-foreground font-mono">{onlineNodes.length} Verified Nodes</span></div>
+                      <div>💾 VRAM Headroom: <span className="text-foreground font-mono">{totalOnlineVram.toFixed(1)} GB Available</span></div>
+                      <div>⚖️ Sharding: <span className="text-foreground font-mono">Dynamic Compute-Weighted</span></div>
+                      <div>🛡️ Self-Healing: <span className="text-foreground font-mono">Auto-Failover Enabled</span></div>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground/80 italic pt-0.5">
+                      Workload micro-batches are automatically partitioned across decentralized worker nodes and verified via Proof-of-Delivered-Slice consensus.
+                    </p>
+                  </div>
+
+                  {/* Optional Developer Override Collapsible */}
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowDevOverride(!showDevOverride)}
+                      className="text-[11px] text-muted-foreground hover:text-foreground flex items-center gap-1 cursor-pointer transition-colors"
+                    >
+                      {showDevOverride ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                      <span>Developer Override (Manual Node Pinning)</span>
+                      {devOverrideNodeId && <Badge variant="secondary" className="text-[9px] px-1 py-0 ml-1">Pinned: {devOverrideNodeId}</Badge>}
+                    </button>
+                    {showDevOverride && (
+                      <div className="mt-2 p-2 rounded border border-border/40 bg-muted/30 space-y-1.5">
+                        <div className="text-[11px] text-muted-foreground">
+                          Pin job to a specific worker node (leave empty for autonomous network routing):
+                        </div>
+                        <select
+                          value={devOverrideNodeId}
+                          onChange={(e) => setDevOverrideNodeId(e.target.value)}
+                          className="w-full bg-background border border-border/60 rounded px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                        >
+                          <option value="">-- Autonomous Network Selection (Recommended) --</option>
+                          {clusterNodes.map((n) => (
+                            <option key={n.node_id} value={n.node_id}>
+                              {n.name || n.node_id} ({n.gpu_model || "CPU"} - {n.status})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div className="space-y-2">

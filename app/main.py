@@ -160,6 +160,11 @@ def startup_event():
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS public_ip VARCHAR(64);"))
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_unified_memory BOOLEAN DEFAULT FALSE;"))
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS supported_task_types VARCHAR(255) DEFAULT 'inference,training';"))
+            conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_always_silent BOOLEAN DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS work_capacity_state VARCHAR(32) DEFAULT 'unleashed';"))
+            conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS input_idle_sec FLOAT DEFAULT 300.0;"))
+            conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS gpu_temp_c FLOAT DEFAULT 50.0;"))
+            conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS duty_cycle_pct INTEGER DEFAULT 100;"))
             conn.commit()
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             try:
@@ -1237,6 +1242,11 @@ app.include_router(invite_router)
 from app.user_profile_router import router as user_profile_router
 
 app.include_router(user_profile_router)
+
+# Include System & Remote Server Management Router
+from app.system_router import router as system_router
+
+app.include_router(system_router)
 
 
 # ==============================================================================

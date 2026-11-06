@@ -158,3 +158,14 @@ When multiple decentralized host workers are assigned to a distributed training 
 3. The **`GradientAggregator`** in `app/distributed.py` collects bucket gradients from each worker.
 4. Once all worker gradients for a layer bucket arrive, all-reduce computes the mean gradient tensor.
 5. The aggregated gradient is broadcast back to all worker nodes via gRPC streaming (`app/grpc_endpoints.py`), ensuring weights remain synchronized across nodes without a central bottleneck.
+
+---
+
+## 6. "Always Silent" Autonomous Worker Regulation & Desktop Concurrency
+
+To enable desktop users (such as gamers and workstation owners) to contribute GPU compute 24/7 without experiencing UI stutter or noise disruption:
+
+1. **Continuous Non-Intrusive Sensing:** The local daemon samples OS input timestamps (`GetLastInputInfo` on Windows, `IOKit` on macOS, `XScreenSaver` on Linux) in $<150\text{ns}$ without keylogger hooks or root permissions.
+2. **Adaptive Duty-Cycle Yielding:** When user interaction is detected (e.g. typing, moving mouse in Excel/Chrome), compute kernels are interleaved with $15\text{ms}–40\text{ms}$ yield sleeps. This clears GPU hardware queues for the Desktop Window Manager (`dwm.exe`/`WindowServer`), preserving native 60/120/144 Hz frame rates (<16.6ms frame latency).
+3. **Closed-Loop Thermal Governor:** Software pacing maintains GPU junction temperatures below 62°C, locking hardware cooling fans into their silent curve (<32 dBA) during night and desktop hours.
+4. **PoDS Micro-Slice Harmony:** The worker delivers cryptographically verified Proof-of-Delivered-Slice (PoDS) micro-rewards at an adaptive cadence, preventing straggler bottlenecks in the central cluster while continuing continuous token minting.

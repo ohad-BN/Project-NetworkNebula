@@ -26,12 +26,14 @@ classDiagram
         +dispatch_task(task_id: str, payload: dict) bool
         +handle_worker_timeout(worker_id: str) void
         +calculate_priority(reputation: float, latency_ms: float) float
+        +evaluate_stealth_eligibility(worker_id: str, task_mode: str) bool
     }
 
     class WorkerDaemon {
         +str worker_id
         +str server_url
         +str api_key
+        +str regulation_mode
         -NVMLDevice gpu_handle
         -bool is_running
         +register_node() bool
@@ -40,6 +42,25 @@ classDiagram
         +execute_inference(prompt: str, model_id: str) dict
         +execute_training(dataset_url: str, hparams: dict) str
         +report_result(task_id: str, result: dict) void
+        +sample_stealth_governor() str
+    }
+
+    class StealthPresenceSensor {
+        -str os_platform
+        -float last_input_time
+        -float cooldown_seconds
+        +get_idle_duration_seconds() float
+        +is_media_playback_active() bool
+        +is_fullscreen_game_active() bool
+        +evaluate_presence_state() str
+    }
+
+    class SilentThermalGovernor {
+        -float target_temp_celsius
+        -float baseline_duty_cycle
+        +calculate_micro_yield_sleep(compute_duration_ms: float) float
+        +sample_gpu_temperature() float
+        +enforce_vram_headroom_reclamation() void
     }
 
     class NeuralInferenceRuntime {
@@ -61,6 +82,7 @@ classDiagram
     class WorkerStateRecord {
         +str worker_id
         +str status
+        +str work_capacity_state
         +float vram_used_gb
         +float gpu_utilization_pct
         +datetime last_heartbeat
@@ -70,6 +92,8 @@ classDiagram
     NebulaScheduler --> WorkerStateRecord : evaluates
     NebulaScheduler --> VerificationEngine : triggers verification
     WorkerDaemon --> NeuralInferenceRuntime : invokes VRAM execution
+    WorkerDaemon --> StealthPresenceSensor : probes user activity
+    WorkerDaemon --> SilentThermalGovernor : queries yield pacing
     WorkerDaemon ..> NebulaScheduler : communicates via REST/Celery
 ```
 
@@ -103,6 +127,44 @@ def hot_swap_lora(self, adapter_s3_url: str):
         # Detach previous adapter and mount new safetensors in VRAM
         self.model.set_adapter(adapter_hash)
         self.active_adapter_id = adapter_hash
+```
+
+### 2.3 Mathematical Model of Micro-Duty-Cycle Yielding & Thermal Feedback
+In "Always Silent" Stealth Mode, to ensure the Desktop Window Manager (`dwm.exe` / `WindowServer`) meets $60\text{–}144\text{ Hz}$ frame composition deadlines ($\le 16.6\text{ms}$), compute execution is interleaved with yield sleeps:
+
+$$T_{\text{yield}} = \max\left(15\text{ms},\; T_{\text{compute}} \times R_{\text{duty}} + \max(0,\; T_{\text{junction}} - T_{\text{target}}) \times K_{\text{thermal}}\right)$$
+
+Where:
+- $T_{\text{compute}}$: Duration of the preceding micro-slice or forward-pass step (measured in ms).
+- $R_{\text{duty}}$: Regulated duty ratio multiplier ($2.0 \le R_{\text{duty}} \le 3.0$, enforcing a $25\%\text{–}33\%$ compute duty cycle).
+- $T_{\text{junction}}$: Real-time GPU junction temperature sampled via NVML or Metal system metrics.
+- $T_{\text{target}}$: Acoustic whisper threshold ceiling ($62.0^\circ\text{C}$).
+- $K_{\text{thermal}}$: Closed-loop thermal damping constant ($10.0\text{ ms}/^\circ\text{C}$).
+
+### 2.4 Non-Intrusive OS Presence Probing Algorithm
+The presence sensor samples human activity counters at zero privilege with sub-microsecond overhead:
+
+```python
+def probe_presence_state(self) -> str:
+    # 1. Query OS idle duration
+    idle_sec = self.get_os_idle_seconds()
+    
+    # 2. Check for exclusive fullscreen 3D gaming or VR
+    if self.is_fullscreen_3d_active():
+        return "restricted_pause"
+        
+    # 3. Check for active media video playback (YouTube / Netflix)
+    if self.is_media_playback_active() and idle_sec < 1800.0:
+        return "stealth_regulated"
+        
+    # 4. Two-stage hysteresis state determination
+    if idle_sec < 2.0:
+        self.last_activity_timestamp = time.time()
+        return "stealth_regulated"
+    elif (time.time() - self.last_activity_timestamp) > 60.0:
+        return "unleashed"
+    else:
+        return "stealth_regulated"  # Cooldown period
 ```
 
 ---
@@ -217,6 +279,14 @@ stateDiagram-v2
     Registering --> Rejected: invalid auth or failed hardware specs
     Rejected --> [*]
     
+    state Ready {
+        [*] --> Unleashed: Idle > 60s (100% Duty Cycle)
+        Unleashed --> StealthRegulated: User Input Detected (<2s)
+        StealthRegulated --> Unleashed: Idle Cooldown (>60s)
+        StealthRegulated --> RestrictedPause: Fullscreen 3D Game Active
+        RestrictedPause --> StealthRegulated: Game Terminated
+    }
+
     Ready --> Busy: task assigned
     Busy --> Ready: task complete & result returned
     Busy --> Slashing: fraudulent or malformed output detected
@@ -252,6 +322,9 @@ stateDiagram-v2
 | **Worker Drops Mid-Job** | Celery worker visibility timeout fires or heartbeat misses $>90\text{ s}$. | Orchestrator marks worker `offline`, resets task state from `PROCESSING` to `QUEUED`, and re-dispatches to another active node. | Slight latency delay ($\approx 3\text{ s}$); zero data loss. |
 | **Malformed JSONL Dataset** | Pydantic validation fails during S3 parsing stream. | Job marked `failed`; detailed line-number parsing error written to `TrainingJob.loss_history`. | Client receives descriptive HTTP 400 error detailing faulty line. |
 | **Malicious Output / Poisoning** | Verification Engine spots divergence from consensus or gradient explosion. | Worker stake slashed by 20%; worker reputation reduced to 0; task recomputed. | End client receives verified, safe output. |
+| **User Activity During Compute** | `GetLastInputInfo` / `IOKit` senses input $< 200\text{ ms}$. | Worker immediately yields GPU queue via $25\text{ ms}$ sleep, lowers batch size, flushes VRAM cache, and enters `stealth_regulated`. | Desktop UI retains 144 Hz fluid rendering; zero perceived lag in Excel/Web. |
+| **Fullscreen AAA 3D Game Launch** | `SHQueryUserNotificationState` detects D3D exclusive fullscreen. | Worker enters `restricted_pause`, yields 100% of GPU compute and VRAM. | Game runs with full native GPU performance; worker resumes automatically on exit. |
+| **GPU Thermal Rising Near Fan Threshold** | NVML junction temperature reaches $\ge 62^\circ\text{C}$. | Closed-loop governor extends micro-duty sleep ($+10\text{ms}/^\circ\text{C}$), capping thermal dissipation. | Fans stay in silent curve (<32 dBA); prevents acoustic noise while Jon works/sleeps. |
 
 ---
 

@@ -145,6 +145,11 @@ class Worker(Base):
     public_ip = Column(String(64), nullable=True)
     is_unified_memory = Column(Boolean, default=False)
     supported_task_types = Column(String(255), default="inference,training")
+    is_always_silent = Column(Boolean, default=False)
+    work_capacity_state = Column(String(32), default="unleashed")
+    input_idle_sec = Column(Float, default=300.0)
+    gpu_temp_c = Column(Float, default=50.0)
+    duty_cycle_pct = Column(Integer, default=100)
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

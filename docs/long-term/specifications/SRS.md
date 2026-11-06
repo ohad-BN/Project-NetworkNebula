@@ -105,6 +105,13 @@ Requirements are stated in unambiguous, verifiable terms using the standard "The
 - **REQ-18 (Worker Revenue Share):** The system shall credit 70% of task fees to the serving worker's balance upon successful verification of the completed task.
 - **REQ-19 (Worker Staking & Slashing):** The system shall require workers to stake a minimum of \$50.00 in test credits; malicious or faulty task results shall trigger a 20% slash penalty on the staked balance.
 
+#### Module 5: "Always Silent" Autonomous Compute Regulation & Stealth Sensing
+- **REQ-20 (Zero-Privilege Human Presence Sensing):** The worker agent shall query OS input timestamps (`GetLastInputInfo` on Windows, `IOKit/HIDIdleTime` on macOS, `XScreenSaver`/Wayland D-Bus on Linux) with execution latency $\le 200 \mu\text{s}$ without requiring elevated administrator privileges or keystroke logging.
+- **REQ-21 (Micro-Duty-Cycle Inter-Kernel Yielding):** When active user presence is detected ($\text{idle} < 2.0\text{s}$), the worker shall interleave compute dispatches with microsecond yield sleeps ($15\text{ms} \le T_{\text{yield}} \le 40\text{ms}$) to guarantee that Desktop Window Manager (`dwm.exe`/`WindowServer`) compositions meet frame refresh deadlines ($\ge 60\text{ Hz}$ / $\le 16.6\text{ms}$).
+- **REQ-22 (Software Acoustic & Thermal Governor):** The worker daemon shall continuously sample GPU junction temperature and automatically throttle execution duty cycle to maintain temperatures below 62°C, preventing hardware cooling fans from exceeding 32 dBA.
+- **REQ-23 (Elastic VRAM Dynamic Headroom):** In stealth regulated mode, the worker shall flush temporary PyTorch CUDA allocators and maintain $\ge 4.5\text{ GB}$ of unreserved physical VRAM for hardware-accelerated desktop applications (browsers, Office suite, video decoders).
+- **REQ-24 (Orchestrator Adaptive Stealth Routing & PoDS Grace Period):** The orchestrator scheduler shall dynamically route asynchronous inference and relaxed PoDS micro-slices to workers reporting `"stealth"` telemetry, extending task slice timeouts from 15s to 60s to prevent unfair slashing.
+
 ---
 
 ### 3.2 External Interface Requirements
@@ -115,6 +122,7 @@ Requirements are stated in unambiguous, verifiable terms using the standard "The
   - Training Studio for dataset upload, job launch, and live interactive loss curves.
   - Model Serving Playground with prompt submission and live streaming token output.
   - API Token Management table with copy-to-clipboard functionality.
+  - Worker Node Dashboard with "Always Silent" mode toggle and live stealth/unleashed state badges.
 
 #### Software Interfaces
 - **INT-02 (Storage S3):** MinIO S3 API over HTTP port 9000 using standard AWS S3 client libraries (`boto3`).
@@ -129,6 +137,8 @@ Requirements are stated in unambiguous, verifiable terms using the standard "The
 - **NFR-01 (API Response Latency):** 95% of non-streaming inference requests shall have a Time-to-First-Token (TTFT) under 450 ms for warm workers.
 - **NFR-02 (Throughput Capacity):** The orchestrator API shall sustain at least 250 requests per second across gateway endpoints with CPU utilization below 75%.
 - **NFR-03 (Worker Dispatch Speed):** Task dispatch latency from job submission to worker claiming shall be under 1.5 seconds under standard queue load.
+- **NFR-11 (Zero Desktop UI Jitter):** Interactive desktop performance shall experience zero perceivable frame drops or typing delays ($\text{DWM composition latency} < 16.6\text{ ms}$) during concurrent stealth compute execution.
+- **NFR-12 (Acoustic Noise Ceiling):** In "Always Silent" mode, worker hardware fan noise shall not exceed 35 dBA at a distance of 1.0 meter.
 
 #### Reliability & Availability
 - **NFR-04 (Service Availability):** The core orchestrator and inference gateway shall achieve 99.5% uptime during production operations.
@@ -159,10 +169,12 @@ flowchart TD
         UC05["UC-05: Download Model Checkpoint"]
         UC06["UC-06: Process Worker Payout"]
         UC07["UC-07: Stake & Slash Worker Node"]
+        UC08["UC-08: Execute Always Silent Regulation"]
         
         UC02 -.->|«include»| UC05
         UC03 -.->|«include»| UC06
         UC04 -.->|«extend»| UC07
+        UC04 -.->|«extend»| UC08
     end
 
     Client(("Enterprise Client<br/>(ML Engineer)"))
@@ -176,6 +188,7 @@ flowchart TD
 
     Worker --> UC04
     Worker --> UC06
+    Worker --> UC08
 
     Admin --> UC07
 ```
@@ -241,6 +254,25 @@ flowchart TD
   - *2a. No CUDA GPU Detected:* Worker client notifies user and defaults to CPU simulation mode with restricted task types.
   - *4a. Worker Staking Requirement Unmet:* System assigns worker `unverified` status with low-priority task allocation.
 - **Postconditions:** Worker node is displayed on the Cloud Console Fleet Telemetry page and eligible for jobs.
+
+---
+
+#### UC-08: Execute in Always Silent Regulated Mode
+- **Use Case ID:** UC-08
+- **Actor:** GPU Host Worker / Desktop User ("Jon")
+- **Preconditions:** Worker daemon is launched with `--always-silent` flag or toggled ON via the Cloud Console.
+- **Main Success Flow:**
+  1. Worker operates 24/7 in background without manual user pause or stop commands.
+  2. While the desktop host is idle ($\text{idle} > 60\text{s}$), worker operates in **Unleashed Mode** (100% compute duty cycle, full batch throughput, maximum PoDS revenue).
+  3. When human presence is detected via OS input events ($\text{idle} < 2.0\text{s}$), the daemon transitions in $<200\text{ms}$ to **Stealth Regulated Mode**.
+  4. Worker delivers current micro-slice, releases cached VRAM allocations ($\ge 4.5\text{ GB}$ free), and paces future execution with $15\text{ms}–40\text{ms}$ yield sleeps.
+  5. Desktop Window Manager (`dwm.exe`/`WindowServer`) receives clear GPU queues; interactive desktop tasks (Excel, Web, VS Code) maintain 60/120/144 Hz frame rates with zero noticeable stutter.
+  6. Closed-loop software thermal governor restricts GPU junction temperature below 62°C, preventing hardware fans from exceeding whisper levels (<32 dBA).
+  7. When user presence ceases for 60 consecutive seconds, worker autonomously ramps back up to Unleashed Mode.
+- **Alternative Flows:**
+  - *3a. Fullscreen 3D Game / VR Launched:* Daemon detects `QUNS_RUNNING_D3D_FULL_SCREEN` and enters **Restricted Pause** (0% compute, yields 100% GPU until game exits).
+  - *4a. Active Video Playback:* If media audio/video decode is detected despite 0 mouse input, daemon remains in Stealth Regulated Mode to prevent fan noise during media consumption.
+- **Postconditions:** Continuous PoDS micro-rewards earned 24/7; zero desktop interference or user-perceived performance degradation.
 
 ---
 

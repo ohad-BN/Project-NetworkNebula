@@ -45,6 +45,7 @@ Each deliverable is assigned an immutable tracking identifier (`D-x`) traced thr
 | **D-5** | **React 19 Enterprise Cloud Console** | Responsive dark-mode web console with Training Studio (dataset upload, loss telemetry), Model Serving Hub (deployment, playground, cURL snippets), API Key Manager, and Cluster Telemetry. | TypeScript React 19 + Vite (`network-nebula/`) |
 | **D-6** | **Unified Verification Test Suite (STD/STP)** | Authoritative master test suite (`test_suite.py`) covering all architectural phases, database migrations, S3 bucket verification, worker heartbeats, and end-to-end pipeline execution with 100% green pass. | Automated Test Runner (`test_suite.py`) |
 | **D-7** | **Software Engineering Documentation Chain** | Complete suite of SE documents formatted to Ariel University standards (SOW, SRS, Use Cases, SDD, EDD, API Docs, STP, STD, Traceability Matrix, and README). | Markdown files in `/docs` and root |
+| **D-8** | **"Always Silent" Adaptive Compute Daemon & Acoustic-Thermal Governor** | Autonomous zero-privilege human presence sensing (`GetLastInputInfo`, `IOKit`, `XScreenSaver`), micro-duty-cycle GPU yielding (<8.3ms latency preservation), two-tier elastic VRAM reclamation, closed-loop thermal pacing (<62°C, <32 dBA), and throttled PoDS micro-slice execution. | Standalone CLI Agent Module (`worker/`, `nebula_worker.py`) |
 
 ---
 
@@ -75,7 +76,8 @@ flowchart LR
     M1["Milestone 1<br/><b>Architecture & Schemas</b><br/>Weeks 1-2 (Done)"] --> M2["Milestone 2<br/><b>Training & S3</b><br/>Weeks 3-4 (Done)"]
     M2 --> M3["Milestone 3<br/><b>OpenAI Gateway</b><br/>Weeks 5-6 (Done)"]
     M3 --> M4["Milestone 4<br/><b>React 19 Console</b><br/>Weeks 7-8 (Done)"]
-    M4 --> M5["Milestone 5<br/><b>Online MVP Cutover</b><br/>Weeks 9-10 (Current)"]
+    M4 --> M5["Milestone 5<br/><b>Online MVP Cutover</b><br/>Weeks 9-10 (Done)"]
+    M5 --> M6["Milestone 6<br/><b>Always Silent Stealth Daemon</b><br/>Weeks 11-12 (Planned)"]
 ```
 
 | Milestone | Deliverables Covered | Target Completion | Acceptance Gate & Exit Criteria |
@@ -85,6 +87,7 @@ flowchart LR
 | **M3: Inference & API Gateway** | D-3 | Week 6 | `/v1/chat/completions` serving valid responses to OpenAI SDK with accurate token deduction. |
 | **M4: Web Console Portal** | D-5 | Week 8 | React 19 UI compiles with zero TypeScript errors (`bun run build`), renders real-time telemetry. |
 | **M5: Public Deployment & Handover** | D-4, D-6, D-7 | Week 10 | Docker stack runs live online, standalone worker joins via network, master test suite passes 100%. |
+| **M6: Always Silent Regulation** | D-8 | Week 12 | Worker daemon operates 24/7 without user intervention; throttles to <30% duty cycle within 1.0s of user input; preserves 60/120/144 Hz desktop fluidity; caps GPU noise <32 dBA. |
 
 ---
 
@@ -100,7 +103,8 @@ Deliverables are evaluated and accepted according to the following criteria:
 | **AC-04** | **D-4 Worker Client** | Running `python nebula_worker.py` registers node, reports VRAM/GPU specs, and receives and returns inference results. | **PASSED** |
 | **AC-05** | **D-5 Web Console** | Web app loads on port 80/5173, allows generating API keys, viewing training curves, and executing playground requests. | **PASSED** |
 | **AC-06** | **D-6 Master Test Suite** | Running `python test_suite.py` executes all test phases with **0 failures** and **0 errors**. | **PASSED** |
-| **AC-07** | **D-7 Documentation** | SOW, SRS, SDD, EDD, API, STP, STD, and README documents present, cross-referenced, and matching course standards. | **IN PROGRESS** |
+| **AC-07** | **D-7 Documentation** | SOW, SRS, SDD, EDD, API, STP, STD, and README documents present, cross-referenced, and matching course standards. | **PASSED** |
+| **AC-08** | **D-8 Always Silent Daemon** | `nebula_worker.py --always-silent` detects OS-level user input in <150ns; automatically throttles duty cycle during interactive desktop usage; enforces whisper-quiet acoustics (<32 dBA); and resumes full capacity upon 60s idle cooldown. | **PLANNED** |
 
 ---
 

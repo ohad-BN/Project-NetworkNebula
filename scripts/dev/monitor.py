@@ -187,10 +187,15 @@ def render_dashboard(data: Dict[str, Any], url: str, is_paused: bool = False) ->
     out.append(f"{C.BOLD}{C.CYAN}{node_hdr}{C.RESET}")
     out.append(f"{C.DIM}{'─' * w_width}{C.RESET}")
 
-    if not nodes:
+    active_nodes_list = [n for n in nodes if str(n.get("status", "")).lower() in ("online", "busy")]
+    offline_nodes_list = [n for n in nodes if str(n.get("status", "")).lower() not in ("online", "busy")]
+    recent_offline = [n for n in offline_nodes_list if float(n.get("heartbeat_age_sec", 0.0) or 0.0) < 7200][:4]
+    display_nodes = active_nodes_list + (recent_offline if active_nodes_list else offline_nodes_list[:4])
+
+    if not display_nodes:
         out.append(f"  {C.YELLOW}(No worker nodes currently registered or connected){C.RESET}")
     else:
-        for n in nodes:
+        for n in display_nodes:
             nid = truncate(n.get("id", "unknown"), 16)
             arch_raw = str(n.get("compute_architecture") or "cuda").lower()
             if "mps" in arch_raw:
@@ -236,7 +241,14 @@ def render_dashboard(data: Dict[str, Any], url: str, is_paused: bool = False) ->
             elif st == "busy":
                 badge = f"{C.YELLOW}[BUSY]  {C.RESET}"
             else:
-                badge = f"{C.RED}[OFFLINE]{C.RESET}"
+                age_s = float(n.get("heartbeat_age_sec", 0.0) or 0.0)
+                if age_s < 3600:
+                    ago_lbl = f"{int(max(1, age_s // 60))}m"
+                elif age_s < 86400:
+                    ago_lbl = f"{int(age_s // 3600)}h"
+                else:
+                    ago_lbl = f"{int(age_s // 86400)}d"
+                badge = f"{C.DIM}{C.RED}[OFFLINE {ago_lbl}]{C.RESET}"
 
             line = f"{nid:<17} {gpu:<22} {reg:<17} {vram_str:<20} {util_bar:<21} {rate_str:<8} {badge}"
             out.append(line)
@@ -244,15 +256,15 @@ def render_dashboard(data: Dict[str, Any], url: str, is_paused: bool = False) ->
     # --------------------------------------------------------------------------
     # 4. Active Workloads & Shard Distribution
     # --------------------------------------------------------------------------
-    out.append(f"\n{C.BOLD}▶ LIVE WORKLOAD DISTRIBUTION & SHARD PROGRESSION{C.RESET}")
+    out.append(f"\n{C.BOLD}▶ LIVE WORKLOAD DISTRIBUTION & TRAINING PROGRESSION{C.RESET}")
     out.append(f"{C.DIM}{'─' * w_width}{C.RESET}")
-    task_hdr = f"{'TASK ID':<18} {'ASSIGNED NODE':<18} {'PROMPT / SHARD':<22} {'SLICES DELIVERED':<22} {'TIME':<8} {'STATUS':<10}"
+    task_hdr = f"{'TASK ID':<18} {'ASSIGNED NODE':<18} {'TYPE & WORKLOAD':<22} {'PROGRESS / SLICES':<22} {'TIME':<8} {'STATUS':<10}"
     out.append(f"{C.BOLD}{C.CYAN}{task_hdr}{C.RESET}")
     out.append(f"{C.DIM}{'─' * w_width}{C.RESET}")
 
-    active_tasks = [t for t in workloads if t.get("status") in ("PROCESSING", "QUEUED")][:8]
+    active_tasks = [t for t in workloads if t.get("status") in ("PROCESSING", "TRAINING", "RUNNING", "QUEUED")][:8]
     if not active_tasks:
-        recent_done = workloads[:3]
+        recent_done = workloads[:5]
         if recent_done:
             active_tasks = recent_done
 
@@ -263,21 +275,30 @@ def render_dashboard(data: Dict[str, Any], url: str, is_paused: bool = False) ->
             tid = truncate(t.get("task_id", ""), 17)
             w_assign = truncate(t.get("claimed_by", "unassigned") or "unassigned", 17)
             p_text = truncate(t.get("prompt", "Inference"), 21)
-            
+
             tot_s = max(1, int(t.get("total_slices", 1) or 1))
             comp_s = int(t.get("completed_slices", 0) or 0)
             s_pct = (comp_s / float(tot_s)) * 100.0
-            slice_bar = f"{comp_s}/{tot_s} {make_bar(s_pct, width=6)}"
             
+            is_training = t.get("task_type") == "training" or str(t.get("task_id", "")).startswith("train-")
+            if is_training:
+                slice_bar = f"Ep {comp_s}/{tot_s} {make_bar(s_pct, width=5)}"
+            else:
+                slice_bar = f"Sl {comp_s}/{tot_s} {make_bar(s_pct, width=5)}"
+
             t_sec = f"{float(t.get('total_compute_seconds', 0.0)):.1f}s"
-            
+
             st = str(t.get("status", "QUEUED")).upper()
-            if st == "PROCESSING":
-                st_badge = f"{C.MAGENTA}PROCESS{C.RESET}"
+            if st in ("PROCESSING", "RUNNING"):
+                st_badge = f"{C.MAGENTA}RUNNING{C.RESET}"
+            elif st == "TRAINING":
+                st_badge = f"{C.CYAN}TRAIN  {C.RESET}"
             elif st == "QUEUED":
                 st_badge = f"{C.YELLOW}QUEUED {C.RESET}"
-            elif st == "SUCCESS":
+            elif st in ("SUCCESS", "COMPLETED"):
                 st_badge = f"{C.GREEN}SUCCESS{C.RESET}"
+            elif st in ("CANCELLED", "CANCEL"):
+                st_badge = f"{C.YELLOW}CANCEL {C.RESET}"
             else:
                 st_badge = f"{C.RED}{st[:7]}{C.RESET}"
 

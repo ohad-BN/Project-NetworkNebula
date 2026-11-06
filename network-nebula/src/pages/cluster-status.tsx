@@ -13,6 +13,15 @@ import {
   Play,
   Pause,
   Trash2,
+  Moon,
+  Zap,
+  Gamepad2,
+  VolumeX,
+  GitBranch,
+  ArrowUpCircle,
+  RefreshCw,
+  Globe,
+  CheckCircle2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,6 +31,7 @@ import {
   workersService,
   type ClusterNodeTelemetry,
 } from "@/services/api/workers";
+import { systemService, type SystemStatusData, type GitCheckUpdateData } from "@/services/api/system";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
 
@@ -33,6 +43,57 @@ export function ClusterStatusPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [copiedJoinCmd, setCopiedJoinCmd] = useState(false);
   const [updatingNodeId, setUpdatingNodeId] = useState<string | null>(null);
+
+  // Central Server & Zero-Touch Deployment state
+  const [systemStatus, setSystemStatus] = useState<SystemStatusData | null>(null);
+  const [updateCheck, setUpdateCheck] = useState<GitCheckUpdateData | null>(null);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isDeployingUpdate, setIsDeployingUpdate] = useState(false);
+
+  // Fetch Central Server status
+  const fetchSystemStatus = useCallback(async () => {
+    try {
+      const data = await systemService.getStatus();
+      setSystemStatus(data);
+    } catch {
+      // non-blocking
+    }
+  }, []);
+
+  const handleCheckUpdate = async () => {
+    try {
+      setIsCheckingUpdate(true);
+      const res = await systemService.checkUpdate();
+      setUpdateCheck(res);
+      if (res.update_available) {
+        toast.info(`New update available (${res.commits_behind} commit${res.commits_behind === 1 ? "" : "s"} behind)`);
+      } else {
+        toast.success("Server is up to date with origin/main");
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || "Failed to check for updates");
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
+  const handleDeployUpdate = async () => {
+    try {
+      setIsDeployingUpdate(true);
+      const res = await systemService.applyUpdate();
+      if (res.success) {
+        toast.success(`Server updated to ${res.new_commit}! Reloading status...`);
+        setUpdateCheck(null);
+        await fetchSystemStatus();
+      } else {
+        toast.error(`Update failed: ${res.message}`);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || "Failed to deploy update");
+    } finally {
+      setIsDeployingUpdate(false);
+    }
+  };
 
   // Fetch strictly user's fleet
   const fetchTelemetry = useCallback(async (showToast = false) => {
@@ -56,9 +117,13 @@ export function ClusterStatusPage() {
 
   useEffect(() => {
     fetchTelemetry(false);
-    const interval = setInterval(() => fetchTelemetry(false), 12000);
+    fetchSystemStatus();
+    const interval = setInterval(() => {
+      fetchTelemetry(false);
+      fetchSystemStatus();
+    }, 12000);
     return () => clearInterval(interval);
-  }, [fetchTelemetry]);
+  }, [fetchTelemetry, fetchSystemStatus]);
 
   // Handle remote slider adjustment per GPU
   const handleSliderChange = async (targetWorkerId: string, newPct: number, gpuIndex?: number) => {
@@ -129,10 +194,12 @@ export function ClusterStatusPage() {
   const allocatedVram = nodes.reduce((acc, n) => acc + (n.vram_allocated_gb || 0), 0);
   const totalEarnings = nodes.reduce((acc, n) => acc + (n.total_earnings_usd || 0), 0);
   const totalRate = nodes.reduce((acc, n) => acc + (n.hourly_rate_usd || 0.45), 0);
-  const activeMachines = nodes.filter((n) => n.status === "online" && n.is_available).length;
+  const activeMachines = nodes.filter((n) => (n.status === "online" || n.status === "busy") && (n.is_available ?? true)).length;
+  const stealthCount = nodes.filter((n) => Boolean(n.is_always_silent) || n.work_capacity_state === "stealth_regulated").length;
+  const unleashedCount = nodes.filter((n) => !Boolean(n.is_always_silent) && n.work_capacity_state !== "stealth_regulated").length;
 
-  const originUrl = window.location.origin.includes("localhost:5173")
-    ? "http://localhost:8000"
+  const originUrl = window.location.port === "5173"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
     : window.location.origin;
   const joinCmd = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
 
@@ -180,7 +247,7 @@ export function ClusterStatusPage() {
       </div>
 
       {/* Fleet Overview Grid */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <Card>
           <CardHeader className="p-4 sm:p-5 pb-2">
             <CardDescription className="text-xs flex items-center gap-1.5">
@@ -221,6 +288,22 @@ export function ClusterStatusPage() {
           </CardHeader>
           <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground">
             Active allocation ceiling
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="p-4 sm:p-5 pb-2">
+            <CardDescription className="text-xs flex items-center gap-1.5">
+              <VolumeX className="h-3.5 w-3.5 text-cyan-400" />
+              Regulation State
+            </CardDescription>
+            <CardTitle className="text-lg font-bold text-cyan-300 font-mono">
+              {stealthCount > 0 ? `${stealthCount} Silent` : "All Burst"}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-4 sm:p-5 pt-0 text-[11px] text-muted-foreground flex justify-between items-center">
+            <span>{unleashedCount} Burst • {stealthCount} Silent</span>
+            <Link to="/worker" className="text-cyan-400 hover:underline">Manage</Link>
           </CardContent>
         </Card>
 
@@ -294,6 +377,125 @@ export function ClusterStatusPage() {
         </CardContent>
       </Card>
 
+      {/* Zero-Touch Central Server & In-Browser Remote Deployment */}
+      <Card className="border-border/60 bg-card/60 backdrop-blur-sm">
+        <CardHeader className="p-4 sm:p-5 pb-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+                <Globe className="h-4 w-4 text-cyan-400" />
+              </div>
+              <div>
+                <CardTitle className="text-base font-semibold flex items-center gap-2">
+                  Central Server & Zero-Touch Deployment
+                  <Badge variant="outline" className="text-[10px] bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse mr-1" />
+                    Online
+                  </Badge>
+                </CardTitle>
+                <CardDescription className="text-xs">
+                  Headless host: <span className="font-mono text-foreground font-medium">{systemStatus?.hostname || "Local Node"}</span> • {systemStatus?.os || "Loading..."} • Uptime: {systemStatus?.uptime_human || "..."}
+                </CardDescription>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleCheckUpdate}
+                disabled={isCheckingUpdate || isDeployingUpdate}
+                className="gap-1.5 text-xs h-8"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${isCheckingUpdate ? "animate-spin text-cyan-400" : ""}`} />
+                {isCheckingUpdate ? "Checking..." : "Check Updates"}
+              </Button>
+
+              {updateCheck?.update_available ? (
+                <Button
+                  size="sm"
+                  onClick={handleDeployUpdate}
+                  disabled={isDeployingUpdate}
+                  className="gap-1.5 text-xs h-8 bg-emerald-600 hover:bg-emerald-700 text-white"
+                >
+                  <ArrowUpCircle className={`h-3.5 w-3.5 ${isDeployingUpdate ? "animate-spin" : ""}`} />
+                  {isDeployingUpdate ? "Deploying..." : "1-Click Deploy & Update"}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        </CardHeader>
+
+        <CardContent className="p-4 sm:p-5 pt-0 space-y-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
+              <span className="text-muted-foreground flex items-center gap-1">
+                <GitBranch className="h-3 w-3 text-primary" /> Active Branch & Commit
+              </span>
+              <p className="font-mono font-medium truncate text-foreground">
+                {systemStatus?.git?.branch || "main"} @ {systemStatus?.git?.commit || "..."}
+              </p>
+            </div>
+
+            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
+              <span className="text-muted-foreground flex items-center gap-1">
+                <Cpu className="h-3 w-3 text-cyan-400" /> Server CPU Load
+              </span>
+              <p className="font-mono font-medium text-foreground">
+                {systemStatus?.resources?.cpu_percent ?? 0}%
+              </p>
+            </div>
+
+            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
+              <span className="text-muted-foreground flex items-center gap-1">
+                <HardDrive className="h-3 w-3 text-purple-400" /> Host Memory
+              </span>
+              <p className="font-mono font-medium text-foreground">
+                {systemStatus?.resources?.memory_used_gb ?? 0} / {systemStatus?.resources?.memory_total_gb ?? 0} GB ({systemStatus?.resources?.memory_percent ?? 0}%)
+              </p>
+            </div>
+
+            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
+              <span className="text-muted-foreground flex items-center gap-1">
+                <Globe className="h-3 w-3 text-emerald-400" /> Remote Access
+              </span>
+              <p className="font-mono font-medium text-foreground truncate">
+                {systemStatus?.tailscale_ip ? `Tailscale: ${systemStatus.tailscale_ip}` : (systemStatus?.local_ips?.[0] ? `LAN: ${systemStatus.local_ips[0]}` : "Local")}
+              </p>
+            </div>
+          </div>
+
+          {updateCheck?.update_available ? (
+            <div className="p-3 rounded-md border border-cyan-500/30 bg-cyan-500/10 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="space-y-0.5">
+                <p className="font-semibold text-cyan-300">
+                  New Code Commit Available: {updateCheck.remote_commit} ({updateCheck.commits_behind} commit{updateCheck.commits_behind === 1 ? "" : "s"} behind)
+                </p>
+                {updateCheck.pending_commits?.[0] && (
+                  <p className="text-muted-foreground font-mono text-[11px] truncate">
+                    &bull; {updateCheck.pending_commits[0]}
+                  </p>
+                )}
+              </div>
+              <Button
+                size="sm"
+                onClick={handleDeployUpdate}
+                disabled={isDeployingUpdate}
+                className="gap-1.5 text-xs h-7 self-start sm:self-auto bg-cyan-600 hover:bg-cyan-700 text-white"
+              >
+                <ArrowUpCircle className="h-3.5 w-3.5" />
+                Deploy Now
+              </Button>
+            </div>
+          ) : updateCheck && !updateCheck.update_available ? (
+            <div className="p-2.5 rounded-md border border-emerald-500/20 bg-emerald-500/5 text-xs flex items-center gap-2 text-emerald-400">
+              <CheckCircle2 className="h-4 w-4" />
+              <span>Server is fully up to date with origin/main. Zero physical maintenance needed.</span>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
       {/* Active GPU Nodes Table */}
       <Card>
         <CardHeader className="p-4 sm:p-5 pb-3 border-b">
@@ -333,15 +535,51 @@ export function ClusterStatusPage() {
                     const allocPct = gpu.vram_allocation_pct ?? 80;
                     const isUpdating = updatingNodeId === `${node.node_id || node.id}-${gpu.index}`;
                     const ping = node.latency_ping_ms ?? 12.0;
-                    const isOnline = node.status === "online" && node.is_available;
+                    const isAvailable = node.is_available ?? true;
+                    const isBusy = isAvailable && (node.status === "busy" || Boolean(node.current_task_id));
+                    const isOnline = isAvailable && node.status === "online" && !isBusy;
+                    const isPaused = !isAvailable;
+                    const dotColor = isBusy
+                      ? "bg-blue-400 animate-ping"
+                      : isOnline
+                      ? "bg-emerald-400 animate-pulse"
+                      : isPaused
+                      ? "bg-amber-500"
+                      : "bg-zinc-500";
                     const vramAlloc = gpu.vram_allocated_gb || (gpu.vram_total_gb * allocPct / 100);
 
                     return (
                       <tr key={key} className="hover:bg-muted/20 transition-colors">
                         <td className="py-3.5 px-4">
                           <div className="font-bold text-foreground flex items-center gap-2">
-                            <span className={`h-2 w-2 rounded-full shrink-0 ${isOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`} />
+                            <span className={`h-2 w-2 rounded-full shrink-0 ${dotColor}`} />
                             {node.system_name || node.name}
+                            {isBusy && (
+                              <Badge variant="outline" className="text-[9px] bg-blue-500/10 text-blue-400 border-blue-500/30 font-mono py-0 px-1">
+                                BUSY
+                              </Badge>
+                            )}
+                            {isPaused && (
+                              <Badge variant="outline" className="text-[9px] bg-amber-500/10 text-amber-400 border-amber-500/30 font-mono py-0 px-1">
+                                PAUSED
+                              </Badge>
+                            )}
+                            {node.work_capacity_state === "restricted_pause" ? (
+                              <Badge variant="outline" className="text-[9px] bg-amber-500/10 text-amber-300 border-amber-500/30 font-mono py-0 px-1 flex items-center gap-0.5">
+                                <Gamepad2 className="h-2.5 w-2.5 text-amber-400" />
+                                GAMING YIELD
+                              </Badge>
+                            ) : node.work_capacity_state === "stealth_regulated" || Boolean(node.is_always_silent) ? (
+                              <Badge variant="outline" className="text-[9px] bg-cyan-500/10 text-cyan-300 border-cyan-500/30 font-mono py-0 px-1 flex items-center gap-0.5">
+                                <Moon className="h-2.5 w-2.5 text-cyan-400" />
+                                SILENT ({node.duty_cycle_pct ?? 33}%)
+                              </Badge>
+                            ) : (
+                              <Badge variant="outline" className="text-[9px] bg-emerald-500/10 text-emerald-400 border-emerald-500/30 font-mono py-0 px-1 flex items-center gap-0.5">
+                                <Zap className="h-2.5 w-2.5 text-emerald-400" />
+                                BURST
+                              </Badge>
+                            )}
                           </div>
                           <div className="text-[11px] text-muted-foreground font-mono">
                             {node.node_id || node.id}
@@ -386,7 +624,7 @@ export function ClusterStatusPage() {
                               min={10}
                               max={100}
                               step={5}
-                              disabled={isUpdating || !isOnline}
+                              disabled={isUpdating || isPaused}
                               onValueChange={(val) => handleSliderChange(node.node_id || node.id, val, gpu.index)}
                               className="cursor-pointer"
                             />
@@ -408,10 +646,10 @@ export function ClusterStatusPage() {
                               size="sm"
                               variant="outline"
                               className="h-7 w-7 p-0"
-                              title={isOnline ? "Pause Node" : "Resume Node"}
-                              onClick={() => handleToggleAvailability(node.node_id || node.id, node.is_available)}
+                              title={isPaused ? "Resume Node (Start accepting tasks)" : "Pause Node (Stop receiving tasks)"}
+                              onClick={() => handleToggleAvailability(node.node_id || node.id, isAvailable)}
                             >
-                              {isOnline ? <Pause className="h-3 w-3 text-amber-400" /> : <Play className="h-3 w-3 text-emerald-400" />}
+                              {isPaused ? <Play className="h-3 w-3 text-emerald-400" /> : <Pause className="h-3 w-3 text-amber-400" />}
                             </Button>
                             <Button
                               size="sm"

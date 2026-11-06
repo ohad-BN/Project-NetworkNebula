@@ -561,6 +561,108 @@ def run_tests(quick: bool = False):
                 db_pods.query(ComputeSlice).filter(ComputeSlice.task_id == test_task_id).delete()
                 db_pods.query(DBTask).filter(DBTask.task_id == test_task_id).delete()
                 db_pods.commit()
+
+                # --- Phase 1: Always Silent Presence & Activity Sensing Engine ---
+                from worker.stealth_sensor import StealthPresenceSensor
+                p1_sensor = StealthPresenceSensor(idle_threshold_sec=2.0, cooldown_seconds=5.0)
+                t_bench_start = time.perf_counter()
+                for _ in range(500):
+                    _ = p1_sensor.get_os_idle_seconds()
+                p1_latency_us = ((time.perf_counter() - t_bench_start) / 500) * 1e6
+                p1_tel = p1_sensor.get_telemetry()
+                p1_sensor.close()
+                p1_ok = (
+                    p1_latency_us < 200.0
+                    and "state" in p1_tel
+                    and p1_tel["state"] in ("unleashed", "stealth_regulated", "restricted_pause")
+                )
+                suite.record(
+                    p1_ok,
+                    f"Stealth Presence Sensor: latency {p1_latency_us:.2f}us (<200us budget), state={p1_tel['state']}, platform={p1_tel['platform']}"
+                )
+
+                # --- Phase 2: Closed-Loop Acoustic-Thermal Governor & Micro-Duty Pacer ---
+                from worker.silent_governor import SilentThermalGovernor
+                p2_gov = SilentThermalGovernor(sensor=p1_sensor, target_temp_c=62.0, duty_ratio=2.0)
+                y_calc = p2_gov.calculate_yield_duration(0.020, presence_state="stealth_regulated", gpu_temp_c=50)
+                y_therm = p2_gov.calculate_yield_duration(0.020, presence_state="stealth_regulated", gpu_temp_c=72)
+                vram_info = p2_gov.reclaim_vram_headroom()
+                p2_stream = p2_gov.get_compute_stream()
+                p2_gov.close()
+                p2_ok = (
+                    abs(y_calc - 0.040) < 0.005
+                    and abs(y_therm - 0.140) < 0.005
+                    and "freed_mb" in vram_info
+                )
+                suite.record(
+                    p2_ok,
+                    f"Acoustic-Thermal Governor: 20ms compute -> {y_calc*1000:.0f}ms yield (duty<=33%), 72C thermal expansion -> {y_therm*1000:.0f}ms"
+                )
+
+                # --- Phase 3: Always Silent Standalone CLI Integration ---
+                cli_silent_proc = subprocess.run(
+                    [
+                        sys.executable,
+                        WORKER_SCRIPT,
+                        "join",
+                        "--server", BASE_URL,
+                        "--worker-id", "node-gpu-local-01",
+                        "--always-silent",
+                        "--target-temp", "62.0",
+                        "--cooldown-sec", "10.0",
+                        "--once",
+                        "--json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                silent_json = {}
+                if cli_silent_proc.returncode == 0:
+                    try:
+                        silent_json = json.loads(cli_silent_proc.stdout.strip())
+                    except Exception:
+                        pass
+                p3_ok = (
+                    cli_silent_proc.returncode == 0
+                    and silent_json.get("always_silent") is True
+                    and "work_capacity_state" in silent_json
+                )
+                suite.record(
+                    p3_ok,
+                    f"CLI 'nebula_worker.py join --always-silent --once': capacity={silent_json.get('work_capacity_state')}, temp={silent_json.get('gpu_temp_c')}C"
+                )
+                # --- Phase 4: Orchestrator Fleet Management & Adaptive Scheduling ---
+                from tests.test_orchestrator_stealth_routing import run_phase4_tests
+                p4_ok = run_phase4_tests()
+                suite.record(
+                    p4_ok,
+                    "Orchestrator Fleet and Scheduling: Straggler Exclusion, Capacity Routing and Dynamic Timeout Scaling (TC-028..TC-034)"
+                )
+
+                # --- Phase 5: Web Console UI Dashboard & Live Telemetry Controls ---
+                from tests.test_phase5_ui_contracts import run_phase5_tests
+                p5_ok = run_phase5_tests()
+                suite.record(
+                    p5_ok,
+                    "Web Console UI Dashboard: Always Silent Switches, Live Capacity Badges & Telemetry Contracts (TC-035..TC-038)"
+                )
+
+                # --- Phase 6: End-to-End Always Silent Simulation (Jon's 24h Day) ---
+                from tests.test_always_silent_complete import run_phase6_tests
+                p6_ok = run_phase6_tests()
+                suite.record(
+                    p6_ok,
+                    "End-to-End System Simulation: 'Jon's 24h Day' Lifecycle (Night, Morning, Gaming, Lunch, Ledger) (TC-039..TC-044)"
+                )
+
+                # --- Zero-Touch Server & Remote In-Browser Management ---
+                from tests.test_system_router import run_system_tests
+                sys_ok = run_system_tests()
+                suite.record(
+                    sys_ok,
+                    "Zero-Touch Server & Remote In-Browser Management: Health, Git Sync & Remote Control"
+                )
             finally:
                 db_pods.close()
         except Exception as e:
@@ -5298,6 +5400,44 @@ def run_tests(quick: bool = False):
         )
     except Exception as e:
         suite.record(False, "Phase 8 Alpha Verification & Faucet Suite", str(e))
+
+    # =========================================================================
+    # Phase 9: Always Silent Worker — Presence & Sensing Engine (TC-015..TC-018)
+    # =========================================================================
+    print("\n" + "=" * 65)
+    print("   Phase 9: Always Silent Worker — Presence & Activity Sensing Engine")
+    print("=" * 65 + "\n")
+
+    try:
+        from tests.test_stealth_sensor import run_phase1_tests
+        p1_success = run_phase1_tests()
+        suite.record(p1_success, "Phase 1 Stealth Presence Sensing Engine Suite (TC-015..TC-018)")
+
+        from tests.test_silent_governor import run_phase2_tests
+        p2_success = run_phase2_tests()
+        suite.record(p2_success, "Phase 2 Acoustic-Thermal Governor Suite (TC-019..TC-024)")
+
+        from tests.test_worker_always_silent import run_phase3_tests
+        p3_success = run_phase3_tests()
+        suite.record(p3_success, "Phase 3 Always Silent Worker CLI Suite (TC-024..TC-027)")
+
+        from tests.test_orchestrator_stealth_routing import run_phase4_tests
+        p4_success = run_phase4_tests()
+        suite.record(p4_success, "Phase 4 Orchestrator Fleet and Capacity Scheduling Suite (TC-028..TC-034)")
+
+        from tests.test_phase5_ui_contracts import run_phase5_tests
+        p5_success = run_phase5_tests()
+        suite.record(p5_success, "Phase 5 Web Console UI Dashboard & Live Telemetry Contracts Suite (TC-035..TC-038)")
+
+        from tests.test_always_silent_complete import run_phase6_tests
+        p6_success = run_phase6_tests()
+        suite.record(p6_success, "Phase 6 End-to-End System Simulation & Acoustic Benchmark Suite (TC-039..TC-044)")
+
+        from tests.test_system_router import run_system_tests
+        sys_success = run_system_tests()
+        suite.record(sys_success, "Zero-Touch Server & Remote In-Browser Management Suite")
+    except Exception as e:
+        suite.record(False, "Phase 1 Stealth Presence Sensing Suite", str(e))
 
     # Automatic Teardown: Purge synthetic test workers so only real hardware persists
     try:
