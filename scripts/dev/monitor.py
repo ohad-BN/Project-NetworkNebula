@@ -389,8 +389,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--url",
+        "--server",
+        dest="url",
         default=os.environ.get("NEBULA_SERVER_URL", "http://127.0.0.1:8000"),
-        help="FastAPI orchestrator URL (default: http://127.0.0.1:8000)",
+        help="FastAPI orchestrator URL (default: http://127.0.0.1:8000 or $NEBULA_SERVER_URL)",
     )
     parser.add_argument(
         "--interval",

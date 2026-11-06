@@ -5,5 +5,5 @@ echo ========================================================
 echo   Project NetworkNebula - Zero-Touch Auto-Updater
 echo   Watches GitHub 'main' and auto-deploys updates.
 echo ========================================================
-python scripts/auto_updater.py --interval 60
+python scripts/auto_updater.py --interval 120
 pause

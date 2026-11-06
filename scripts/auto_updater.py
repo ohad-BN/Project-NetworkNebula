@@ -125,28 +125,32 @@ def check_and_apply_update(branch: str = "main", reload_docker: bool = True) -> 
     return True
 
 
-def run_daemon(interval: int = 60, branch: str = "main", reload_docker: bool = True):
-    """Run the continuous monitoring loop."""
+def run_daemon(interval: int = 120, branch: str = "main", reload_docker: bool = True):
+    """Run the continuous monitoring loop with error backoff to protect GitHub rate limits."""
     logger.info("=" * 60)
     logger.info("NetworkNebula Zero-Touch Auto-Updater Daemon Started")
     logger.info(f"Project directory: {PROJECT_ROOT}")
     logger.info(f"Tracking branch:   origin/{branch}")
-    logger.info(f"Poll interval:     {interval} seconds")
+    logger.info(f"Poll interval:     {interval} seconds (safe against GitHub rate limits)")
     logger.info(f"Current commit:    {get_commit_hash('HEAD')[:7]}")
     logger.info("=" * 60)
 
+    backoff = 0
     while True:
         try:
-            check_and_apply_update(branch=branch, reload_docker=reload_docker)
+            success = check_and_apply_update(branch=branch, reload_docker=reload_docker)
+            backoff = 0
         except Exception as e:
             logger.error(f"Error in update loop: {e}")
+            backoff = min(backoff + 30, 300)
 
-        time.sleep(interval)
+        sleep_time = interval + backoff
+        time.sleep(sleep_time)
 
 
 def main():
     parser = argparse.ArgumentParser(description="NetworkNebula Zero-Touch Auto-Updater Daemon")
-    parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
+    parser.add_argument("--interval", type=int, default=120, help="Poll interval in seconds (default: 120s)")
     parser.add_argument("--branch", type=str, default="main", help="Git branch to track (default: main)")
     parser.add_argument("--no-docker", action="store_true", help="Skip Docker compose reload on update")
     parser.add_argument("--once", action="store_true", help="Check and apply updates once, then exit")
