@@ -613,7 +613,7 @@ if ($Key -and $Key.Trim() -ne "") {{
 }}
 
 Write-Host "[*] Starting GPU Worker Node & Connecting Telemetry Tunnel..." -ForegroundColor Cyan
-& $pythonCmd $workerScript join --server $HostUrl $apiKeyArg --tunnel
+& $pythonCmd $workerScript work --server $HostUrl $apiKeyArg --tunnel --auto-claim
 '''
     return PlainTextResponse(script, media_type="text/plain")
 
@@ -662,7 +662,7 @@ if [ -n "$KEY" ]; then
 fi
 
 echo "[*] Starting GPU Worker Node & Connecting Telemetry Tunnel..."
-exec $PYTHON_CMD nebula_worker.py join --server "$SERVER_URL" $API_KEY_ARG --tunnel
+exec $PYTHON_CMD nebula_worker.py work --server "$SERVER_URL" $API_KEY_ARG --tunnel --auto-claim
 '''
     return PlainTextResponse(script, media_type="text/plain")
 

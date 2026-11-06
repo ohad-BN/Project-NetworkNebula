@@ -21,8 +21,14 @@ from typing import Dict, Any, List, Optional, Tuple, Callable
 
 import numpy as np
 import torch
-import peft
-import safetensors.torch
+try:
+    import peft
+except ImportError:
+    peft = None
+try:
+    import safetensors.torch
+except ImportError:
+    safetensors = None
 
 from app.distributed import (
     GradientAggregator,

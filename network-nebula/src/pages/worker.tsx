@@ -205,7 +205,7 @@ export function WorkerDashboardPage() {
     : window.location.origin;
 
   const powershellBootstrapper = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
-  const powershellLocalCmd = `python nebula_worker.py join --server ${originUrl} --api-key ${apiKey} --tunnel`;
+  const powershellLocalCmd = `python nebula_worker.py work --server ${originUrl} --api-key ${apiKey} --tunnel --auto-claim`;
   const bashBootstrapper = `curl -sSL "${originUrl}/connect.sh?key=${apiKey}" | bash`;
   const bashLocalCmd = `./scripts/run_worker.sh --api-key ${apiKey}`;
 

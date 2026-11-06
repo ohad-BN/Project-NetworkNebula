@@ -134,7 +134,24 @@ def _get_git_info() -> SystemGitInfo:
         ).decode("utf-8").strip()
         is_dirty = len(diff_stat) > 0
     except Exception:
-        pass
+        try:
+            git_dir = os.path.join(PROJECT_ROOT, ".git")
+            head_file = os.path.join(git_dir, "HEAD")
+            if os.path.isfile(head_file):
+                with open(head_file, "r") as hf:
+                    ref = hf.read().strip()
+                if ref.startswith("ref: "):
+                    rel_ref = ref.split("ref: ")[1].strip()
+                    branch = rel_ref.split("/")[-1]
+                    ref_file = os.path.join(git_dir, rel_ref.replace("/", os.sep))
+                    if os.path.isfile(ref_file):
+                        with open(ref_file, "r") as rf:
+                            full_commit = rf.read().strip()
+                            commit = full_commit[:7]
+                            message = f"Autonomous update on {branch}"
+                            timestamp = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            pass
 
     return SystemGitInfo(
         commit=commit,

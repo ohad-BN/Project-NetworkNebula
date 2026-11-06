@@ -19,5 +19,7 @@ torch>=2.0.0
 diffusers>=0.25.0
 transformers>=4.36.0
 accelerate>=0.25.0
+peft>=0.7.0
+safetensors>=0.4.0
 # xformers>=0.0.24  # Optional; PyTorch 2.0+ native SDPA is used by default for zero-crash acceleration
 websockets>=13.0

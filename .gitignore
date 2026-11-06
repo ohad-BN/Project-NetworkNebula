@@ -50,7 +50,7 @@ venv.bak/
 # Frontend dependencies & production builds
 node_modules/
 network-nebula/node_modules/
-network-nebula/dist/
+# network-nebula/dist/
 network-nebula/dist-ssr/
 *.tsbuildinfo
 test-results/

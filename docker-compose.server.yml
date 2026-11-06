@@ -100,6 +100,9 @@ services:
       minio:
         condition: service_started
     volumes:
+      - ./app:/app/app:ro
+      - ./worker:/app/worker:ro
+      - ./nebula_worker.py:/app/nebula_worker.py:ro
       - model_cache:/models/cache
       - ./.git:/app/.git:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -130,6 +133,8 @@ services:
       minio:
         condition: service_started
     volumes:
+      - ./app:/app/app:ro
+      - ./worker:/app/worker:ro
       - model_cache:/models/cache
     command: celery -A app.worker.celery_app worker --loglevel=info -P solo
     healthcheck:
@@ -147,6 +152,9 @@ services:
     ports:
       - "80:80"
       - "5173:80"
+    volumes:
+      - ./network-nebula/dist:/usr/share/nginx/html:ro
+      - ./network-nebula/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - api
 

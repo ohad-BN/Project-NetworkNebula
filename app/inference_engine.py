@@ -19,7 +19,10 @@ from typing import Dict, Any, List, Optional, Tuple, Generator
 
 import requests
 import torch
-import peft
+try:
+    import peft
+except ImportError:
+    peft = None
 from transformers import TextIteratorStreamer
 
 from app.model_cache import model_cache, DEFAULT_FOUNDATION_MODEL
