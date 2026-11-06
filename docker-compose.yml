@@ -51,7 +51,7 @@ services:
               capabilities: [gpu]
 
   db:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     environment:
       - POSTGRES_USER=nebula
       - POSTGRES_PASSWORD=nebula123
