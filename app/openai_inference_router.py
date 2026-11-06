@@ -353,28 +353,6 @@ def create_chat_completion(
     # Dispatch inference to worker
     raw_messages = [{"role": m.role, "content": m.content} for m in payload.messages]
 
-    try:
-        # Run inference via Celery task or local inline
-        worker_res = serve_inference_request(
-            model=actual_model,
-            messages=raw_messages,
-            temperature=payload.temperature or 0.7,
-            max_tokens=payload.max_tokens or 512,
-            endpoint_id=endpoint_id,
-            adapter_url=adapter_url
-        )
-    except Exception as e:
-        print(f"[GATEWAY] Worker inference execution error: {e}")
-        worker_res = {
-            "content": f"Response from {payload.model} via NetworkNebula enterprise GPU cluster.",
-            "prompt_tokens": 12,
-            "completion_tokens": 20,
-            "total_tokens": 32,
-            "latency_ms": 50.0
-        }
-
-    completion_text = worker_res["content"]
-
     # Handle Server-Sent Events (SSE) Streaming
     if payload.stream:
         # If endpoint_id provided, record request in telemetry
@@ -443,6 +421,28 @@ def create_chat_completion(
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    try:
+        # Run inference via Celery task or local inline
+        worker_res = serve_inference_request(
+            model=actual_model,
+            messages=raw_messages,
+            temperature=payload.temperature or 0.7,
+            max_tokens=payload.max_tokens or 512,
+            endpoint_id=endpoint_id,
+            adapter_url=adapter_url
+        )
+    except Exception as e:
+        print(f"[GATEWAY] Worker inference execution error: {e}")
+        worker_res = {
+            "content": f"Response from {payload.model} via NetworkNebula enterprise GPU cluster.",
+            "prompt_tokens": 12,
+            "completion_tokens": 20,
+            "total_tokens": 32,
+            "latency_ms": 50.0
+        }
+
+    completion_text = worker_res["content"]
 
     # Standard Non-Streaming JSON Response
     return {

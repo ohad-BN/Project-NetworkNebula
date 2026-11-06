@@ -569,19 +569,26 @@ def cmd_join(args: argparse.Namespace) -> int:
                 hb_data_loop["input_idle_sec"] = tel["idle_sec"]
                 hb_data_loop["gpu_temp_c"] = tel["gpu_temp_c"]
                 hb_data_loop["duty_cycle_pct"] = 100 if tel["state"] == "unleashed" else (0 if tel["state"] == "restricted_pause" else 33)
-            r_hb = requests.post(
-                f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
-                headers=headers,
-                json=hb_data_loop,
-                timeout=10,
-            )
-            if r_hb.status_code == 200:
-                new_pct = r_hb.json().get("vram_allocation_pct", server_pct)
-                if new_pct != server_pct:
-                    server_pct = new_pct
-                    apply_vram_limit(server_pct)
+            try:
+                r_hb = requests.post(
+                    f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
+                    headers=headers,
+                    json=hb_data_loop,
+                    timeout=15,
+                )
+                if r_hb.status_code == 200:
+                    new_pct = r_hb.json().get("vram_allocation_pct", server_pct)
+                    if new_pct != server_pct:
+                        server_pct = new_pct
+                        apply_vram_limit(server_pct)
+                        if not args.json:
+                            print(f"[NEBULA_WORKER] Updated GPU contribution limit to {server_pct}% from orchestrator.")
+                else:
                     if not args.json:
-                        print(f"[NEBULA_WORKER] Updated GPU contribution limit to {server_pct}% from orchestrator.")
+                        print(f"[NEBULA_WORKER] Heartbeat notice: server returned HTTP {r_hb.status_code} (retrying in background...)")
+            except Exception as hb_err:
+                if not args.json:
+                    print(f"[NEBULA_WORKER] Heartbeat network jitter: {hb_err} (reconnecting in {args.interval}s...)")
     except KeyboardInterrupt:
         if not args.json:
             print("\n[NEBULA_WORKER] Shutting down worker agent gracefully.")
@@ -817,122 +824,142 @@ def cmd_work(args: argparse.Namespace) -> int:
 
         async def _work_over_tunnel():
             nonlocal tasks_completed, total_earnings
-            async with websockets.connect(ws_url, open_timeout=10) as ws:
-                init_frame = json.loads(await ws.recv())
-                if not args.json:
-                    auth_state = f"authenticated ({init_frame.get('user_id')})" if init_frame.get("authenticated") else "guest (unlinked)"
-                    print(f"[*] Connected over WebSocket tunnel as {auth_state} | Node ID: {worker_id}")
+            reconnect_delay = 2.0
+            while max_tasks <= 0 or tasks_completed < max_tasks:
+                try:
+                    async with websockets.connect(ws_url, open_timeout=15, ping_interval=20, ping_timeout=20) as ws:
+                        init_frame = json.loads(await ws.recv())
+                        if not args.json:
+                            auth_state = f"authenticated ({init_frame.get('user_id')})" if init_frame.get("authenticated") else "guest (unlinked)"
+                            print(f"[*] Connected over WebSocket tunnel as {auth_state} | Node ID: {worker_id}")
+                        reconnect_delay = 2.0
 
-                while max_tasks <= 0 or tasks_completed < max_tasks:
-                    # Restricted gaming pause check
-                    if always_silent and sensor:
-                        p_state = sensor.evaluate_presence_state()
-                        if p_state == "restricted_pause":
+                        while max_tasks <= 0 or tasks_completed < max_tasks:
+                            # Restricted gaming pause check
+                            if always_silent and sensor:
+                                p_state = sensor.evaluate_presence_state()
+                                if p_state == "restricted_pause":
+                                    if not args.json:
+                                        print(f"[STEALTH] Restricted pause active (exclusive 3D application running). Yielding 100% compute.")
+                                    if governor:
+                                        governor.reclaim_vram_headroom()
+                                    await asyncio.sleep(2.0)
+                                    if max_tasks > 0 and getattr(args, "once", False):
+                                        break
+                                    continue
+
+                            # Request / claim task
+                            auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
+                            await ws.send(json.dumps({"type": "claim_task", "auto_create": auto_claim_flag}))
+                            dispatch_raw = await ws.recv()
+                            dispatch_msg = json.loads(dispatch_raw)
+
+                            if dispatch_msg.get("type") == "no_tasks":
+                                if not args.json:
+                                    print(f"[WORKER] Standing by for cluster tasks... (idle)")
+                                await asyncio.sleep(args.interval)
+                                continue
+
+                            if dispatch_msg.get("type") != "task_dispatch":
+                                await asyncio.sleep(args.interval)
+                                continue
+
+                            task_data = dispatch_msg.get("task", {})
+                            task_id = task_data.get("task_id")
+                            prompt = task_data.get("prompt", "Neural forward pass")
+                            tot_slices = int(task_data.get("total_slices", 1) or 1)
+                            start_slice = int(task_data.get("resume_slice_index", 1) or 1)
+                            last_chk = task_data.get("last_checkpoint_url")
+
+                            if not args.json and start_slice > 1:
+                                print(f"[PoDS] Resuming task {task_id[:12]} from slice #{start_slice}/{tot_slices} (checkpoint: {last_chk})")
+
+                            # Step 1: Send progress (10%)
+                            await ws.send(json.dumps({
+                                "type": "task_progress",
+                                "task_id": task_id,
+                                "progress": 10.0,
+                            }))
+                            prog_ack = json.loads(await ws.recv())
+
+                            # Step 2: Execute compute slices and stream PoDS submissions
+                            task_slice_earned = 0.0
+                            last_compute_sec = 0.05
+                            for s_idx in range(start_slice, tot_slices + 1):
+                                slice_t0 = time.time()
+                                dev_obj, dev_type = resolve_tensor_device()
+                                stream = governor.get_compute_stream(dev_obj) if governor else None
+                                execute_tensor_compute_slice(dev_obj, dev_type, stream=stream)
+                                compute_sec = round(max(0.02, time.time() - slice_t0), 3)
+                                last_compute_sec = compute_sec
+
+                                pacing_res = None
+                                if always_silent and governor:
+                                    pacing_res = governor.yield_gpu_queue(compute_sec)
+                                    if not args.json and pacing_res.get("yield_duration_s", 0) > 0:
+                                        print(f"[STEALTH PACER] Slice #{s_idx} compute: {compute_sec:.3f}s | Yield: {pacing_res['yield_duration_s']:.3f}s | State: {pacing_res['state']} | Duty: {pacing_res['effective_duty_cycle_pct']}% | Temp: {pacing_res['gpu_temp_c']}°C")
+
+                                payload_str = f"pods_slice_{task_id}_{s_idx}_{worker_id}"
+                                payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+                                chk_url = f"http://localhost:9000/nebula-renders/checkpoints/{task_id}_s{s_idx}.pt"
+
+                                slice_msg = {
+                                    "type": "slice_submit",
+                                    "task_id": task_id,
+                                    "slice_index": s_idx,
+                                    "compute_time_sec": compute_sec,
+                                    "payload_hash": payload_hash,
+                                    "payload_data": payload_str,
+                                    "checkpoint_url": chk_url,
+                                }
+                                if always_silent and sensor:
+                                    slice_msg["work_capacity_state"] = sensor.evaluate_presence_state()
+
+                                await ws.send(json.dumps(slice_msg))
+                                slice_ack = json.loads(await ws.recv())
+                                s_earned = float(slice_ack.get("reward_usd", 0.0))
+                                task_slice_earned += s_earned
+                                if not args.json:
+                                    print(f"[PoDS] Slice #{s_idx}/{tot_slices} delivered | {compute_sec:.2f}s compute | +${s_earned:.6f} minted | Proof: {payload_hash[:10]}...")
+
+                            result_payload = {
+                                "status": "completed",
+                                "prompt": prompt,
+                                "completion": f"Processed autonomously by {worker_id} within {vram_pct}% VRAM limit.",
+                                "latency_ms": round(last_compute_sec * 1000 + 40.0, 2),
+                                "tokens": 32,
+                                "slices_delivered": tot_slices,
+                            }
+
+                            # Step 3: Complete task
+                            await ws.send(json.dumps({
+                                "type": "task_complete",
+                                "task_id": task_id,
+                                "result": result_payload,
+                            }))
+                            complete_ack = json.loads(await ws.recv())
+                            earned = complete_ack.get("earnings", task_slice_earned)
+                            total_earnings += max(earned, task_slice_earned)
+                            tasks_completed += 1
+
                             if not args.json:
-                                print(f"[STEALTH] Restricted pause active (exclusive 3D application running). Yielding 100% compute.")
-                            if governor:
-                                governor.reclaim_vram_headroom()
-                            await asyncio.sleep(2.0)
-                            if max_tasks > 0 and getattr(args, "once", False):
+                                print(f"[WORKER] Task {task_id[:12]} completed via tunnel | +${earned:.4f} | Total: ${total_earnings:.4f}")
+
+                            if max_tasks > 0 and tasks_completed >= max_tasks:
                                 break
-                            continue
-
-                    # Request / claim task
-                    auto_claim_flag = bool(args.auto_claim or max_tasks > 0)
-                    await ws.send(json.dumps({"type": "claim_task", "auto_create": auto_claim_flag}))
-                    dispatch_raw = await ws.recv()
-                    dispatch_msg = json.loads(dispatch_raw)
-
-                    if dispatch_msg.get("type") == "no_tasks":
-                        if not args.json:
-                            print(f"[WORKER] Standing by for cluster tasks... (idle)")
-                        await asyncio.sleep(args.interval)
-                        continue
-
-                    if dispatch_msg.get("type") != "task_dispatch":
-                        await asyncio.sleep(args.interval)
-                        continue
-
-                    task_data = dispatch_msg.get("task", {})
-                    task_id = task_data.get("task_id")
-                    prompt = task_data.get("prompt", "Neural forward pass")
-                    tot_slices = int(task_data.get("total_slices", 1) or 1)
-                    start_slice = int(task_data.get("resume_slice_index", 1) or 1)
-                    last_chk = task_data.get("last_checkpoint_url")
-
-                    if not args.json and start_slice > 1:
-                        print(f"[PoDS] Resuming task {task_id[:12]} from slice #{start_slice}/{tot_slices} (checkpoint: {last_chk})")
-
-                    # Step 1: Send progress (10%)
-                    await ws.send(json.dumps({
-                        "type": "task_progress",
-                        "task_id": task_id,
-                        "progress": 10.0,
-                    }))
-                    prog_ack = json.loads(await ws.recv())
-
-                    # Step 2: Execute compute slices and stream PoDS submissions
-                    task_slice_earned = 0.0
-                    last_compute_sec = 0.05
-                    for s_idx in range(start_slice, tot_slices + 1):
-                        slice_t0 = time.time()
-                        dev_obj, dev_type = resolve_tensor_device()
-                        stream = governor.get_compute_stream(dev_obj) if governor else None
-                        execute_tensor_compute_slice(dev_obj, dev_type, stream=stream)
-                        compute_sec = round(max(0.02, time.time() - slice_t0), 3)
-                        last_compute_sec = compute_sec
-
-                        pacing_res = None
-                        if always_silent and governor:
-                            pacing_res = governor.yield_gpu_queue(compute_sec)
-                            if not args.json and pacing_res.get("yield_duration_s", 0) > 0:
-                                print(f"[STEALTH PACER] Slice #{s_idx} compute: {compute_sec:.3f}s | Yield: {pacing_res['yield_duration_s']:.3f}s | State: {pacing_res['state']} | Duty: {pacing_res['effective_duty_cycle_pct']}% | Temp: {pacing_res['gpu_temp_c']}°C")
-
-                        payload_str = f"pods_slice_{task_id}_{s_idx}_{worker_id}"
-                        payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
-                        chk_url = f"http://localhost:9000/nebula-renders/checkpoints/{task_id}_s{s_idx}.pt"
-
-                        slice_msg = {
-                            "type": "slice_submit",
-                            "task_id": task_id,
-                            "slice_index": s_idx,
-                            "compute_time_sec": compute_sec,
-                            "payload_hash": payload_hash,
-                            "payload_data": payload_str,
-                            "checkpoint_url": chk_url,
-                        }
-                        if always_silent and sensor:
-                            slice_msg["work_capacity_state"] = sensor.evaluate_presence_state()
-
-                        await ws.send(json.dumps(slice_msg))
-                        slice_ack = json.loads(await ws.recv())
-                        s_earned = float(slice_ack.get("reward_usd", 0.0))
-                        task_slice_earned += s_earned
-                        if not args.json:
-                            print(f"[PoDS] Slice #{s_idx}/{tot_slices} delivered | {compute_sec:.2f}s compute | +${s_earned:.6f} minted | Proof: {payload_hash[:10]}...")
-
-                    result_payload = {
-                        "status": "completed",
-                        "prompt": prompt,
-                        "completion": f"Processed autonomously by {worker_id} within {vram_pct}% VRAM limit.",
-                        "latency_ms": round(last_compute_sec * 1000 + 40.0, 2),
-                        "tokens": 32,
-                        "slices_delivered": tot_slices,
-                    }
-
-                    # Step 3: Complete task
-                    await ws.send(json.dumps({
-                        "type": "task_complete",
-                        "task_id": task_id,
-                        "result": result_payload,
-                    }))
-                    complete_ack = json.loads(await ws.recv())
-                    earned = complete_ack.get("earnings", task_slice_earned)
-                    total_earnings += max(earned, task_slice_earned)
-                    tasks_completed += 1
-
+                except asyncio.CancelledError:
+                    break
+                except (KeyboardInterrupt, SystemExit):
+                    break
+                except Exception as ws_err:
+                    if max_tasks > 0 and tasks_completed >= max_tasks:
+                        break
+                    if getattr(args, "once", False) and tasks_completed > 0:
+                        break
                     if not args.json:
-                        print(f"[WORKER] Task {task_id[:12]} completed via tunnel | +${earned:.4f} | Total: ${total_earnings:.4f}")
+                        print(f"[TUNNEL] Connection dropped ({ws_err}). Auto-reconnecting in {reconnect_delay:.1f}s...")
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(30.0, reconnect_delay * 1.5)
 
             res_tunnel_dict = {
                 "status": "completed",
@@ -1087,9 +1114,11 @@ def cmd_work(args: argparse.Namespace) -> int:
                     if not args.json:
                         print(f"[WORKER] Task {task_id[:12]} completed via REST | +${earned:.4f} | Total: ${total_earnings:.4f}")
             except Exception as e:
-                if args.json:
+                if args.json and (max_tasks > 0 or getattr(args, "once", False)):
                     print(json.dumps({"status": "error", "error": str(e)}))
                     return 1
+                if not args.json:
+                    print(f"[WORKER] REST task polling note: {e} (retrying in {args.interval}s...)")
                 time.sleep(args.interval)
 
         summary = {

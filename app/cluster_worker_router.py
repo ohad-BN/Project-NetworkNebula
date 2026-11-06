@@ -240,78 +240,85 @@ def resolve_optional_user(
     return None
 
 
-def sync_primary_local_worker(db: Session) -> Worker:
+def sync_primary_local_worker(db: Session) -> Optional[Worker]:
     """Ensure the primary local worker node is registered and synced with live hardware & geo metrics."""
-    hw = probe_local_gpu_hardware()
-    geo = resolve_node_location()
-    worker_id = LOCAL_PRIMARY_NODE_ID
-    worker = db.query(Worker).filter(Worker.id == worker_id).first()
-    if not worker:
-        owner = db.query(User).filter(User.is_worker == True).first() or db.query(User).first()
-        worker = Worker(
-            id=worker_id,
-            user_id=owner.id if owner else None,
-            name=f"{hw['hostname']} ({hw['gpu_model']})",
-            gpu_info=hw["gpu_model"],
-            status="online",
-            cpu_cores=hw["cpu_cores"],
-            memory_gb=hw["memory_gb"],
-            gpu_memory_gb=hw["vram_total_gb"],
-            vram_used_gb=hw["vram_used_gb"],
-            vram_allocation_pct=80,
-            gpu_utilization_pct=hw["gpu_utilization_pct"],
-            cuda_version=hw.get("runtime_version") or hw.get("cuda_version", "12.8"),
-            gpus_json=json.dumps(hw["gpus"]),
-            role="LoRA Training & Fast Serving",
-            hourly_rate_usd=0.45,
-            total_earnings_usd=0.0,
-            is_available=True,
-            total_tasks_completed=0,
-            region=geo.get("region", "us-east"),
-            latency_ping_ms=geo.get("latency_ping_ms", 12.0),
-            compute_architecture=hw.get("compute_architecture", "cuda"),
-            hardware_tier=hw.get("hardware_tier", "consumer_gpu"),
-            device_brand=hw.get("gpu_vendor", "Generic"),
-            country=geo.get("country"),
-            city=geo.get("city"),
-            public_ip=geo.get("public_ip"),
-            is_unified_memory=hw.get("is_unified_memory", False),
-            supported_task_types=hw.get("supported_task_types", "inference,training"),
-            last_heartbeat=datetime.utcnow(),
-        )
-        db.add(worker)
-        db.commit()
-        db.refresh(worker)
-    else:
-        worker.gpu_info = hw["gpu_model"]
-        worker.gpu_memory_gb = hw["vram_total_gb"]
-        worker.vram_used_gb = hw["vram_used_gb"]
-        worker.cuda_version = hw.get("runtime_version") or hw.get("cuda_version", "12.8")
-        worker.compute_architecture = hw.get("compute_architecture", "cuda")
-        worker.hardware_tier = hw.get("hardware_tier", "consumer_gpu")
-        worker.device_brand = hw.get("gpu_vendor", "Generic")
-        worker.is_unified_memory = hw.get("is_unified_memory", False)
-        worker.supported_task_types = hw.get("supported_task_types", "inference,training")
-        cur_pct = worker.vram_allocation_pct or 80
-        for g in hw["gpus"]:
-            g["vram_allocation_pct"] = cur_pct
-            g["vram_allocated_gb"] = round(float(g.get("vram_total_gb", 8.0)) * (cur_pct / 100.0), 2)
-        worker.gpus_json = json.dumps(hw["gpus"])
-        if not getattr(worker, "region", None) or worker.region == "us-east":
-            worker.region = geo.get("region", "us-east")
-        if not getattr(worker, "country", None):
-            worker.country = geo.get("country")
-            worker.city = geo.get("city")
-            worker.public_ip = geo.get("public_ip")
-        if getattr(worker, "latency_ping_ms", None) is None:
-            worker.latency_ping_ms = geo.get("latency_ping_ms", 12.0)
-        if worker.status == "offline" and worker.is_available:
-            worker.status = "online"
-        worker.last_heartbeat = datetime.utcnow()
-        db.commit()
-        db.commit()
-        db.refresh(worker)
-    return worker
+    try:
+        hw = probe_local_gpu_hardware()
+        geo = resolve_node_location()
+        worker_id = LOCAL_PRIMARY_NODE_ID
+        worker = db.query(Worker).filter(Worker.id == worker_id).first()
+        if not worker:
+            owner = db.query(User).filter(User.is_worker == True).first() or db.query(User).first()
+            worker = Worker(
+                id=worker_id,
+                user_id=owner.id if owner else None,
+                name=f"{hw['hostname']} ({hw['gpu_model']})",
+                gpu_info=hw["gpu_model"],
+                status="online",
+                cpu_cores=hw["cpu_cores"],
+                memory_gb=hw["memory_gb"],
+                gpu_memory_gb=hw["vram_total_gb"],
+                vram_used_gb=hw["vram_used_gb"],
+                vram_allocation_pct=80,
+                gpu_utilization_pct=hw["gpu_utilization_pct"],
+                cuda_version=hw.get("runtime_version") or hw.get("cuda_version", "12.8"),
+                gpus_json=json.dumps(hw["gpus"]),
+                role="LoRA Training & Fast Serving",
+                hourly_rate_usd=0.45,
+                total_earnings_usd=0.0,
+                is_available=True,
+                total_tasks_completed=0,
+                region=geo.get("region", "us-east"),
+                latency_ping_ms=geo.get("latency_ping_ms", 12.0),
+                compute_architecture=hw.get("compute_architecture", "cuda"),
+                hardware_tier=hw.get("hardware_tier", "consumer_gpu"),
+                device_brand=hw.get("gpu_vendor", "Generic"),
+                country=geo.get("country"),
+                city=geo.get("city"),
+                public_ip=geo.get("public_ip"),
+                is_unified_memory=hw.get("is_unified_memory", False),
+                supported_task_types=hw.get("supported_task_types", "inference,training"),
+                last_heartbeat=datetime.utcnow(),
+            )
+            db.add(worker)
+            db.commit()
+            db.refresh(worker)
+        else:
+            worker.gpu_info = hw["gpu_model"]
+            worker.gpu_memory_gb = hw["vram_total_gb"]
+            worker.vram_used_gb = hw["vram_used_gb"]
+            worker.cuda_version = hw.get("runtime_version") or hw.get("cuda_version", "12.8")
+            worker.compute_architecture = hw.get("compute_architecture", "cuda")
+            worker.hardware_tier = hw.get("hardware_tier", "consumer_gpu")
+            worker.device_brand = hw.get("gpu_vendor", "Generic")
+            worker.is_unified_memory = hw.get("is_unified_memory", False)
+            worker.supported_task_types = hw.get("supported_task_types", "inference,training")
+            cur_pct = worker.vram_allocation_pct or 80
+            for g in hw["gpus"]:
+                g["vram_allocation_pct"] = cur_pct
+                g["vram_allocated_gb"] = round(float(g.get("vram_total_gb", 8.0)) * (cur_pct / 100.0), 2)
+            worker.gpus_json = json.dumps(hw["gpus"])
+            if not getattr(worker, "region", None) or worker.region == "us-east":
+                worker.region = geo.get("region", "us-east")
+            if not getattr(worker, "country", None):
+                worker.country = geo.get("country")
+                worker.city = geo.get("city")
+                worker.public_ip = geo.get("public_ip")
+            if getattr(worker, "latency_ping_ms", None) is None:
+                worker.latency_ping_ms = geo.get("latency_ping_ms", 12.0)
+            if worker.status == "offline" and worker.is_available:
+                worker.status = "online"
+            worker.last_heartbeat = datetime.utcnow()
+            db.commit()
+            db.refresh(worker)
+        return worker
+    except Exception as e:
+        logger.warning(f"Could not sync primary local worker: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
 
 
 def serialize_worker_node(w: Worker) -> Dict[str, Any]:
@@ -594,11 +601,9 @@ Write-Host "[+] Using Python: $(& $pythonCmd --version)" -ForegroundColor Green
 
 # 2. Fetch latest nebula_worker.py
 $workerScript = "nebula_worker.py"
-if (-not (Test-Path $workerScript)) {{
-    Write-Host "[*] Fetching latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
-    Invoke-WebRequest -Uri "$HostUrl/nebula_worker.py" -OutFile $workerScript -UseBasicParsing
-    Write-Host "[+] Downloaded nebula_worker.py." -ForegroundColor Green
-}}
+Write-Host "[*] Synchronizing latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
+Invoke-WebRequest -Uri "$HostUrl/nebula_worker.py" -OutFile $workerScript -UseBasicParsing
+Write-Host "[+] Synchronized nebula_worker.py." -ForegroundColor Green
 
 # 3. Launch Worker Agent
 $apiKeyArg = ""
@@ -646,11 +651,9 @@ fi
 
 echo "[+] Using Python: $($PYTHON_CMD --version)"
 
-if [ ! -f "nebula_worker.py" ]; then
-    echo "[*] Fetching latest nebula_worker.py from $SERVER_URL..."
-    curl -fsSL "$SERVER_URL/nebula_worker.py" -o nebula_worker.py
-    echo "[+] Downloaded nebula_worker.py."
-fi
+echo "[*] Synchronizing latest nebula_worker.py from $SERVER_URL..."
+curl -fsSL "$SERVER_URL/nebula_worker.py" -o nebula_worker.py
+echo "[+] Synchronized nebula_worker.py."
 
 API_KEY_ARG=""
 if [ -n "$KEY" ]; then
@@ -725,7 +728,12 @@ def get_cluster_telemetry(
     if not is_test_runner:
         workers = [w for w in workers if is_real_hardware_node(w)]
 
-    node_list = [serialize_worker_node(w) for w in workers]
+    node_list = []
+    for w in workers:
+        try:
+            node_list.append(serialize_worker_node(w))
+        except Exception as e:
+            logger.warning(f"Could not serialize worker node {getattr(w, 'id', 'unknown')}: {e}")
 
     total_vram = round(sum(n["vram_total_gb"] for n in node_list), 2)
     allocated_vram = round(sum(n["vram_allocated_gb"] for n in node_list), 2)

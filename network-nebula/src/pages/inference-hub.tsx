@@ -216,13 +216,20 @@ export function InferenceHubPage() {
         { role: "user", content: userPrompt },
       ];
 
+      const storedKey = localStorage.getItem("api_key") || "";
+      const streamHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (storedKey) {
+        streamHeaders["Authorization"] = `Bearer ${storedKey}`;
+        streamHeaders["X-API-Key"] = storedKey;
+      }
+
       if (isStream) {
         const streamEndpoint = typeof window !== "undefined" && window.location.port !== "5173"
           ? "/v1/chat/completions"
-          : "http://localhost:8000/v1/chat/completions";
+          : `${window.location.protocol}//${window.location.hostname}:8000/v1/chat/completions`;
         const response = await fetch(streamEndpoint, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: streamHeaders,
           body: JSON.stringify({
             model: selectedModel,
             messages,
@@ -230,25 +237,33 @@ export function InferenceHubPage() {
           }),
         });
 
+        if (!response.ok) {
+          const errData = await response.json().catch(() => null);
+          throw new Error(errData?.detail || `Inference error: HTTP ${response.status}`);
+        }
+
         if (!response.body) throw new Error("No readable stream");
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let accumulated = "";
+        let buffer = "";
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const chunk = decoder.decode(value);
-          const lines = chunk.split("\n");
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
           for (const line of lines) {
-            if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("data: ") && !trimmed.includes("[DONE]")) {
               try {
-                const parsed = JSON.parse(line.slice(6));
+                const parsed = JSON.parse(trimmed.slice(6));
                 const text = parsed.choices?.[0]?.delta?.content || "";
                 accumulated += text;
                 setPlaygroundOutput(accumulated);
               } catch {
-                // Ignore parse chunk
+                // Ignore partial JSON parse chunk
               }
             }
           }
@@ -269,7 +284,7 @@ export function InferenceHubPage() {
         fetchEndpoints();
       }
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || "Inference call failed");
+      toast.error(err.message || err.response?.data?.detail || "Inference call failed");
     } finally {
       setIsGenerating(false);
     }
