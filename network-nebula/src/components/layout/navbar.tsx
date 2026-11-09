@@ -1,3 +1,15 @@
+import { useEffect, useCallback } from "react";
+import { getApiBaseUrl, setApiBaseUrl } from "@/services/api/client";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
@@ -64,6 +76,47 @@ interface NavbarProps {
 }
 
 export function Navbar({ user, onLogout }: NavbarProps) {
+  const [isApiDialogOpen, setIsApiDialogOpen] = useState(false);
+  const [currentApiUrl, setCurrentApiUrl] = useState(() => getApiBaseUrl());
+  const [inputApiUrl, setInputApiUrl] = useState(() => getApiBaseUrl());
+  const [apiHealth, setApiHealth] = useState<"checking" | "online" | "offline">("checking");
+
+  const checkHealth = useCallback(async (urlToCheck?: string) => {
+    const target = (urlToCheck !== undefined ? urlToCheck : currentApiUrl) || getApiBaseUrl();
+    if (!target) {
+      setApiHealth("offline");
+      return;
+    }
+    setApiHealth("checking");
+    try {
+      const res = await fetch(`${target}/health`, { method: "GET", signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        setApiHealth("online");
+      } else {
+        setApiHealth("offline");
+      }
+    } catch {
+      setApiHealth("offline");
+    }
+  }, [currentApiUrl]);
+
+  useEffect(() => {
+    checkHealth();
+    const interval = setInterval(() => checkHealth(), 20000);
+    return () => clearInterval(interval);
+  }, [checkHealth]);
+
+  const handleSaveApi = () => {
+    setApiBaseUrl(inputApiUrl);
+    setCurrentApiUrl(inputApiUrl.trim().replace(/\/+$/, ""));
+    toast.success("Backend API URL updated!");
+    setIsApiDialogOpen(false);
+    checkHealth(inputApiUrl.trim().replace(/\/+$/, ""));
+    setTimeout(() => {
+      window.location.reload();
+    }, 500);
+  };
+
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
@@ -161,6 +214,103 @@ export function Navbar({ user, onLogout }: NavbarProps) {
                 </>
               )}
             </Button>
+
+                        {/* Backend API Connection Status Dialog */}
+            <Dialog open={isApiDialogOpen} onOpenChange={setIsApiDialogOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 h-8 text-xs px-2.5 border-border font-mono shrink-0"
+                  title={`Backend: ${currentApiUrl || "Not configured"}`}
+                >
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-full",
+                      apiHealth === "online"
+                        ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.7)] animate-pulse"
+                        : apiHealth === "checking"
+                        ? "bg-amber-400 animate-bounce"
+                        : "bg-rose-500"
+                    )}
+                  />
+                  <span className="hidden md:inline">
+                    {apiHealth === "online" ? "API Live" : apiHealth === "checking" ? "Connecting..." : "API Offline"}
+                  </span>
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-md">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <Server className="h-4 w-4 text-indigo-400" />
+                    Backend API Gateway
+                  </DialogTitle>
+                  <DialogDescription>
+                    Connect this web console to your live FastAPI orchestrator backend (local or Cloudflare Tunnel).
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4 py-2">
+                  <div className="flex items-center justify-between text-xs p-2.5 rounded-md bg-muted/50 border border-border">
+                    <span className="text-muted-foreground">Current Status:</span>
+                    <span
+                      className={cn(
+                        "font-semibold flex items-center gap-1.5",
+                        apiHealth === "online" ? "text-emerald-400" : "text-rose-400"
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "h-2 w-2 rounded-full",
+                          apiHealth === "online" ? "bg-emerald-400" : "bg-rose-400"
+                        )}
+                      />
+                      {apiHealth === "online" ? "Connected (Healthy)" : "Offline / Unreachable"}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium text-foreground">API Base URL</label>
+                    <Input
+                      value={inputApiUrl}
+                      onChange={(e) => setInputApiUrl(e.target.value)}
+                      placeholder="e.g. http://localhost:8000 or https://xxx.trycloudflare.com"
+                      className="font-mono text-xs"
+                    />
+                    <div className="flex gap-2 pt-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="text-[11px] h-7 px-2"
+                        onClick={() => {
+                          setInputApiUrl("http://localhost:8000");
+                          checkHealth("http://localhost:8000");
+                        }}
+                      >
+                        Localhost:8000
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="text-[11px] h-7 px-2"
+                        onClick={() => checkHealth(inputApiUrl)}
+                      >
+                        Test Connection
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex justify-end gap-2 pt-2">
+                  <Button variant="outline" size="sm" onClick={() => setIsApiDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" onClick={handleSaveApi}>
+                    Save & Connect
+                  </Button>
+                </div>
+              </DialogContent>
+            </Dialog>
 
             {user ? (
               <>

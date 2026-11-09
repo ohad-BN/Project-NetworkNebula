@@ -1,3 +1,4 @@
+import { getApiBaseUrl } from "@/services/api/client";
 import { useState, useEffect, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -200,9 +201,7 @@ export function WorkerDashboardPage() {
   const totalGpusCount = myNodes.reduce((acc, n) => acc + (n.gpus?.length || 1), 0);
 
   // Connection commands
-  const originUrl = window.location.origin.includes("localhost:5173")
-    ? "http://localhost:8000"
-    : window.location.origin;
+  const originUrl = getApiBaseUrl() || window.location.origin;
 
   const powershellBootstrapper = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
   const powershellLocalCmd = `python nebula_worker.py join --server ${originUrl} --api-key ${apiKey} --tunnel`;

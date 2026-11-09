@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { User } from "@/types";
+import { getApiBaseUrl } from "@/services/api/client";
 
 interface AuthState {
   user: User | null;
@@ -31,15 +32,7 @@ interface AuthActions {
 
 type AuthStore = AuthState & AuthActions;
 
-const getApiBase = (): string => {
-  if (typeof window !== "undefined") {
-    if (window.location.port === "5173") {
-      return "http://localhost:8000";
-    }
-    return "";
-  }
-  return "http://localhost:8000";
-};
+const getApiBase = getApiBaseUrl;
 
 export const useAuthStore = create<AuthStore>()(
   persist(

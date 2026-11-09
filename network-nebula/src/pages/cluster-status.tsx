@@ -1,3 +1,4 @@
+import { getApiBaseUrl } from "@/services/api/client";
 import { useState, useEffect, useCallback } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -140,9 +141,7 @@ export function ClusterStatusPage() {
   const stealthCount = nodes.filter((n) => Boolean(n.is_always_silent) || n.work_capacity_state === "stealth_regulated").length;
   const unleashedCount = nodes.filter((n) => !Boolean(n.is_always_silent) && n.work_capacity_state !== "stealth_regulated").length;
 
-  const originUrl = window.location.origin.includes("localhost:5173")
-    ? "http://localhost:8000"
-    : window.location.origin;
+  const originUrl = getApiBaseUrl() || window.location.origin;
   const joinCmd = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
 
   const copyJoinCommand = () => {

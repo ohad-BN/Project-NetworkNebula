@@ -2,12 +2,50 @@ import axios from "axios";
 
 export const getApiBaseUrl = (): string => {
   if (typeof window !== "undefined") {
-    if (window.location.port === "5173") {
+    // 1. Query parameter (?api=https://...)
+    const urlParams = new URLSearchParams(window.location.search);
+    const queryApi = urlParams.get("api");
+    if (queryApi && queryApi.trim()) {
+      const clean = queryApi.trim().replace(/\/+$/, "");
+      localStorage.setItem("nebula_api_url", clean);
+      return clean;
+    }
+
+    // 2. Saved in localStorage
+    const savedApi = localStorage.getItem("nebula_api_url");
+    if (savedApi && savedApi.trim()) {
+      return savedApi.trim().replace(/\/+$/, "");
+    }
+
+    // 3. Environment variable
+    const envApi = import.meta.env.VITE_API_URL;
+    if (envApi && typeof envApi === "string" && envApi.trim()) {
+      return envApi.trim().replace(/\/+$/, "");
+    }
+
+    // 4. Local dev port
+    if (
+      window.location.port === "5173" ||
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1"
+    ) {
       return "http://localhost:8000";
     }
+
     return "";
   }
   return "http://localhost:8000";
+};
+
+export const setApiBaseUrl = (url: string) => {
+  const clean = url.trim().replace(/\/+$/, "");
+  if (!clean) {
+    localStorage.removeItem("nebula_api_url");
+    apiClient.defaults.baseURL = getApiBaseUrl();
+  } else {
+    localStorage.setItem("nebula_api_url", clean);
+    apiClient.defaults.baseURL = clean;
+  }
 };
 
 const API_BASE_URL = getApiBaseUrl();
