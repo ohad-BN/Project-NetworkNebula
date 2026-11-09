@@ -74,6 +74,7 @@ services:
   # 4. FastAPI Backend Orchestrator & OpenAI Gateway
   # ----------------------------------------------------------------------------
   api:
+    image: project-networknebula-api:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -107,9 +108,7 @@ services:
   # 5. Celery Asynchronous Job Coordinator
   # ----------------------------------------------------------------------------
   celery:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: project-networknebula-api:latest
     container_name: nebula-celery
     restart: unless-stopped
     environment:
