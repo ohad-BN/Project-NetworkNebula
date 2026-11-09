@@ -43,26 +43,39 @@ ARCH=$(uname -m)
 echo -e "[*] Target User: ${BOLD}${TARGET_USER}${RESET} (Home: ${USER_HOME})"
 echo -e "[*] Detected Architecture: ${BOLD}${ARCH}${RESET}"
 
-# 2. Update System & Install Core Packages
+# 2. Update System & Install Core Packages (Universal Ubuntu & Oracle Linux)
 echo -e "\n${CYAN}[1/5] Updating system packages and installing prerequisites...${RESET}"
-export DEBIAN_FRONTEND=noninteractive
-$SUDO apt-get update -y -q
-$SUDO apt-get install -y -q \
-    curl \
-    wget \
-    git \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    iptables \
-    iptables-persistent \
-    netfilter-persistent
-
-# 3. Install Docker & Docker Compose Plugin if not installed
-echo -e "\n${CYAN}[2/5] Configuring Docker container runtime...${RESET}"
-if ! command -v docker >/dev/null 2>&1; then
-    echo "[*] Installing Docker Engine..."
-    $SUDO apt-get install -y -q docker.io docker-compose-v2
+if command -v apt-get >/dev/null 2>&1; then
+    # Ubuntu / Debian
+    export DEBIAN_FRONTEND=noninteractive
+    $SUDO apt-get update -y -q
+    $SUDO apt-get install -y -q \
+        curl \
+        wget \
+        git \
+        ca-certificates \
+        gnupg \
+        lsb-release \
+        iptables \
+        iptables-persistent \
+        netfilter-persistent
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "[*] Installing Docker Engine (apt)..."
+        $SUDO apt-get install -y -q docker.io docker-compose-v2
+    fi
+elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    # Oracle Linux / RHEL / CentOS
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+    echo "[*] Detected Red Hat/Oracle Linux system ($PKG_MGR)..."
+    $SUDO $PKG_MGR update -y -q
+    $SUDO $PKG_MGR install -y -q curl wget git iptables iptables-services || true
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "[*] Installing Docker Engine ($PKG_MGR)..."
+        $SUDO $PKG_MGR install -y -q yum-utils || true
+        $SUDO $PKG_MGR config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null || true
+        $SUDO $PKG_MGR install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin || $SUDO $PKG_MGR install -y -q docker podman-docker || true
+    fi
 fi
 
 # Ensure docker service is running
