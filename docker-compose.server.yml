@@ -1,0 +1,154 @@
+# ==============================================================================
+# Project NetworkNebula — Dedicated Server Docker Stack (Cloud Server / Oracle)
+# ==============================================================================
+# Starts all core services: Postgres, Redis, MinIO S3, FastAPI Orchestrator,
+# Celery Worker, and Nginx-hosted React 19 Frontend Console.
+#
+# Usage:
+#   docker compose -f docker-compose.server.yml up -d --build
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. PostgreSQL Database (Multi-Tenant Relational Store)
+  # ----------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: nebula-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nebula}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nebula123}
+      POSTGRES_DB: ${POSTGRES_DB:-nebula_db}
+    ports:
+      - "5432:5432"
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nebula} -d ${POSTGRES_DB:-nebula_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # 2. Redis (Cache, Message Broker & P2P Pub/Sub)
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: nebula-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # 3. MinIO S3 Object Storage (Checkpoints, Datasets & Adapter Safetensors)
+  # ----------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: nebula-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-nebula}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-nebula123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ----------------------------------------------------------------------------
+  # 4. FastAPI Backend Orchestrator & OpenAI Gateway
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nebula-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-nebula}:${POSTGRES_PASSWORD:-nebula123}@db:5432/${POSTGRES_DB:-nebula_db}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-nebula}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-nebula123}
+      - MINIO_BUCKET=nebula-datasets
+      - MODEL_CACHE_DIR=/models/cache
+      - APP_ENV=production
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - model_cache:/models/cache
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  # ----------------------------------------------------------------------------
+  # 5. Celery Asynchronous Job Coordinator
+  # ----------------------------------------------------------------------------
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nebula-celery
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-nebula}:${POSTGRES_PASSWORD:-nebula123}@db:5432/${POSTGRES_DB:-nebula_db}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-nebula}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-nebula123}
+      - MODEL_CACHE_DIR=/models/cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - model_cache:/models/cache
+    command: celery -A app.worker.celery_app worker --loglevel=info -P solo
+
+  # ----------------------------------------------------------------------------
+  # 6. React 19 Enterprise Cloud Console (Nginx Web Portal)
+  # ----------------------------------------------------------------------------
+  web:
+    build:
+      context: ./network-nebula
+      dockerfile: Dockerfile
+    container_name: nebula-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  model_cache:
