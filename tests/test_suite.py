@@ -655,14 +655,6 @@ def run_tests(quick: bool = False):
                     p6_ok,
                     "End-to-End System Simulation: 'Jon's 24h Day' Lifecycle (Night, Morning, Gaming, Lunch, Ledger) (TC-039..TC-044)"
                 )
-
-                # --- Zero-Touch Server & Remote In-Browser Management ---
-                from tests.test_system_router import run_system_tests
-                sys_ok = run_system_tests()
-                suite.record(
-                    sys_ok,
-                    "Zero-Touch Server & Remote In-Browser Management: Health, Git Sync & Remote Control"
-                )
             finally:
                 db_pods.close()
         except Exception as e:
@@ -5432,10 +5424,6 @@ def run_tests(quick: bool = False):
         from tests.test_always_silent_complete import run_phase6_tests
         p6_success = run_phase6_tests()
         suite.record(p6_success, "Phase 6 End-to-End System Simulation & Acoustic Benchmark Suite (TC-039..TC-044)")
-
-        from tests.test_system_router import run_system_tests
-        sys_success = run_system_tests()
-        suite.record(sys_success, "Zero-Touch Server & Remote In-Browser Management Suite")
     except Exception as e:
         suite.record(False, "Phase 1 Stealth Presence Sensing Suite", str(e))
 

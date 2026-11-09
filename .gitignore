@@ -6,7 +6,6 @@
 .env
 .env.*
 !.env.example
-!.env.server.example
 *.env
 *.key
 *.pem
@@ -27,6 +26,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+!network-nebula/src/lib/
 parts/
 sdist/
 var/
@@ -111,3 +111,6 @@ bin/
 .bin/
 cloudflared.exe
 
+
+# Agent scratch directories
+.agents/

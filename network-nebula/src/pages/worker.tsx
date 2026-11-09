@@ -200,8 +200,8 @@ export function WorkerDashboardPage() {
   const totalGpusCount = myNodes.reduce((acc, n) => acc + (n.gpus?.length || 1), 0);
 
   // Connection commands
-  const originUrl = window.location.port === "5173"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
+  const originUrl = window.location.origin.includes("localhost:5173")
+    ? "http://localhost:8000"
     : window.location.origin;
 
   const powershellBootstrapper = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;

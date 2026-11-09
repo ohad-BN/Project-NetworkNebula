@@ -17,11 +17,6 @@ import {
   Zap,
   Gamepad2,
   VolumeX,
-  GitBranch,
-  ArrowUpCircle,
-  RefreshCw,
-  Globe,
-  CheckCircle2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -31,7 +26,6 @@ import {
   workersService,
   type ClusterNodeTelemetry,
 } from "@/services/api/workers";
-import { systemService, type SystemStatusData, type GitCheckUpdateData } from "@/services/api/system";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
 
@@ -44,56 +38,6 @@ export function ClusterStatusPage() {
   const [copiedJoinCmd, setCopiedJoinCmd] = useState(false);
   const [updatingNodeId, setUpdatingNodeId] = useState<string | null>(null);
 
-  // Central Server & Zero-Touch Deployment state
-  const [systemStatus, setSystemStatus] = useState<SystemStatusData | null>(null);
-  const [updateCheck, setUpdateCheck] = useState<GitCheckUpdateData | null>(null);
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
-  const [isDeployingUpdate, setIsDeployingUpdate] = useState(false);
-
-  // Fetch Central Server status
-  const fetchSystemStatus = useCallback(async () => {
-    try {
-      const data = await systemService.getStatus();
-      setSystemStatus(data);
-    } catch {
-      // non-blocking
-    }
-  }, []);
-
-  const handleCheckUpdate = async () => {
-    try {
-      setIsCheckingUpdate(true);
-      const res = await systemService.checkUpdate();
-      setUpdateCheck(res);
-      if (res.update_available) {
-        toast.info(`New update available (${res.commits_behind} commit${res.commits_behind === 1 ? "" : "s"} behind)`);
-      } else {
-        toast.success("Server is up to date with origin/main");
-      }
-    } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to check for updates");
-    } finally {
-      setIsCheckingUpdate(false);
-    }
-  };
-
-  const handleDeployUpdate = async () => {
-    try {
-      setIsDeployingUpdate(true);
-      const res = await systemService.applyUpdate();
-      if (res.success) {
-        toast.success(`Server updated to ${res.new_commit}! Reloading status...`);
-        setUpdateCheck(null);
-        await fetchSystemStatus();
-      } else {
-        toast.error(`Update failed: ${res.message}`);
-      }
-    } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to deploy update");
-    } finally {
-      setIsDeployingUpdate(false);
-    }
-  };
 
   // Fetch strictly user's fleet
   const fetchTelemetry = useCallback(async (showToast = false) => {
@@ -117,13 +61,11 @@ export function ClusterStatusPage() {
 
   useEffect(() => {
     fetchTelemetry(false);
-    fetchSystemStatus();
     const interval = setInterval(() => {
       fetchTelemetry(false);
-      fetchSystemStatus();
-    }, 12000);
+      }, 12000);
     return () => clearInterval(interval);
-  }, [fetchTelemetry, fetchSystemStatus]);
+  }, [fetchTelemetry]);
 
   // Handle remote slider adjustment per GPU
   const handleSliderChange = async (targetWorkerId: string, newPct: number, gpuIndex?: number) => {
@@ -198,8 +140,8 @@ export function ClusterStatusPage() {
   const stealthCount = nodes.filter((n) => Boolean(n.is_always_silent) || n.work_capacity_state === "stealth_regulated").length;
   const unleashedCount = nodes.filter((n) => !Boolean(n.is_always_silent) && n.work_capacity_state !== "stealth_regulated").length;
 
-  const originUrl = window.location.port === "5173"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
+  const originUrl = window.location.origin.includes("localhost:5173")
+    ? "http://localhost:8000"
     : window.location.origin;
   const joinCmd = `powershell -c "irm ${originUrl}/connect.ps1?key=${apiKey} | iex"`;
 
@@ -374,125 +316,6 @@ export function ClusterStatusPage() {
           <div className="bg-slate-950 text-emerald-400 p-3 rounded-md font-mono text-xs overflow-x-auto border border-slate-800 break-all select-all">
             <code>{joinCmd}</code>
           </div>
-        </CardContent>
-      </Card>
-
-      {/* Zero-Touch Central Server & In-Browser Remote Deployment */}
-      <Card className="border-border/60 bg-card/60 backdrop-blur-sm">
-        <CardHeader className="p-4 sm:p-5 pb-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
-                <Globe className="h-4 w-4 text-cyan-400" />
-              </div>
-              <div>
-                <CardTitle className="text-base font-semibold flex items-center gap-2">
-                  Central Server & Zero-Touch Deployment
-                  <Badge variant="outline" className="text-[10px] bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse mr-1" />
-                    Online
-                  </Badge>
-                </CardTitle>
-                <CardDescription className="text-xs">
-                  Headless host: <span className="font-mono text-foreground font-medium">{systemStatus?.hostname || "Local Node"}</span> • {systemStatus?.os || "Loading..."} • Uptime: {systemStatus?.uptime_human || "..."}
-                </CardDescription>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleCheckUpdate}
-                disabled={isCheckingUpdate || isDeployingUpdate}
-                className="gap-1.5 text-xs h-8"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${isCheckingUpdate ? "animate-spin text-cyan-400" : ""}`} />
-                {isCheckingUpdate ? "Checking..." : "Check Updates"}
-              </Button>
-
-              {updateCheck?.update_available ? (
-                <Button
-                  size="sm"
-                  onClick={handleDeployUpdate}
-                  disabled={isDeployingUpdate}
-                  className="gap-1.5 text-xs h-8 bg-emerald-600 hover:bg-emerald-700 text-white"
-                >
-                  <ArrowUpCircle className={`h-3.5 w-3.5 ${isDeployingUpdate ? "animate-spin" : ""}`} />
-                  {isDeployingUpdate ? "Deploying..." : "1-Click Deploy & Update"}
-                </Button>
-              ) : null}
-            </div>
-          </div>
-        </CardHeader>
-
-        <CardContent className="p-4 sm:p-5 pt-0 space-y-4">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
-              <span className="text-muted-foreground flex items-center gap-1">
-                <GitBranch className="h-3 w-3 text-primary" /> Active Branch & Commit
-              </span>
-              <p className="font-mono font-medium truncate text-foreground">
-                {systemStatus?.git?.branch || "main"} @ {systemStatus?.git?.commit || "..."}
-              </p>
-            </div>
-
-            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
-              <span className="text-muted-foreground flex items-center gap-1">
-                <Cpu className="h-3 w-3 text-cyan-400" /> Server CPU Load
-              </span>
-              <p className="font-mono font-medium text-foreground">
-                {systemStatus?.resources?.cpu_percent ?? 0}%
-              </p>
-            </div>
-
-            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
-              <span className="text-muted-foreground flex items-center gap-1">
-                <HardDrive className="h-3 w-3 text-purple-400" /> Host Memory
-              </span>
-              <p className="font-mono font-medium text-foreground">
-                {systemStatus?.resources?.memory_used_gb ?? 0} / {systemStatus?.resources?.memory_total_gb ?? 0} GB ({systemStatus?.resources?.memory_percent ?? 0}%)
-              </p>
-            </div>
-
-            <div className="p-2.5 rounded-md border bg-background/50 space-y-1">
-              <span className="text-muted-foreground flex items-center gap-1">
-                <Globe className="h-3 w-3 text-emerald-400" /> Remote Access
-              </span>
-              <p className="font-mono font-medium text-foreground truncate">
-                {systemStatus?.tailscale_ip ? `Tailscale: ${systemStatus.tailscale_ip}` : (systemStatus?.local_ips?.[0] ? `LAN: ${systemStatus.local_ips[0]}` : "Local")}
-              </p>
-            </div>
-          </div>
-
-          {updateCheck?.update_available ? (
-            <div className="p-3 rounded-md border border-cyan-500/30 bg-cyan-500/10 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div className="space-y-0.5">
-                <p className="font-semibold text-cyan-300">
-                  New Code Commit Available: {updateCheck.remote_commit} ({updateCheck.commits_behind} commit{updateCheck.commits_behind === 1 ? "" : "s"} behind)
-                </p>
-                {updateCheck.pending_commits?.[0] && (
-                  <p className="text-muted-foreground font-mono text-[11px] truncate">
-                    &bull; {updateCheck.pending_commits[0]}
-                  </p>
-                )}
-              </div>
-              <Button
-                size="sm"
-                onClick={handleDeployUpdate}
-                disabled={isDeployingUpdate}
-                className="gap-1.5 text-xs h-7 self-start sm:self-auto bg-cyan-600 hover:bg-cyan-700 text-white"
-              >
-                <ArrowUpCircle className="h-3.5 w-3.5" />
-                Deploy Now
-              </Button>
-            </div>
-          ) : updateCheck && !updateCheck.update_available ? (
-            <div className="p-2.5 rounded-md border border-emerald-500/20 bg-emerald-500/5 text-xs flex items-center gap-2 text-emerald-400">
-              <CheckCircle2 className="h-4 w-4" />
-              <span>Server is fully up to date with origin/main. Zero physical maintenance needed.</span>
-            </div>
-          ) : null}
         </CardContent>
       </Card>
 

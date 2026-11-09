@@ -1242,13 +1242,6 @@ app.include_router(invite_router)
 from app.user_profile_router import router as user_profile_router
 
 app.include_router(user_profile_router)
-
-# Include System & Remote Server Management Router
-from app.system_router import router as system_router
-
-app.include_router(system_router)
-
-
 # ==============================================================================
 # Single-Page Application (SPA) Static Files & Client-Side Route Fallback
 # ==============================================================================
