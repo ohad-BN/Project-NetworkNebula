@@ -106,6 +106,8 @@ services:
     image: project-networknebula-api:latest
     container_name: nebula-celery
     restart: unless-stopped
+    healthcheck:
+      disable: true
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-nebula}:${POSTGRES_PASSWORD:-nebula123}@db:5432/${POSTGRES_DB:-nebula_db}
       - REDIS_URL=redis://redis:6379/0
