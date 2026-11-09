@@ -68,11 +68,18 @@ elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     PKG_MGR="dnf"
     command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
     echo "[*] Detected Red Hat/Oracle Linux system ($PKG_MGR)..."
+    # Wait for background system tasks to release rpm lock if busy
+    while $SUDO fuser /var/lib/rpm/.rpm.lock >/dev/null 2>&1; do
+        echo "[*] Waiting for background system initialization to release package lock..."
+        sleep 3
+    done
+
     $SUDO $PKG_MGR update -y -q
     $SUDO $PKG_MGR install -y -q curl wget git iptables iptables-services || true
     if ! command -v docker >/dev/null 2>&1; then
         echo "[*] Installing Docker Engine ($PKG_MGR)..."
         $SUDO $PKG_MGR install -y -q yum-utils || true
+        $SUDO rpm --import https://download.docker.com/linux/centos/gpg 2>/dev/null || true
         $SUDO $PKG_MGR config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null || true
         $SUDO $PKG_MGR install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin || $SUDO $PKG_MGR install -y -q docker podman-docker || true
     fi
