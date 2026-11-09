@@ -52,7 +52,7 @@ services:
   # 3. MinIO S3 Object Storage (Checkpoints, Datasets & Adapter Safetensors)
   # ----------------------------------------------------------------------------
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     container_name: nebula-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
