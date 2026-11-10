@@ -549,40 +549,112 @@ def cmd_join(args: argparse.Namespace) -> int:
     if args.once:
         return 0
 
-    # Continuous daemon heartbeat loop
+    stop_event = None
+    if getattr(args, "tunnel", False):
+        import threading
+        stop_event = threading.Event()
+
+        def _maintain_tunnel():
+            import asyncio
+            backoff = 2.0
+            ws_base = server_url.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/worker/{registered_id}"
+            if api_key:
+                ws_base += f"?api_key={api_key.strip()}"
+            websockets = ensure_websockets()
+
+            async def _keepalive():
+                nonlocal backoff
+                while not stop_event.is_set():
+                    try:
+                        async with websockets.connect(ws_base, open_timeout=10, ping_interval=20, ping_timeout=20) as ws:
+                            await ws.recv()
+                            backoff = 2.0
+                            while not stop_event.is_set():
+                                live_hw = discover_hardware()
+                                await ws.send(json.dumps({
+                                    "type": "heartbeat",
+                                    "vram_used_gb": live_hw["vram_used_gb"],
+                                    "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
+                                }))
+                                await asyncio.wait_for(ws.recv(), timeout=15.0)
+                                await asyncio.sleep(max(5.0, float(args.interval)))
+                    except Exception:
+                        await asyncio.sleep(backoff)
+                        backoff = min(30.0, backoff * 2.0)
+
+            try:
+                asyncio.run(_keepalive())
+            except Exception:
+                pass
+
+        threading.Thread(target=_maintain_tunnel, daemon=True).start()
+
+    # Continuous resilient daemon heartbeat loop
+    backoff_sec = 2.0
     try:
         while True:
             time.sleep(args.interval)
-            live_hw = discover_hardware()
-            live_lat = measure_server_latency(server_url)
-            hb_data_loop = {
-                "vram_used_gb": live_hw["vram_used_gb"],
-                "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
-                "latency_ping_ms": live_lat,
-                "region": region,
-                "status": "online",
-            }
-            if always_silent and sensor:
-                tel = sensor.get_telemetry()
-                hb_data_loop["is_always_silent"] = True
-                hb_data_loop["work_capacity_state"] = tel["state"]
-                hb_data_loop["input_idle_sec"] = tel["idle_sec"]
-                hb_data_loop["gpu_temp_c"] = tel["gpu_temp_c"]
-                hb_data_loop["duty_cycle_pct"] = 100 if tel["state"] == "unleashed" else (0 if tel["state"] == "restricted_pause" else 33)
-            r_hb = requests.post(
+            try:
+                live_hw = discover_hardware()
+                live_lat = measure_server_latency(server_url)
+                hb_data_loop = {
+                    "vram_used_gb": live_hw["vram_used_gb"],
+                    "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
+                    "latency_ping_ms": live_lat,
+                    "region": region,
+                    "status": "online",
+                }
+                if always_silent and sensor:
+                    tel = sensor.get_telemetry()
+                    hb_data_loop["is_always_silent"] = True
+                    hb_data_loop["work_capacity_state"] = tel["state"]
+                    hb_data_loop["input_idle_sec"] = tel["idle_sec"]
+                    hb_data_loop["gpu_temp_c"] = tel["gpu_temp_c"]
+                    hb_data_loop["duty_cycle_pct"] = 100 if tel["state"] == "unleashed" else (0 if tel["state"] == "restricted_pause" else 33)
+                r_hb = requests.post(
+                    f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
+                    headers=headers,
+                    json=hb_data_loop,
+                    timeout=10,
+                )
+                if r_hb.status_code == 404:
+                    reg_retry = requests.post(
+                        f"{server_url}/api/v1/workers/register",
+                        headers=headers,
+                        json=reg_payload,
+                        timeout=10,
+                    )
+                    if reg_retry.status_code == 200:
+                        registered_id = reg_retry.json().get("worker_id", registered_id)
+                        backoff_sec = 2.0
+                        if not args.json:
+                            print(f"[NEBULA_WORKER] Re-registered worker '{registered_id}' with orchestrator.")
+                    continue
+                if r_hb.status_code == 200:
+                    backoff_sec = 2.0
+                    new_pct = r_hb.json().get("vram_allocation_pct", server_pct)
+                    if new_pct != server_pct:
+                        server_pct = new_pct
+                        apply_vram_limit(server_pct)
+                        if not args.json:
+                            print(f"[NEBULA_WORKER] Updated GPU contribution limit to {server_pct}% from orchestrator.")
+            except Exception as net_err:
+                if not args.json:
+                    print(f"[NEBULA_WORKER] Connection hiccup ({net_err}); retrying in {backoff_sec:.0f}s...")
+                time.sleep(backoff_sec)
+                backoff_sec = min(30.0, backoff_sec * 2.0)
+    except KeyboardInterrupt:
+        if stop_event is not None:
+            stop_event.set()
+        try:
+            requests.post(
                 f"{server_url}/api/v1/workers/{registered_id}/heartbeat",
                 headers=headers,
-                json=hb_data_loop,
-                timeout=10,
+                json={"status": "offline"},
+                timeout=3,
             )
-            if r_hb.status_code == 200:
-                new_pct = r_hb.json().get("vram_allocation_pct", server_pct)
-                if new_pct != server_pct:
-                    server_pct = new_pct
-                    apply_vram_limit(server_pct)
-                    if not args.json:
-                        print(f"[NEBULA_WORKER] Updated GPU contribution limit to {server_pct}% from orchestrator.")
-    except KeyboardInterrupt:
+        except BaseException:
+            pass
         if not args.json:
             print("\n[NEBULA_WORKER] Shutting down worker agent gracefully.")
     return 0

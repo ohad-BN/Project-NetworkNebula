@@ -155,7 +155,7 @@ export const workersService = {
   },
 
   deregister: async (workerId: string): Promise<void> => {
-    await apiClient.post(`/workers/${workerId}/deregister`);
+    await apiClient.delete(`/api/v1/workers/${encodeURIComponent(workerId)}`);
   },
 
   stakeCollateral: async (

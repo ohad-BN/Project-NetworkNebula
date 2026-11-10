@@ -4,6 +4,7 @@ Provides REST endpoints for submitting distributed/PEFT fine-tuning jobs,
 querying real-time loss and epoch telemetry, and retrieving checkpoints.
 """
 
+import os
 import json
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +37,54 @@ def dispatch_training_job_resilient(job_id: str):
     # Threaded background runner ensures immediate progress without stalled queues
     thread = threading.Thread(target=execute_training_job, args=(job_id,), daemon=True)
     thread.start()
+
+
+def dispatch_queued_training_jobs(db: Session) -> int:
+    """
+    Dispatch queued LoRA/enterprise training jobs once at least one active compute worker is online.
+    Returns count of dispatched jobs.
+    """
+    from app.cluster_worker_router import get_eligible_training_workers
+
+    active_workers = get_eligible_training_workers(db)
+    allow_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
+    if not active_workers and not allow_fallback:
+        return 0
+
+    queued_jobs = (
+        db.query(TrainingJob)
+        .filter(TrainingJob.status == "queued")
+        .order_by(TrainingJob.created_at.asc())
+        .all()
+    )
+    dispatched = 0
+    for q_job in queued_jobs:
+        try:
+            hp = json.loads(q_job.hyperparameters) if q_job.hyperparameters else {}
+        except Exception:
+            hp = {}
+
+        requested_ids = hp.get("worker_ids") if isinstance(hp.get("worker_ids"), list) else None
+        eligible_for_job = active_workers
+        if requested_ids and not hp.get("waiting_for_worker"):
+            matched = [w for w in active_workers if w.id in requested_ids]
+            if matched:
+                eligible_for_job = matched
+
+        if not eligible_for_job and not allow_fallback:
+            continue
+
+        # Mark dispatching atomically before enqueuing to avoid duplicate triggers on concurrent heartbeats
+        target_count = max(1, int(q_job.num_gpus or 1)) if eligible_for_job else 0
+        if eligible_for_job:
+            hp["worker_ids"] = [w.id for w in eligible_for_job[:target_count]]
+        hp.pop("waiting_for_worker", None)
+        q_job.hyperparameters = json.dumps(hp)
+        q_job.status = "dispatching"
+        db.commit()
+        dispatch_training_job_resilient(q_job.id)
+        dispatched += 1
+    return dispatched
 
 router = APIRouter(prefix="/api/v1/training", tags=["Enterprise Training"])
 
@@ -228,8 +277,12 @@ def submit_training_job(
     job_name = payload.name or f"{payload.base_model.split('/')[-1]}-{payload.train_type.upper()}-{job_id[:6]}"
 
     # Extract or format hyperparameters
+    from app.cluster_worker_router import get_eligible_training_workers
+
     hyperparams = payload.hyperparameters or {}
     epochs = payload.total_epochs or hyperparams.get("epochs", 3)
+    allow_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
+    eligible_workers = get_eligible_training_workers(db, requested_worker_ids=payload.worker_ids)
 
     if payload.worker_ids:
         hyperparams["worker_ids"] = payload.worker_ids
@@ -250,6 +303,12 @@ def submit_training_job(
         selected_ids = sched_res.get("selected_worker_ids", [])
         if selected_ids:
             hyperparams["worker_ids"] = [selected_ids[0]]
+        elif eligible_workers:
+            hyperparams["worker_ids"] = [eligible_workers[0].id]
+
+    should_dispatch = bool(eligible_workers) or allow_fallback
+    if not should_dispatch:
+        hyperparams["waiting_for_worker"] = True
 
     new_job = TrainingJob(
         id=job_id,
@@ -273,8 +332,9 @@ def submit_training_job(
     db.commit()
     db.refresh(new_job)
 
-    # Dispatch resiliently (Celery or background worker)
-    dispatch_training_job_resilient(job_id)
+    # Dispatch only when at least one eligible worker is active; otherwise remain queued
+    if should_dispatch:
+        dispatch_training_job_resilient(job_id)
 
     return format_job_response(new_job)
 
@@ -290,6 +350,7 @@ def submit_distributed_training_job(
     gradient aggregation and dataset batch sharding across registered GPU workers.
     """
     from app.distributed_training_engine import distributed_training_engine
+    from app.cluster_worker_router import get_eligible_training_workers
 
     job_id = str(uuid.uuid4())
     job_name = payload.name or f"Dist-{payload.base_model.split('/')[-1]}-{payload.num_gpus}GPU-{job_id[:6]}"
@@ -315,6 +376,9 @@ def submit_distributed_training_job(
                 ),
             )
 
+    eligible_workers = get_eligible_training_workers(db, requested_worker_ids=worker_ids)
+    allow_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
+
     if not worker_ids or len(worker_ids) < payload.num_gpus:
         resolved = distributed_training_engine.resolve_worker_fleet(
             db,
@@ -329,13 +393,16 @@ def submit_distributed_training_job(
         else:
             worker_ids = resolved
 
-    worker_ids = worker_ids[:payload.num_gpus]
+    worker_ids = worker_ids[:payload.num_gpus] if worker_ids else []
+    should_dispatch = bool(eligible_workers) or allow_fallback
 
     hyperparams = dict(payload.hyperparameters or {})
     epochs = payload.total_epochs or hyperparams.get("epochs", 2)
     hyperparams["distributed_mode"] = True
     hyperparams["worker_ids"] = worker_ids
     hyperparams["allreduce_protocol"] = "ring_allreduce_float32"
+    if not should_dispatch:
+        hyperparams["waiting_for_worker"] = True
     if payload.enforce_region:
         hyperparams["enforce_region"] = payload.enforce_region
     if payload.max_rtt_ms is not None:
@@ -348,7 +415,7 @@ def submit_distributed_training_job(
         base_model=payload.base_model,
         train_type=payload.train_type,
         parallelism=payload.parallelism,
-        num_gpus=len(worker_ids),
+        num_gpus=max(len(worker_ids), payload.num_gpus),
         dataset_s3_url=payload.dataset_s3_url or "s3://nebula-datasets/default_distributed.jsonl",
         hyperparameters=json.dumps(hyperparams),
         status="queued",
@@ -364,11 +431,12 @@ def submit_distributed_training_job(
     db.commit()
     db.refresh(new_job)
 
-    if payload.sync_execution:
-        execute_training_job(job_id)
-        db.refresh(new_job)
-    else:
-        dispatch_training_job_resilient(job_id)
+    if should_dispatch:
+        if payload.sync_execution:
+            execute_training_job(job_id)
+            db.refresh(new_job)
+        else:
+            dispatch_training_job_resilient(job_id)
 
     return format_job_response(new_job)
 

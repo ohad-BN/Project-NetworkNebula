@@ -463,7 +463,7 @@ def main() -> int:
                 print(render_dashboard(last_data, server_url, is_paused=is_paused))
             else:
                 print(f"{C.YELLOW}[*] Connecting to NetworkNebula Orchestrator at {server_url}...{C.RESET}")
-                print(f"{C.DIM}Ensure backend is running (python -m uvicorn app.main:app --port 8000){C.RESET}")
+                print(f"{C.DIM}For remote servers run: monitor.bat --url http://<SERVER_IP> (or set NEBULA_SERVER_URL){C.RESET}")
 
             # Polling wait with sub-slice sleep for responsive keypresses
             poll_steps = max(1, int(args.interval / 0.15))

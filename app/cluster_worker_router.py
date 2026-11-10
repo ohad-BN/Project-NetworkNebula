@@ -11,7 +11,7 @@ import os
 import socket
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -44,6 +44,8 @@ def get_local_primary_node_id() -> str:
     return f"node-{safe_host}"
 
 LOCAL_PRIMARY_NODE_ID = get_local_primary_node_id()
+HEARTBEAT_TIMEOUT_SECONDS = 45.0  # 3 missed heartbeats (15s * 3) = offline node
+TASK_STALE_TIMEOUT_SECONDS = 180.0  # 3 minutes without heartbeat = failed task
 
 
 class WorkerTunnelManager:
@@ -240,9 +242,112 @@ def resolve_optional_user(
     return None
 
 
-def sync_primary_local_worker(db: Session) -> Worker:
-    """Ensure the primary local worker node is registered and synced with live hardware & geo metrics."""
+def _is_running_in_container() -> bool:
+    """Detect Docker/container runtime environments."""
+    return os.path.exists("/.dockerenv") or os.environ.get("KUBERNETES_SERVICE_HOST") is not None
+
+
+def _should_register_local_primary(hw: Dict[str, Any]) -> bool:
+    """Only register the orchestrator host as a worker when explicitly enabled or on local GPU hosts."""
+    override = os.environ.get("REGISTER_LOCAL_ORCHESTRATOR_WORKER", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    if _is_running_in_container() and not hw.get("cuda_available"):
+        return False
+    return True
+
+
+def reap_stale_workers_and_tasks(db: Session) -> bool:
+    """Mark timed-out workers offline, release finished task bindings, and fail stale processing tasks."""
+    now = datetime.now(timezone.utc)
+    dirty = False
+
+    all_workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
+    for w in all_workers:
+        if (w.status or "").lower() not in ("offline", "failed") and w.last_heartbeat:
+            if not worker_tunnel_manager.is_connected(w.id):
+                hb = w.last_heartbeat
+                if hb.tzinfo is None:
+                    hb = hb.replace(tzinfo=timezone.utc)
+                if (now - hb).total_seconds() > HEARTBEAT_TIMEOUT_SECONDS:
+                    w.status = "offline"
+                    if w.current_task_id:
+                        w.current_task_id = None
+                    dirty = True
+
+        if w.current_task_id:
+            tid = str(w.current_task_id)
+            if tid.startswith("train-"):
+                job_uuid_prefix = tid.replace("train-", "")
+                j_rec = db.query(TrainingJob).filter(TrainingJob.id.like(f"{job_uuid_prefix}%")).first()
+                if not j_rec or j_rec.status in ("completed", "failed", "cancelled"):
+                    w.current_task_id = None
+                    if w.is_available and (w.status or "").lower() == "busy":
+                        w.status = "online"
+                    dirty = True
+            else:
+                t_rec = db.query(Task).filter(Task.task_id == tid).first()
+                if not t_rec or t_rec.status in (TaskStatus.SUCCESS, TaskStatus.FAILURE):
+                    w.current_task_id = None
+                    if w.is_available and (w.status or "").lower() == "busy":
+                        w.status = "online"
+                    dirty = True
+
+    processing_tasks_db = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).all()
+    for t in processing_tasks_db:
+        t_ref = t.updated_at or t.created_at
+        if t_ref:
+            if t_ref.tzinfo is None:
+                t_ref = t_ref.replace(tzinfo=timezone.utc)
+            if (now - t_ref).total_seconds() > TASK_STALE_TIMEOUT_SECONDS:
+                t.status = TaskStatus.FAILURE
+                dirty = True
+
+    if dirty:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            return False
+    return dirty
+
+
+def get_eligible_training_workers(
+    db: Session,
+    requested_worker_ids: Optional[List[str]] = None,
+) -> List[Worker]:
+    """Return currently online, available compute workers eligible for training."""
+    reap_stale_workers_and_tasks(db)
+    q = db.query(Worker).filter(
+        Worker.is_available == True,
+        Worker.status.in_(["online", "busy"]),
+    )
+    if requested_worker_ids:
+        q = q.filter(Worker.id.in_(requested_worker_ids))
+    workers = q.order_by(Worker.created_at.asc()).all()
+    return [
+        w
+        for w in workers
+        if (getattr(w, "work_capacity_state", None) or "unleashed").lower() != "restricted_pause"
+    ]
+
+
+def _trigger_queued_training_dispatch(db: Session) -> None:
+    """Safely wake queued training jobs whenever a worker comes online."""
+    try:
+        from app.enterprise_training_router import dispatch_queued_training_jobs
+        dispatch_queued_training_jobs(db)
+    except Exception as exc:
+        logger.debug(f"Queued training dispatch skipped: {exc}")
+
+
+def sync_primary_local_worker(db: Session) -> Optional[Worker]:
+    """Ensure local GPU host worker is synced when running natively (never registers CPU API containers)."""
     hw = probe_local_gpu_hardware()
+    if not _should_register_local_primary(hw):
+        return None
     geo = resolve_node_location()
     worker_id = LOCAL_PRIMARY_NODE_ID
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
@@ -519,6 +624,8 @@ def get_user_workers(
             "nodes": [],
         }
 
+    reap_stale_workers_and_tasks(db)
+
     # Query strictly the workers owned by this user
     user_workers = (
         db.query(Worker)
@@ -526,14 +633,6 @@ def get_user_workers(
         .order_by(Worker.created_at.desc())
         .all()
     )
-
-    # Auto-link local primary worker if user is creator/admin and primary worker is unlinked
-    if not user_workers:
-        primary = db.query(Worker).filter(Worker.id == LOCAL_PRIMARY_NODE_ID).first()
-        if primary and (primary.user_id is None or primary.user_id == user.id):
-            primary.user_id = user.id
-            db.commit()
-            user_workers = [primary]
 
     # Filter out synthetic test harness nodes
     user_agent = request.headers.get("user-agent", "").lower()
@@ -592,23 +691,29 @@ if (-not (Get-Command "python" -ErrorAction SilentlyContinue)) {{
 
 Write-Host "[+] Using Python: $(& $pythonCmd --version)" -ForegroundColor Green
 
-# 2. Fetch latest nebula_worker.py
+# 2. Fetch latest nebula_worker.py (refresh if possible, keep local fallback)
 $workerScript = "nebula_worker.py"
-if (-not (Test-Path $workerScript)) {{
-    Write-Host "[*] Fetching latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
+try {{
+    Write-Host "[*] Syncing latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
     Invoke-WebRequest -Uri "$HostUrl/nebula_worker.py" -OutFile $workerScript -UseBasicParsing
-    Write-Host "[+] Downloaded nebula_worker.py." -ForegroundColor Green
+    Write-Host "[+] Synced nebula_worker.py." -ForegroundColor Green
+}} catch {{
+    if (-not (Test-Path $workerScript)) {{
+        Write-Host "[-] Failed to download nebula_worker.py: $_" -ForegroundColor Red
+        Exit 1
+    }}
 }}
 
 # 3. Launch Worker Agent
-$apiKeyArg = ""
+$workerArgs = @($workerScript, "join", "--server", $HostUrl)
 if ($Key -and $Key.Trim() -ne "") {{
-    $apiKeyArg = "--api-key $Key"
+    $workerArgs += @("--api-key", $Key.Trim())
     Write-Host "[+] Authenticating with account API key..." -ForegroundColor Green
 }}
+$workerArgs += "--tunnel"
 
 Write-Host "[*] Starting GPU Worker Node & Connecting Telemetry Tunnel..." -ForegroundColor Cyan
-& $pythonCmd $workerScript join --server $HostUrl $apiKeyArg --tunnel
+& $pythonCmd @workerArgs
 '''
     return PlainTextResponse(script, media_type="text/plain")
 
@@ -689,6 +794,7 @@ def get_cluster_telemetry(
     Never exposes simulated test workers belonging to other tenants.
     """
     sync_primary_local_worker(db)
+    reap_stale_workers_and_tasks(db)
 
     user = resolve_optional_user(db, x_api_key=x_api_key, authorization=authorization)
     if not user:
@@ -954,6 +1060,8 @@ def register_worker_node(
 
     db.commit()
     db.refresh(worker)
+    if worker.is_available and (worker.status or "").lower() == "online":
+        _trigger_queued_training_dispatch(db)
 
     serialized = serialize_worker_node(worker)
     serialized["cuda_fraction_enforced"] = cuda_enforced
@@ -1027,6 +1135,8 @@ async def update_worker_config(
     worker.last_heartbeat = datetime.utcnow()
     db.commit()
     db.refresh(worker)
+    if worker.is_available and (worker.status or "").lower() == "online":
+        _trigger_queued_training_dispatch(db)
 
     res = serialize_worker_node(worker)
     res["cuda_fraction_enforced"] = cuda_enforced
@@ -1107,6 +1217,8 @@ def worker_node_heartbeat(
 
     db.commit()
     db.refresh(worker)
+    if worker.is_available and (worker.status or "").lower() == "online":
+        _trigger_queued_training_dispatch(db)
 
     return {
         "status": "ok",
@@ -1167,19 +1279,37 @@ def get_worker_node_stats(
 @router.post("/api/v1/workers/{worker_id}/deregister")
 @router.post("/api/workers/{worker_id}/deregister")
 @router.post("/workers/{worker_id}/deregister")
+@router.delete("/api/v1/workers/{worker_id}")
+@router.delete("/api/workers/{worker_id}")
+@router.delete("/workers/{worker_id}")
 def deregister_worker_node(
     worker_id: str,
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    """Deregister or mark a worker node offline."""
+    """Permanently unlink and delete a worker node from the cluster fleet."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
 
-    worker.status = "offline"
-    worker.is_available = False
+    raw_key = x_api_key or request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    raw_auth = authorization or request.headers.get("authorization") or request.headers.get("Authorization")
+    caller = resolve_optional_user(db, x_api_key=raw_key, authorization=raw_auth)
+    if caller and not caller.is_admin and worker.user_id and worker.user_id != caller.id:
+        raise HTTPException(status_code=403, detail="Not authorized to remove this worker node")
+
+    worker_tunnel_manager.disconnect(worker_id)
+    # Release any incomplete tasks claimed by this node so they can be re-queued cleanly
+    db.query(Task).filter(
+        Task.claimed_by == worker_id,
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROCESSING]),
+    ).update({"claimed_by": None, "status": TaskStatus.QUEUED}, synchronize_session=False)
+
+    db.delete(worker)
     db.commit()
-    return {"status": "deregistered", "worker_id": worker_id}
+    return {"status": "deregistered", "deleted": True, "worker_id": worker_id}
 
 
 # ==============================================================================
@@ -1206,10 +1336,20 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             user = db.query(User).filter(User.api_key == raw_key.strip()).first()
 
         worker = db.query(Worker).filter(Worker.id == worker_id).first()
-        if user and worker and worker.user_id != user.id:
-            worker.user_id = user.id
-            db.commit()
-            db.refresh(worker)
+        if worker:
+            dirty_ws = False
+            if user and worker.user_id != user.id:
+                worker.user_id = user.id
+                dirty_ws = True
+            worker.last_heartbeat = datetime.utcnow()
+            if worker.is_available and (worker.status or "").lower() != "busy":
+                worker.status = "online"
+            dirty_ws = True
+            if dirty_ws:
+                db.commit()
+                db.refresh(worker)
+            if worker.is_available and (worker.status or "").lower() == "online":
+                _trigger_queued_training_dispatch(db)
 
         vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
         owner_id = worker.user_id if worker else (user.id if user else None)
@@ -1981,10 +2121,6 @@ def submit_worker_slice(
 # Live Cluster Fleet Monitor Telemetry Snapshot Endpoint
 # ==============================================================================
 
-HEARTBEAT_TIMEOUT_SECONDS = 45.0  # 3 missed heartbeats (15s * 3) = offline node
-TASK_STALE_TIMEOUT_SECONDS = 180.0  # 3 minutes without heartbeat = failed task
-
-
 @router.get("/api/v1/cluster/monitor/snapshot")
 @router.get("/api/cluster/monitor/snapshot")
 def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
@@ -1994,61 +2130,9 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
     - active & queued tasks with slice progress + enterprise LoRA/QLoRA training jobs
     - real-time PoDS minted settlements ticker
     """
-    now = datetime.now(timezone.utc)
-    dirty = False
+    reap_stale_workers_and_tasks(db)
 
-    # 1. Autonomous Heartbeat Staleness Reaper
-    all_workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
-    for w in all_workers:
-        if (w.status or "").lower() not in ("offline", "failed") and w.last_heartbeat:
-            hb = w.last_heartbeat
-            if hb.tzinfo is None:
-                hb = hb.replace(tzinfo=timezone.utc)
-            age_sec = (now - hb).total_seconds()
-            if age_sec > HEARTBEAT_TIMEOUT_SECONDS:
-                w.status = "offline"
-                # Preserve user's administrative availability (do NOT set w.is_available = False)
-                if w.current_task_id:
-                    w.current_task_id = None
-                dirty = True
-
-        # Orphan task watchdog: release workers bound to finished/cancelled jobs
-        if w.current_task_id:
-            tid = str(w.current_task_id)
-            if tid.startswith("train-"):
-                job_uuid_prefix = tid.replace("train-", "")
-                j_rec = db.query(TrainingJob).filter(TrainingJob.id.like(f"{job_uuid_prefix}%")).first()
-                if not j_rec or j_rec.status in ("completed", "failed", "cancelled"):
-                    w.current_task_id = None
-                    if w.is_available and (w.status or "").lower() == "busy":
-                        w.status = "online"
-                    dirty = True
-            else:
-                t_rec = db.query(Task).filter(Task.task_id == tid).first()
-                if not t_rec or t_rec.status in (TaskStatus.SUCCESS, TaskStatus.FAILURE):
-                    w.current_task_id = None
-                    if w.is_available and (w.status or "").lower() == "busy":
-                        w.status = "online"
-                    dirty = True
-
-    # 2. Stale Processing Task Watchdog
-    processing_tasks_db = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).all()
-    for t in processing_tasks_db:
-        t_ref = t.updated_at or t.created_at
-        if t_ref:
-            if t_ref.tzinfo is None:
-                t_ref = t_ref.replace(tzinfo=timezone.utc)
-            if (now - t_ref).total_seconds() > TASK_STALE_TIMEOUT_SECONDS:
-                t.status = TaskStatus.FAILURE
-                dirty = True
-
-    if dirty:
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-
-    # Re-query workers, tasks, training jobs, and compute slices
+    # Query workers, tasks, training jobs, and compute slices
     workers = db.query(Worker).order_by(Worker.created_at.asc()).all()
     tasks = db.query(Task).order_by(Task.created_at.desc()).limit(15).all()
     training_jobs = db.query(TrainingJob).order_by(TrainingJob.created_at.desc()).limit(10).all()

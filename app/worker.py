@@ -717,13 +717,20 @@ def execute_training_job(*args, **kwargs):
     print(f"[WORKER] Initiating enterprise training job: {job_id}")
     db = SessionLocal()
     try:
+        from app.models import Worker
         job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
         if not job:
             print(f"[WORKER] Error: Training job {job_id} not found in database")
             return {"status": "error", "message": f"Job {job_id} not found"}
+        if job.status in ("completed", "cancelled", "running"):
+            print(f"[WORKER] Skipping training job {job_id} already in state '{job.status}'")
+            return {"status": job.status, "job_id": job_id}
 
-        job.status = "running"
-        db.commit()
+        try:
+            from app.cluster_worker_router import reap_stale_workers_and_tasks
+            reap_stale_workers_and_tasks(db)
+        except Exception:
+            pass
 
         # Parse hyperparameters & settings
         total_epochs = max(1, job.total_epochs or 3)
@@ -734,15 +741,25 @@ def execute_training_job(*args, **kwargs):
         except Exception:
             hyperparams = {}
 
-        storage = get_storage()
-        storage.ensure_all_enterprise_buckets_exist()
+        allow_server_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
+        participating_workers: List[str] = []
 
-        loss_history = []
-        checkpoints_list = []
-        final_adapter_url = None
-        # Resolve participating workers for this training run
         if hyperparams.get("worker_ids"):
-            participating_workers = list(hyperparams.get("worker_ids"))
+            requested_ids = list(hyperparams.get("worker_ids"))
+            active_requested = [
+                w.id
+                for w in db.query(Worker).filter(
+                    Worker.id.in_(requested_ids),
+                    Worker.status.in_(["online", "busy"]),
+                    Worker.is_available == True,
+                ).all()
+            ]
+            participating_workers = active_requested
+            if not participating_workers and not allow_server_fallback:
+                # Re-check whether any other active worker came online
+                from app.cluster_worker_router import get_eligible_training_workers
+                eligible_any = get_eligible_training_workers(db)
+                participating_workers = [w.id for w in eligible_any[:max(1, num_gpus)]]
         elif num_gpus >= 2:
             from app.distributed_training_engine import distributed_training_engine
             target_workers = distributed_training_engine.resolve_worker_fleet(db, num_gpus=max(2, num_gpus))
@@ -760,14 +777,38 @@ def execute_training_job(*args, **kwargs):
             if selected_ids:
                 participating_workers = [selected_ids[0]]
             else:
-                from app.models import Worker
-                active_w = db.query(Worker).filter(Worker.status == "online", Worker.is_available == True).first()
+                active_w = db.query(Worker).filter(
+                    Worker.status.in_(["online", "busy"]),
+                    Worker.is_available == True,
+                ).first()
                 if active_w:
                     participating_workers = [active_w.id]
-                else:
-                    import socket
-                    safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
-                    participating_workers = [f"node-{safe_host}"]
+
+        if not participating_workers:
+            if allow_server_fallback:
+                import socket
+                safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+                participating_workers = [f"node-{safe_host}"]
+            else:
+                job.status = "queued"
+                hyperparams["waiting_for_worker"] = True
+                job.hyperparameters = json.dumps(hyperparams)
+                db.commit()
+                print(f"[WORKER] Training job {job_id} remains queued: no active online workers.")
+                return {"status": "queued", "job_id": job_id, "reason": "no_active_workers"}
+
+        hyperparams.pop("waiting_for_worker", None)
+        hyperparams["worker_ids"] = participating_workers
+        job.hyperparameters = json.dumps(hyperparams)
+        job.status = "running"
+        db.commit()
+
+        storage = get_storage()
+        storage.ensure_all_enterprise_buckets_exist()
+
+        loss_history = []
+        checkpoints_list = []
+        final_adapter_url = None
 
         def set_workers_state(status_str: str, current_task: Optional[str], util_pct: float):
             db_w = SessionLocal()

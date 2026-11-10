@@ -13,6 +13,7 @@ Coordinates data-parallel and model-parallel PEFT / LoRA fine-tuning across 2+ G
 
 import gc
 import json
+import os
 import time
 import uuid
 import logging
@@ -109,8 +110,11 @@ class DistributedTrainingEngine:
                     break
 
         if not worker_ids:
-            from app.cluster_worker_router import LOCAL_PRIMARY_NODE_ID
-            worker_ids = [LOCAL_PRIMARY_NODE_ID]
+            if os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes"):
+                from app.cluster_worker_router import LOCAL_PRIMARY_NODE_ID
+                worker_ids = [LOCAL_PRIMARY_NODE_ID]
+            else:
+                return []
 
         return worker_ids[:num_gpus]
 

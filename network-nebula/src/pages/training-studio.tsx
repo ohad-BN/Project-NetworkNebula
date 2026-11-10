@@ -175,12 +175,16 @@ export function TrainingStudioPage() {
       };
 
       const endpoint = isDistributed ? "/api/v1/training/distributed/jobs" : "/api/v1/training/jobs";
-      await apiClient.post(endpoint, payload);
-      toast.success(
-        isDistributed
-          ? `Decentralized training job dispatched across ${targetGpus} nodes via autonomous consensus!`
-          : "Training job submitted to optimal sovereign worker node"
-      );
+      const submitRes = await apiClient.post(endpoint, payload);
+      if (submitRes.data?.status === "queued" && onlineNodes.length === 0) {
+        toast.info("No active compute workers online — training job queued and will start once a worker connects.");
+      } else {
+        toast.success(
+          isDistributed
+            ? `Decentralized training job dispatched across ${targetGpus} nodes via autonomous consensus!`
+            : "Training job submitted to optimal sovereign worker node"
+        );
+      }
       setIsSubmitModalOpen(false);
       setJobName("");
       fetchJobs();
@@ -305,11 +309,17 @@ export function TrainingStudioPage() {
                       Autonomous Compute Fleet Strategy
                       <Sparkles className="h-3.5 w-3.5 text-amber-400" />
                     </Label>
-                    <Badge variant="outline" className="text-xs font-mono bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                      <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse mr-1.5" />
+                    <Badge variant="outline" className={`text-xs font-mono ${onlineNodes.length > 0 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30"}`}>
+                      <span className={`inline-block w-2 h-2 rounded-full mr-1.5 ${onlineNodes.length > 0 ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`} />
                       {onlineNodes.length} Verified Online
                     </Badge>
                   </div>
+
+                  {onlineNodes.length === 0 && (
+                    <div className="text-[11px] rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 px-2.5 py-1.5">
+                      No active compute workers online — your training job will stay <strong>Queued</strong> until a worker joins.
+                    </div>
+                  )}
 
                   {/* 3 Strategy Cards */}
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
