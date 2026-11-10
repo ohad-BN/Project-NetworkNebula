@@ -6,7 +6,7 @@ from app.config import settings
 connect_args = {}
 if "postgresql" in settings.DATABASE_URL:
     connect_args = {
-        "options": "-c statement_timeout=25000 -c idle_in_transaction_session_timeout=10000"
+        "options": "-c statement_timeout=60000 -c idle_in_transaction_session_timeout=300000"
     }
 
 engine = create_engine(

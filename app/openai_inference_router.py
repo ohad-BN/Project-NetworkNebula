@@ -233,9 +233,13 @@ def create_chat_completion(
         InferenceEndpoint.user_id == current_user.id,
         InferenceEndpoint.name == payload.model
     ).first()
+    user_id_str = str(current_user.id)
     endpoint_id = endpoint.id if endpoint else None
     actual_model = endpoint.model_id if endpoint else payload.model
     adapter_url = endpoint.adapter_url if endpoint else None
+    has_endpoint = endpoint is not None
+    # Release DB read transaction immediately before long model execution
+    db.commit()
 
     # Check if Decentralized Speculative Decoding (DSD) is requested
     if getattr(payload, "speculative", False):
@@ -279,7 +283,7 @@ def create_chat_completion(
     # Check if requested model is a decentralized sharded model (e.g. 70B/72B/33B)
     from app.sharding_engine import sharding_engine
     is_sharded_model = (
-        not endpoint
+        not has_endpoint
         and any(s_key in actual_model for s_key in ["70B", "72B", "33B", "Mixtral-8x7B"])
     )
 
@@ -375,8 +379,9 @@ def create_chat_completion(
 
         from app.cluster_worker_router import worker_tunnel_manager
         tunnel_worker_id = worker_tunnel_manager.select_online_inference_worker(
-            db, model_id=actual_model, preferred_user_id=current_user.id
+            db, model_id=actual_model, preferred_user_id=user_id_str
         )
+        db.commit()
 
         async def event_generator() -> AsyncGenerator[str, None]:
             stream_start = time.time()
@@ -481,7 +486,7 @@ def create_chat_completion(
             max_tokens=payload.max_tokens or 512,
             endpoint_id=endpoint_id,
             adapter_url=adapter_url,
-            preferred_user_id=current_user.id,
+            preferred_user_id=user_id_str,
         )
     except Exception as e:
         print(f"[GATEWAY] Real neural inference error: {e}")

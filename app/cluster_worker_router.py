@@ -33,7 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import engine, get_db
+from app.database import SessionLocal, engine, get_db
 from app.models import ComputeSlice, Task, TaskStatus, TrainingJob, Transaction, TransactionType, User, Worker
 from app.hardware_detector import inspect_universal_hardware
 from app.geo_locator import resolve_node_location
@@ -60,17 +60,23 @@ def _get_redis_client():
         return None
 
 
-def _set_worker_tunnel_redis_state(worker_id: str, online: bool) -> None:
+def _set_worker_tunnel_redis_state(worker_id: str, online: bool, is_v2: Optional[bool] = None) -> None:
     """Publish tunnel online/offline presence in Redis so Celery workers can route GPU jobs."""
     r = _get_redis_client()
     if r is None:
         return
     try:
         key = f"nebula:tunnel:online:{worker_id}"
+        v2_key = f"nebula:tunnel:v2:{worker_id}"
         if online:
             r.set(key, "1", ex=90)
+            if is_v2 is True:
+                r.set(v2_key, "1", ex=90)
+            elif is_v2 is False:
+                r.delete(v2_key)
         else:
             r.delete(key)
+            r.delete(v2_key)
     except Exception:
         pass
 
@@ -88,29 +94,49 @@ def is_worker_tunnel_online_anywhere(worker_id: str) -> bool:
         return False
 
 
+def is_worker_tunnel_v2_online_anywhere(worker_id: str) -> bool:
+    """Return True only if worker tunnel is online AND announced v2 compute dispatch support."""
+    if worker_tunnel_manager.is_connected(worker_id) and worker_tunnel_manager.worker_v2.get(worker_id):
+        return True
+    r = _get_redis_client()
+    if r is None:
+        return False
+    try:
+        return bool(r.get(f"nebula:tunnel:v2:{worker_id}"))
+    except Exception:
+        return False
+
+
 class WorkerTunnelManager:
     """Manages persistent bidirectional WebSocket tunnels and live compute RPC for remote GPU workers."""
 
     def __init__(self):
         self.active_tunnels: Dict[str, WebSocket] = {}
         self.send_locks: Dict[str, asyncio.Lock] = {}
+        self.worker_v2: Dict[str, bool] = {}
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.pending_jobs: Dict[str, asyncio.Future] = {}
         self.pending_streams: Dict[str, asyncio.Queue] = {}
         self.job_worker: Dict[str, str] = {}
         self._bridge_started: bool = False
 
+    def mark_v2_capable(self, worker_id: str) -> None:
+        self.worker_v2[worker_id] = True
+        _set_worker_tunnel_redis_state(worker_id, True, is_v2=True)
+
     async def connect(self, worker_id: str, websocket: WebSocket):
         await websocket.accept()
         self.loop = asyncio.get_running_loop()
         self.active_tunnels[worker_id] = websocket
         self.send_locks.setdefault(worker_id, asyncio.Lock())
-        _set_worker_tunnel_redis_state(worker_id, True)
+        self.worker_v2[worker_id] = False
+        _set_worker_tunnel_redis_state(worker_id, True, is_v2=False)
 
     def disconnect(self, worker_id: str, websocket: Optional[WebSocket] = None):
         if worker_id in self.active_tunnels:
             if websocket is None or self.active_tunnels[worker_id] == websocket:
                 del self.active_tunnels[worker_id]
+                self.worker_v2.pop(worker_id, None)
                 _set_worker_tunnel_redis_state(worker_id, False)
                 # Abort any pending RPC jobs/streams waiting on this disconnected worker
                 stale_reqs = [rid for rid, wid in list(self.job_worker.items()) if wid == worker_id]
@@ -155,8 +181,10 @@ class WorkerTunnelManager:
         model_id: Optional[str] = None,
         preferred_user_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Select the highest-priority connected GPU/hardware worker tunnel for inference."""
-        connected_ids = list(self.active_tunnels.keys())
+        """Select the highest-priority v2-capable connected GPU/hardware worker tunnel for inference."""
+        connected_ids = [
+            wid for wid in list(self.active_tunnels.keys()) if self.worker_v2.get(wid)
+        ]
         if not connected_ids:
             return None
 
@@ -1598,39 +1626,41 @@ def deregister_worker_node(
 async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key: Optional[str] = Query(default=None)):
     """
     Firewall/NAT-friendly persistent bidirectional WebSocket tunnel for remote GPU workers.
-    Streams live hardware telemetry heartbeats, binds worker to authenticated user account,
-    and dispatches genuine compute jobs without synthetic idle payouts.
+    Uses short-lived DB transactions per frame so idle WebSocket connections never hit
+    PostgreSQL idle-in-transaction timeouts.
     """
     await worker_tunnel_manager.connect(worker_id, websocket)
     logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel connected.")
 
-    db: Session = next(get_db())
     try:
-        # Check API key from query params or headers
-        raw_key = api_key or websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
-        user = None
-        if raw_key:
-            user = db.query(User).filter(User.api_key == raw_key.strip()).first()
+        vram_pct = 80
+        owner_id = None
+        db_init = SessionLocal()
+        try:
+            raw_key = api_key or websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
+            user = None
+            if raw_key:
+                user = db_init.query(User).filter(User.api_key == raw_key.strip()).first()
 
-        worker = db.query(Worker).filter(Worker.id == worker_id).first()
-        if worker:
-            dirty_ws = False
-            if user and worker.user_id != user.id:
-                worker.user_id = user.id
-                dirty_ws = True
-            worker.last_heartbeat = datetime.utcnow()
-            if worker.is_available and (worker.status or "").lower() != "busy":
-                worker.status = "online"
-            dirty_ws = True
-            if dirty_ws:
-                db.commit()
-                db.refresh(worker)
-            if worker.is_available and (worker.status or "").lower() == "online":
-                _trigger_queued_training_dispatch(db)
+            worker = db_init.query(Worker).filter(Worker.id == worker_id).first()
+            if worker:
+                if user and worker.user_id != user.id:
+                    worker.user_id = user.id
+                worker.last_heartbeat = datetime.utcnow()
+                if worker.is_available and (worker.status or "").lower() != "busy":
+                    worker.status = "online"
+                db_init.commit()
+                db_init.refresh(worker)
+                if worker.is_available and (worker.status or "").lower() == "online":
+                    _trigger_queued_training_dispatch(db_init)
 
-        vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
-        owner_id = worker.user_id if worker else (user.id if user else None)
-        await websocket.send_json(
+            vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
+            owner_id = worker.user_id if worker else (user.id if user else None)
+        finally:
+            db_init.close()
+
+        await worker_tunnel_manager._safe_send_json(
+            worker_id,
             {
                 "type": "init",
                 "worker_id": worker_id,
@@ -1639,35 +1669,47 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 "vram_allocation_pct": vram_pct,
                 "status": "connected",
                 "message": "WebSocket tunnel established with NetworkNebula orchestrator",
-            }
+            },
         )
 
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type", "heartbeat")
 
-            if msg_type in ("heartbeat", "telemetry"):
-                _set_worker_tunnel_redis_state(worker_id, True)
-                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
-                if w_record:
-                    w_record.last_heartbeat = datetime.utcnow()
-                    if "vram_used_gb" in data:
-                        w_record.vram_used_gb = float(data["vram_used_gb"])
-                    if "gpu_utilization_pct" in data:
-                        w_record.gpu_utilization_pct = float(data["gpu_utilization_pct"])
-                    if data.get("current_task_id"):
-                        w_record.current_task_id = data["current_task_id"]
-                        w_record.status = "busy"
-                    elif "current_task_id" in data and data["current_task_id"] is None:
-                        w_record.current_task_id = None
-                        w_record.status = "online"
-                    elif (w_record.status or "").lower() != "busy":
-                        w_record.status = "online"
-                    db.commit()
-                    db.refresh(w_record)
-                    curr_pct = int(w_record.vram_allocation_pct or 80)
+            if msg_type == "capabilities":
+                if int(data.get("protocol_version", 1)) >= 2:
+                    worker_tunnel_manager.mark_v2_capable(worker_id)
+
+            elif msg_type in ("heartbeat", "telemetry"):
+                is_v2 = bool(data.get("tunnel_protocol_v2")) or bool(worker_tunnel_manager.worker_v2.get(worker_id))
+                if data.get("tunnel_protocol_v2"):
+                    worker_tunnel_manager.mark_v2_capable(worker_id)
                 else:
-                    curr_pct = 80
+                    _set_worker_tunnel_redis_state(worker_id, True, is_v2=is_v2)
+
+                curr_pct = 80
+                db_hb = SessionLocal()
+                try:
+                    w_record = db_hb.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_record:
+                        w_record.last_heartbeat = datetime.utcnow()
+                        if "vram_used_gb" in data:
+                            w_record.vram_used_gb = float(data["vram_used_gb"])
+                        if "gpu_utilization_pct" in data:
+                            w_record.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                        if data.get("current_task_id"):
+                            w_record.current_task_id = data["current_task_id"]
+                            w_record.status = "busy"
+                        elif "current_task_id" in data and data["current_task_id"] is None:
+                            w_record.current_task_id = None
+                            w_record.status = "online"
+                        elif (w_record.status or "").lower() != "busy":
+                            w_record.status = "online"
+                        db_hb.commit()
+                        db_hb.refresh(w_record)
+                        curr_pct = int(w_record.vram_allocation_pct or 80)
+                finally:
+                    db_hb.close()
 
                 await worker_tunnel_manager._safe_send_json(
                     worker_id,
@@ -1723,58 +1765,65 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 val_loss = float(data.get("val_loss", round(avg_loss * 0.98 + 0.02, 4)))
                 ckpt_url = data.get("ckpt_url")
                 ckpt_size = int(data.get("size_bytes", 0))
-                if t_job_id:
-                    tj = db.query(TrainingJob).filter(TrainingJob.id == t_job_id).first()
-                    if tj:
-                        try:
-                            lh = json.loads(tj.loss_history) if tj.loss_history else []
-                        except Exception:
-                            lh = []
-                        lh.append({
-                            "epoch": ep_num,
-                            "step": ep_num * 100,
-                            "loss": avg_loss,
-                            "val_loss": val_loss,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                        try:
-                            ckpts = json.loads(tj.checkpoints) if tj.checkpoints else []
-                        except Exception:
-                            ckpts = []
-                        if ckpt_url:
-                            ckpts.append({
+                db_tr = SessionLocal()
+                try:
+                    if t_job_id:
+                        tj = db_tr.query(TrainingJob).filter(TrainingJob.id == t_job_id).first()
+                        if tj:
+                            try:
+                                lh = json.loads(tj.loss_history) if tj.loss_history else []
+                            except Exception:
+                                lh = []
+                            lh.append({
                                 "epoch": ep_num,
-                                "s3_url": ckpt_url,
-                                "size_bytes": ckpt_size,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "step": ep_num * 100,
+                                "loss": avg_loss,
+                                "val_loss": val_loss,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
                             })
-                            tj.final_adapter_url = ckpt_url
-                        tj.current_epoch = ep_num
-                        tj.loss_history = json.dumps(lh)
-                        tj.checkpoints = json.dumps(ckpts)
-                        db.commit()
-                w_rec = db.query(Worker).filter(Worker.id == worker_id).first()
-                if w_rec:
-                    w_rec.last_heartbeat = datetime.utcnow()
-                    w_rec.status = "busy"
-                    w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
-                    if "vram_used_gb" in data:
-                        w_rec.vram_used_gb = float(data["vram_used_gb"])
-                    if "gpu_utilization_pct" in data:
-                        w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
-                    db.commit()
+                            try:
+                                ckpts = json.loads(tj.checkpoints) if tj.checkpoints else []
+                            except Exception:
+                                ckpts = []
+                            if ckpt_url:
+                                ckpts.append({
+                                    "epoch": ep_num,
+                                    "s3_url": ckpt_url,
+                                    "size_bytes": ckpt_size,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                tj.final_adapter_url = ckpt_url
+                            tj.current_epoch = ep_num
+                            tj.loss_history = json.dumps(lh)
+                            tj.checkpoints = json.dumps(ckpts)
+                    w_rec = db_tr.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_rec:
+                        w_rec.last_heartbeat = datetime.utcnow()
+                        w_rec.status = "busy"
+                        w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
+                        if "vram_used_gb" in data:
+                            w_rec.vram_used_gb = float(data["vram_used_gb"])
+                        if "gpu_utilization_pct" in data:
+                            w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                    db_tr.commit()
+                finally:
+                    db_tr.close()
 
             elif msg_type in ("training_result", "training_error"):
                 t_job_id = data.get("job_id")
-                w_rec = db.query(Worker).filter(Worker.id == worker_id).first()
-                if w_rec:
-                    w_rec.current_task_id = None
-                    w_rec.status = "online"
-                    if "vram_used_gb" in data:
-                        w_rec.vram_used_gb = float(data["vram_used_gb"])
-                    if "gpu_utilization_pct" in data:
-                        w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
-                    db.commit()
+                db_done = SessionLocal()
+                try:
+                    w_rec = db_done.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_rec:
+                        w_rec.current_task_id = None
+                        w_rec.status = "online"
+                        if "vram_used_gb" in data:
+                            w_rec.vram_used_gb = float(data["vram_used_gb"])
+                        if "gpu_utilization_pct" in data:
+                            w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                        db_done.commit()
+                finally:
+                    db_done.close()
                 if t_job_id:
                     r = _get_redis_client()
                     if r is not None:
@@ -1789,64 +1838,67 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
 
             elif msg_type == "claim_task":
                 auto_create = bool(data.get("auto_create", False))
-                # Look for queued tasks
-                task = db.query(Task).filter(
-                    Task.status == TaskStatus.QUEUED,
-                    Task.claimed_by == None
-                ).order_by(Task.created_at.asc()).first()
+                db_clm = SessionLocal()
+                task_payload = None
+                try:
+                    task = db_clm.query(Task).filter(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.claimed_by == None
+                    ).order_by(Task.created_at.asc()).first()
 
-                if not task and not auto_create:
-                    # Queue is empty - return idle state without manufactured payouts
-                    await websocket.send_json({
+                    if task or auto_create:
+                        if not task and auto_create:
+                            task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
+                            w_record = db_clm.query(Worker).filter(Worker.id == worker_id).first()
+                            task = Task(
+                                task_id=task_id,
+                                user_id=w_record.user_id if w_record else None,
+                                prompt=data.get("prompt", "Project NetworkNebula autonomous neural inference execution"),
+                                status=TaskStatus.PROCESSING,
+                                task_mode="standalone",
+                                cost=0.0052,
+                                claimed_by=worker_id,
+                            )
+                            db_clm.add(task)
+                        else:
+                            task.claimed_by = worker_id
+                            task.status = TaskStatus.PROCESSING
+
+                        w_record = db_clm.query(Worker).filter(Worker.id == worker_id).first()
+                        if w_record:
+                            w_record.current_task_id = task.task_id
+                            w_record.status = "busy"
+                        db_clm.commit()
+                        tot_slices = int(getattr(task, "total_slices", 1) or 1)
+                        comp_slices = int(getattr(task, "completed_slices", 0) or 0)
+                        task_payload = {
+                            "type": "task_dispatch",
+                            "task": {
+                                "task_id": task.task_id,
+                                "prompt": task.prompt,
+                                "task_type": "inference",
+                                "width": getattr(task, "width", 512),
+                                "height": getattr(task, "height", 512),
+                                "steps": getattr(task, "steps", 20),
+                                "cost": float(task.cost or 0.0052),
+                                "total_slices": tot_slices,
+                                "completed_slices": comp_slices,
+                                "resume_slice_index": comp_slices + 1,
+                                "last_checkpoint_url": getattr(task, "last_checkpoint_url", None),
+                            },
+                        }
+                finally:
+                    db_clm.close()
+
+                if task_payload is None:
+                    await worker_tunnel_manager._safe_send_json(worker_id, {
                         "type": "no_tasks",
                         "status": "idle",
                         "worker_id": worker_id,
                         "timestamp": datetime.utcnow().isoformat(),
                     })
-                    continue
-
-                if not task and auto_create:
-                    # Auto-provision a task for autonomous execution ONLY if explicitly requested
-                    task_id = f"auton-task-{uuid.uuid4().hex[:8]}"
-                    w_record = db.query(Worker).filter(Worker.id == worker_id).first()
-                    task = Task(
-                        task_id=task_id,
-                        user_id=w_record.user_id if w_record else None,
-                        prompt=data.get("prompt", "Project NetworkNebula autonomous neural inference execution"),
-                        status=TaskStatus.PROCESSING,
-                        task_mode="standalone",
-                        cost=0.0052,
-                        claimed_by=worker_id,
-                    )
-                    db.add(task)
                 else:
-                    task.claimed_by = worker_id
-                    task.status = TaskStatus.PROCESSING
-
-                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
-                if w_record:
-                    w_record.current_task_id = task.task_id
-                    w_record.status = "busy"
-                db.commit()
-
-                tot_slices = int(getattr(task, "total_slices", 1) or 1)
-                comp_slices = int(getattr(task, "completed_slices", 0) or 0)
-                await websocket.send_json({
-                    "type": "task_dispatch",
-                    "task": {
-                        "task_id": task.task_id,
-                        "prompt": task.prompt,
-                        "task_type": "inference",
-                        "width": getattr(task, "width", 512),
-                        "height": getattr(task, "height", 512),
-                        "steps": getattr(task, "steps", 20),
-                        "cost": float(task.cost or 0.0052),
-                        "total_slices": tot_slices,
-                        "completed_slices": comp_slices,
-                        "resume_slice_index": comp_slices + 1,
-                        "last_checkpoint_url": getattr(task, "last_checkpoint_url", None),
-                    }
-                })
+                    await worker_tunnel_manager._safe_send_json(worker_id, task_payload)
 
             elif msg_type == "slice_submit":
                 tid = data.get("task_id")
@@ -1856,9 +1908,10 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 chk_url = data.get("checkpoint_url")
                 p_data = data.get("payload_data")
                 metrics = data.get("metrics")
+                db_sl = SessionLocal()
                 try:
                     res = settle_pods_slice(
-                        db=db,
+                        db=db_sl,
                         task_id=tid,
                         worker_id=worker_id,
                         slice_index=slice_idx,
@@ -1868,7 +1921,7 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         payload_data=p_data,
                         metrics=metrics,
                     )
-                    await websocket.send_json({
+                    reply = {
                         "type": "slice_verified_ack",
                         "status": "verified",
                         "task_id": tid,
@@ -1880,23 +1933,30 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         "total_slices": res.get("total_slices", 1),
                         "checkpoint_url": chk_url,
                         "proof_hash": p_hash,
-                    })
+                    }
                 except Exception as e:
-                    await websocket.send_json({
+                    reply = {
                         "type": "slice_error",
                         "task_id": tid,
                         "slice_index": slice_idx,
                         "error": str(e),
-                    })
+                    }
+                finally:
+                    db_sl.close()
+                await worker_tunnel_manager._safe_send_json(worker_id, reply)
 
             elif msg_type == "task_progress":
                 tid = data.get("task_id")
                 prog = float(data.get("progress", 0.0))
-                t_obj = db.query(Task).filter(Task.task_id == tid).first()
-                if t_obj:
-                    t_obj.progress = prog
-                    db.commit()
-                await websocket.send_json({
+                db_pr = SessionLocal()
+                try:
+                    t_obj = db_pr.query(Task).filter(Task.task_id == tid).first()
+                    if t_obj:
+                        t_obj.progress = prog
+                        db_pr.commit()
+                finally:
+                    db_pr.close()
+                await worker_tunnel_manager._safe_send_json(worker_id, {
                     "type": "progress_ack",
                     "task_id": tid,
                     "progress": prog,
@@ -1905,27 +1965,31 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             elif msg_type == "task_complete":
                 tid = data.get("task_id")
                 res_obj = data.get("result", {})
-                t_obj = db.query(Task).filter(Task.task_id == tid).first()
                 earnings_res = {}
-                if t_obj:
-                    t_obj.status = TaskStatus.SUCCESS
-                    t_obj.progress = 100.0
-                    t_obj.result = json.dumps(res_obj)
-                    from app.worker import attribute_worker_earnings
-                    earnings_res = attribute_worker_earnings(
-                        db=db,
-                        task_id=tid,
-                        gross_cost=float(t_obj.cost or 0.0052),
-                        description=f"Host 70% share for autonomous tunnel task {tid[:8]}",
-                        worker_id=worker_id,
-                    )
-                w_record = db.query(Worker).filter(Worker.id == worker_id).first()
-                if w_record:
-                    w_record.current_task_id = None
-                    w_record.status = "online"
-                db.commit()
+                db_tc = SessionLocal()
+                try:
+                    t_obj = db_tc.query(Task).filter(Task.task_id == tid).first()
+                    if t_obj:
+                        t_obj.status = TaskStatus.SUCCESS
+                        t_obj.progress = 100.0
+                        t_obj.result = json.dumps(res_obj)
+                        from app.worker import attribute_worker_earnings
+                        earnings_res = attribute_worker_earnings(
+                            db=db_tc,
+                            task_id=tid,
+                            gross_cost=float(t_obj.cost or 0.0052),
+                            description=f"Host 70% share for autonomous tunnel task {tid[:8]}",
+                            worker_id=worker_id,
+                        )
+                    w_record = db_tc.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_record:
+                        w_record.current_task_id = None
+                        w_record.status = "online"
+                    db_tc.commit()
+                finally:
+                    db_tc.close()
 
-                await websocket.send_json({
+                await worker_tunnel_manager._safe_send_json(worker_id, {
                     "type": "task_complete_ack",
                     "task_id": tid,
                     "status": "completed",
@@ -1939,27 +2003,27 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
         logger.warning(f"[WS_TUNNEL] Tunnel error for '{worker_id}': {e}")
     finally:
         worker_tunnel_manager.disconnect(worker_id, websocket)
-        try:
-            db.close()
-        except Exception:
-            pass
 
 
 @router.websocket("/ws/cluster")
 async def websocket_cluster_telemetry(websocket: WebSocket):
     """
     Live WebSocket broadcast stream for Cloud Console fleet monitoring.
+    Uses short-lived DB sessions per snapshot so PostgreSQL transactions are never held idle.
     """
     await cluster_broadcast_manager.connect(websocket)
-    db: Session = next(get_db())
     try:
-        workers = (
-            db.query(Worker)
-            .filter(Worker.is_available == True)
-            .order_by(Worker.created_at.asc())
-            .all()
-        )
-        nodes = [serialize_worker_node(w) for w in workers]
+        db_init = SessionLocal()
+        try:
+            workers = (
+                db_init.query(Worker)
+                .filter(Worker.is_available == True)
+                .order_by(Worker.created_at.asc())
+                .all()
+            )
+            nodes = [serialize_worker_node(w) for w in workers]
+        finally:
+            db_init.close()
         await websocket.send_json(
             {
                 "type": "telemetry_snapshot",
@@ -1974,8 +2038,12 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
             if text_or_json == "ping":
                 await websocket.send_text("pong")
             elif text_or_json == "refresh":
-                workers = db.query(Worker).filter(Worker.is_available == True).all()
-                nodes = [serialize_worker_node(w) for w in workers]
+                db_ref = SessionLocal()
+                try:
+                    workers = db_ref.query(Worker).filter(Worker.is_available == True).all()
+                    nodes = [serialize_worker_node(w) for w in workers]
+                finally:
+                    db_ref.close()
                 await websocket.send_json(
                     {
                         "type": "telemetry_snapshot",
@@ -1989,10 +2057,6 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
         logger.debug(f"[WS_CLUSTER] Subscriber disconnected: {e}")
     finally:
         cluster_broadcast_manager.disconnect(websocket)
-        try:
-            db.close()
-        except Exception:
-            pass
 
 
 # ==============================================================================

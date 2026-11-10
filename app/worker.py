@@ -946,11 +946,11 @@ def execute_training_job(*args, **kwargs):
             else:
                 target_wid = participating_workers[0] if participating_workers else None
                 from app.cluster_worker_router import (
-                    is_worker_tunnel_online_anywhere,
+                    is_worker_tunnel_v2_online_anywhere,
                     _get_redis_client,
                 )
                 r_client = _get_redis_client()
-                if target_wid and is_worker_tunnel_online_anywhere(target_wid) and r_client is not None:
+                if target_wid and is_worker_tunnel_v2_online_anywhere(target_wid) and r_client is not None:
                     from app.training_engine import training_engine
                     records = training_engine.load_dataset_records(target_dataset_s3_url)
                     dispatch_payload = {
@@ -981,7 +981,7 @@ def execute_training_job(*args, **kwargs):
                         if popped:
                             train_res = json.loads(popped[1])
                             break
-                        if is_worker_tunnel_online_anywhere(target_wid):
+                        if is_worker_tunnel_v2_online_anywhere(target_wid):
                             last_online_seen = time.time()
                         elif time.time() - last_online_seen > 20.0:
                             raise RuntimeError(f"Remote GPU worker '{target_wid}' tunnel disconnected during training.")

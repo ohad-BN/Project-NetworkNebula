@@ -1048,12 +1048,18 @@ def cmd_join(args: argparse.Namespace) -> int:
                             backoff = 2.0
                             send_lock = asyncio.Lock()
                             loop = asyncio.get_running_loop()
-                            if not args.json:
-                                print(f"[NEBULA_WORKER] Bidirectional compute tunnel connected ({registered_id}) — ready for GPU inference & LoRA training.")
 
                             async def _safe_send(payload_obj: Dict[str, Any]):
                                 async with send_lock:
                                     await ws.send(json.dumps(payload_obj))
+
+                            await _safe_send({
+                                "type": "capabilities",
+                                "protocol_version": 2,
+                                "compute_capabilities": ["inference", "training"],
+                            })
+                            if not args.json:
+                                print(f"[NEBULA_WORKER] Bidirectional compute tunnel connected ({registered_id}) — ready for GPU inference & LoRA training.")
 
                             async def _handle_dispatch(msg: Dict[str, Any]):
                                 job_type = msg.get("job_type")
@@ -1209,6 +1215,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                     live_hw = discover_hardware()
                                     await _safe_send({
                                         "type": "heartbeat",
+                                        "tunnel_protocol_v2": True,
                                         "vram_used_gb": live_hw["vram_used_gb"],
                                         "gpu_utilization_pct": live_hw["gpu_utilization_pct"],
                                         "current_task_id": active_task["id"],
