@@ -82,14 +82,12 @@ export function Navbar({ user, onLogout }: NavbarProps) {
   const [apiHealth, setApiHealth] = useState<"checking" | "online" | "offline">("checking");
 
   const checkHealth = useCallback(async (urlToCheck?: string) => {
-    const target = (urlToCheck !== undefined ? urlToCheck : currentApiUrl) || getApiBaseUrl();
-    if (!target) {
-      setApiHealth("offline");
-      return;
-    }
+    const rawTarget = urlToCheck !== undefined ? urlToCheck : currentApiUrl;
+    const base = rawTarget || getApiBaseUrl();
+    const healthEndpoint = base ? `${base.replace(/\/+$/, "")}/health` : "/health";
     setApiHealth("checking");
     try {
-      const res = await fetch(`${target}/health`, { method: "GET", signal: AbortSignal.timeout(3000) });
+      const res = await fetch(healthEndpoint, { method: "GET", signal: AbortSignal.timeout(3000) });
       if (res.ok) {
         setApiHealth("online");
       } else {

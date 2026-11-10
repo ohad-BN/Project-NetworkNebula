@@ -9,6 +9,7 @@ import { LoadingSpinner } from '@/components/common/loading-spinner';
 import { ImagePreview } from '@/components/common/image-preview';
 import { EmptyState } from '@/components/common/empty-state';
 import { taskService } from '@/services/api/tasks';
+import { resolveAssetUrl } from '@/services/api/client';
 import type { TaskStatus } from '@/types/index';
 
 const RATE_PER_MEGAPIXEL_STEP = 0.001;
@@ -71,7 +72,8 @@ export function JobStatusPage() {
 
   const rawTask = task as (TaskStatus & { output_url?: string }) | null;
   const taskOutput = rawTask?.result as { width?: number; height?: number; steps?: number; image_url?: string; prompt?: string } | null;
-  const imageUrl = taskOutput?.image_url || rawTask?.output_url || (rawTask?.result as { output_url?: string } | null)?.output_url;
+  const rawImageUrl = taskOutput?.image_url || rawTask?.output_url || (rawTask?.result as { output_url?: string } | null)?.output_url;
+  const imageUrl = resolveAssetUrl(rawImageUrl);
 
   const handleDownload = () => {
     if (imageUrl) {

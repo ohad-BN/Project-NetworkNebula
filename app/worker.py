@@ -191,6 +191,29 @@ def attribute_worker_earnings(
     }
 
 
+def _is_fast_poc_mode(model_id: Optional[str] = None) -> bool:
+    """Return True if fast lightweight execution is requested or default on CPU servers."""
+    env_flag = os.environ.get("FAST_POC_MODE", "").lower() in ("1", "true", "yes")
+    cfg_flag = bool(getattr(settings, "FAST_POC_MODE", False))
+    return model_id == "fast-poc" or cfg_flag or env_flag
+
+
+def _generate_fast_poc_image(prompt: str, width: int, height: int) -> Image.Image:
+    """Generate a deterministic visual preview on CPU/low-RAM hosts without Stable Diffusion."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (width, height), color=(15, 23, 42))
+    draw = ImageDraw.Draw(img)
+    for _ in range(40):
+        x = random.randint(0, width)
+        y = random.randint(0, height)
+        r = random.randint(15, 90)
+        color = (random.randint(2, 50), random.randint(132, 220), random.randint(200, 255))
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
+    draw.text((20, max(10, height - 40)), f"Nebula Generated: {prompt[:35]}", fill=(255, 255, 255))
+    return img
+
+
 @celery_app.task(name="render_image", bind=True)
 def render_image(
     self,
@@ -228,7 +251,7 @@ def render_image(
 
     try:
         try:
-            if model_id == "fast-poc" or getattr(settings, "FAST_POC_MODE", False) or os.environ.get("FAST_POC_MODE", "").lower() in ["1", "true"]:
+            if _is_fast_poc_mode(model_id):
                 raise RuntimeError("Fast PoC visual generation requested")
             pipe = load_stable_diffusion_pipeline(model_id)
 
@@ -257,17 +280,7 @@ def render_image(
                 result_image = output.images[0]
         except Exception as sd_err:
             print(f"[WORKER] SD pipeline fallback active: {sd_err}")
-            # Generate artistic high-speed PoC visual representation
-            from PIL import Image, ImageDraw
-            result_image = Image.new("RGB", (width, height), color=(15, 23, 42))
-            draw = ImageDraw.Draw(result_image)
-            for _ in range(40):
-                x = random.randint(0, width)
-                y = random.randint(0, height)
-                r = random.randint(15, 90)
-                color = (random.randint(2, 50), random.randint(132, 220), random.randint(200, 255))
-                draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
-            draw.text((20, height - 40), f"Nebula Generated: {prompt[:35]}", fill=(255, 255, 255))
+            result_image = _generate_fast_poc_image(prompt, width, height)
 
         output_filename = f"renders/{user_id}/{task_id}.png"
         from app.storage import upload_image_to_minio
@@ -382,7 +395,13 @@ def run_batch_inference(
         prompts = [prompt] * batch_size
 
     try:
-        pipe = load_stable_diffusion_pipeline(model_id)
+        pipe = None
+        if not _is_fast_poc_mode(model_id):
+            try:
+                pipe = load_stable_diffusion_pipeline(model_id)
+            except Exception as sd_err:
+                print(f"[WORKER] Batch SD pipeline fallback active: {sd_err}")
+                pipe = None
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         output_urls = []
@@ -390,28 +409,33 @@ def run_batch_inference(
         for i, p in enumerate(prompts):
             print(f"[WORKER] Batch image {i+1}/{len(prompts)}: {p}")
 
-            generator = torch.Generator(device=device)
-            current_seed = seed + i if seed is not None else None
-            if current_seed is not None:
-                generator = generator.manual_seed(current_seed)
+            if pipe is not None:
+                generator = torch.Generator(device=device)
+                current_seed = seed + i if seed is not None else None
+                if current_seed is not None:
+                    generator = generator.manual_seed(current_seed)
 
-            for j in range(steps):
-                time.sleep(0.2)
-                progress = ((i * steps + j + 1) / (len(prompts) * steps)) * 100.0
+                for j in range(steps):
+                    time.sleep(0.2)
+                    progress = ((i * steps + j + 1) / (len(prompts) * steps)) * 100.0
+                    update_task_progress(None, task_id, progress)
+                    if j % 10 == 0:
+                        print(f"[WORKER] Batch Progress: {progress:.1f}%")
+
+                with torch.no_grad():
+                    output = pipe(
+                        p,
+                        width=width,
+                        height=height,
+                        num_inference_steps=steps,
+                        generator=generator,
+                        guidance_scale=7.5,
+                    )
+                    result_image = output.images[0]
+            else:
+                progress = ((i + 1) / max(1, len(prompts))) * 100.0
                 update_task_progress(None, task_id, progress)
-                if j % 10 == 0:
-                    print(f"[WORKER] Batch Progress: {progress:.1f}%")
-
-            with torch.no_grad():
-                output = pipe(
-                    p,
-                    width=width,
-                    height=height,
-                    num_inference_steps=steps,
-                    generator=generator,
-                    guidance_scale=7.5,
-                )
-                result_image = output.images[0]
+                result_image = _generate_fast_poc_image(p, width, height)
 
             output_filename = f"renders/{user_id}/{task_id}/batch_{i}.png"
             from app.storage import upload_image_to_minio
@@ -525,29 +549,25 @@ def train_model(
     print(f"[WORKER] GPU: {gpu_info}")
 
     try:
-        from diffusers import DDPMScheduler, UNet2DConditionModel
-        from transformers import AutoTokenizer
-        from torch.utils.data import Dataset, DataLoader
-        import tempfile
-
-        # Load components
-        pipe = load_stable_diffusion_pipeline(model_id)
-        tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Create training dataset (placeholder for actual implementation)
-        # In production, this would download and parse training_data_url
         concept_token = f"<{prompt.replace(' ', '_')}>"
+        if not _is_fast_poc_mode(model_id):
+            try:
+                from transformers import AutoTokenizer
 
-        # Add the new token to tokenizer
-        num_added_tokens = tokenizer.add_tokens(concept_token)
-        if num_added_tokens > 0:
-            pipe.text_encoder.resize_token_embeddings(len(tokenizer))
-            token_ids = tokenizer.encode(concept_token, add_special_tokens=False)
-            if token_ids:
-                new_token_id = token_ids[0]
-                print(f"[WORKER] Added concept token '{concept_token}' with ID {new_token_id}")
+                # Load components
+                pipe = load_stable_diffusion_pipeline(model_id)
+                tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+
+                # Add the new token to tokenizer
+                num_added_tokens = tokenizer.add_tokens(concept_token)
+                if num_added_tokens > 0:
+                    pipe.text_encoder.resize_token_embeddings(len(tokenizer))
+                    token_ids = tokenizer.encode(concept_token, add_special_tokens=False)
+                    if token_ids:
+                        new_token_id = token_ids[0]
+                        print(f"[WORKER] Added concept token '{concept_token}' with ID {new_token_id}")
+            except Exception as sd_err:
+                print(f"[WORKER] Training SD pipeline fallback active: {sd_err}")
 
         # Simulate training progress
         print(f"[WORKER] Training type: {train_type}")
@@ -708,7 +728,7 @@ def execute_training_job(*args, **kwargs):
         # Parse hyperparameters & settings
         total_epochs = max(1, job.total_epochs or 3)
         num_gpus = max(1, int(job.num_gpus or 1))
-        fast_mode = os.getenv("FAST_POC_MODE", "false").lower() in ("true", "1", "yes")
+        fast_mode = _is_fast_poc_mode(None)
         try:
             hyperparams = json.loads(job.hyperparameters) if job.hyperparameters else {}
         except Exception:

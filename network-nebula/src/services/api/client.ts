@@ -47,6 +47,32 @@ export const setApiBaseUrl = (url: string) => {
   }
 };
 
+/**
+ * Resolve internal Docker/localhost MinIO object URLs to browser-reachable URLs.
+ * Routes through Nginx bucket proxies on remote hosts while preserving Vite local dev on :5173.
+ */
+export const resolveAssetUrl = (url?: string | null): string | undefined => {
+  if (!url) return undefined;
+  const trimmed = url.trim();
+  const minioMatch = trimmed.match(/^https?:\/\/(minio|localhost|127\.0\.0\.1):9000(\/(nebula-(?:renders|datasets|checkpoints|models))\/.*)$/i);
+  if (!minioMatch) {
+    return trimmed;
+  }
+  const host = minioMatch[1].toLowerCase();
+  const objectPath = minioMatch[2];
+  if (typeof window !== "undefined") {
+    const isLocalBrowser =
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1";
+    const apiBase = getApiBaseUrl();
+    if (isLocalBrowser && apiBase.includes(":8000")) {
+      return `http://${window.location.hostname}:9000${objectPath}`;
+    }
+    return apiBase ? `${apiBase}${objectPath}` : objectPath;
+  }
+  return host === "minio" ? objectPath : trimmed;
+};
+
 const API_BASE_URL = getApiBaseUrl();
 
 export const apiClient = axios.create({

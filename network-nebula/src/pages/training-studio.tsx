@@ -27,7 +27,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { apiClient } from "@/services/api/client";
+import { apiClient, resolveAssetUrl } from "@/services/api/client";
 import { toast } from "sonner";
 
 interface ClusterNodeItem {
@@ -74,7 +74,7 @@ export function TrainingStudioPage() {
   const [jobName, setJobName] = useState("");
   const [baseModel, setBaseModel] = useState("Qwen/Qwen2.5-0.5B-Instruct");
   const [trainType, setTrainType] = useState("lora");
-  const [datasetUrl, setDatasetUrl] = useState("http://localhost:9000/nebula-datasets/enterprise/real_alpaca_dataset.jsonl");
+  const [datasetUrl, setDatasetUrl] = useState("s3://nebula-datasets/enterprise/real_alpaca_dataset.jsonl");
   const [epochs, setEpochs] = useState("3");
   const [learningRate, setLearningRate] = useState("0.0002");
   const [loraR, setLoraR] = useState("16");
@@ -755,7 +755,7 @@ export function TrainingStudioPage() {
                           </div>
                         </div>
                         <a
-                          href={ckpt.s3_url}
+                          href={resolveAssetUrl(ckpt.s3_url)}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"

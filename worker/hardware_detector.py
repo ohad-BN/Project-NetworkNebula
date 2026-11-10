@@ -153,6 +153,7 @@ def probe_cpu_info() -> Dict[str, Any]:
     return {
         "cpu_model": cpu_model,
         "cpu_architecture": norm_arch,
+        "cpu_cores": logical_cores,
         "cpu_physical_cores": physical_cores,
         "cpu_logical_cores": logical_cores,
     }

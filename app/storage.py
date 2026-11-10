@@ -24,6 +24,7 @@ class StorageClient:
         )
         self.bucket = bucket
         self.endpoint = endpoint
+        self._verified_buckets: set = set()
 
     def ensure_bucket_exists(self, bucket_name: Optional[str] = None):
         target_bucket = bucket_name or self.bucket
@@ -53,15 +54,17 @@ class StorageClient:
             self.s3.put_bucket_policy(Bucket=target_bucket, Policy=policy)
         except Exception as e:
             logger.warning(f"Could not set public bucket policy on {target_bucket}: {e}")
+        self._verified_buckets.add(target_bucket)
 
     def ensure_all_enterprise_buckets_exist(self) -> List[str]:
         """Ensure all enterprise platform buckets exist in MinIO"""
-        buckets = [
-            self.bucket,               # "nebula-renders"
+        buckets = list(dict.fromkeys([
+            self.bucket,
+            "nebula-renders",          # Image & render task outputs
             "nebula-datasets",         # Customer fine-tuning datasets
             "nebula-checkpoints",      # LoRA and model checkpoints (.safetensors)
             "nebula-models",           # Foundation model weight cache
-        ]
+        ]))
         created = []
         for b in buckets:
             self.ensure_bucket_exists(b)
@@ -77,6 +80,8 @@ class StorageClient:
     ) -> str:
         """Upload raw bytes to a specific bucket"""
         try:
+            if bucket not in self._verified_buckets:
+                self.ensure_bucket_exists(bucket)
             self.s3.put_object(
                 Bucket=bucket,
                 Key=object_name,
