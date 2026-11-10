@@ -45,6 +45,15 @@ DEFAULT_MODELS = [
         "parent": None,
     },
     {
+        "id": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "object": "model",
+        "created": 1730000000,
+        "owned_by": "nebula-cluster",
+        "permission": [],
+        "root": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "parent": None,
+    },
+    {
         "id": "meta-llama/Llama-3-8B",
         "object": "model",
         "created": 1713430000,
@@ -353,31 +362,8 @@ def create_chat_completion(
     # Dispatch inference to worker
     raw_messages = [{"role": m.role, "content": m.content} for m in payload.messages]
 
-    try:
-        # Run inference via Celery task or local inline
-        worker_res = serve_inference_request(
-            model=actual_model,
-            messages=raw_messages,
-            temperature=payload.temperature or 0.7,
-            max_tokens=payload.max_tokens or 512,
-            endpoint_id=endpoint_id,
-            adapter_url=adapter_url
-        )
-    except Exception as e:
-        print(f"[GATEWAY] Worker inference execution error: {e}")
-        worker_res = {
-            "content": f"Response from {payload.model} via NetworkNebula enterprise GPU cluster.",
-            "prompt_tokens": 12,
-            "completion_tokens": 20,
-            "total_tokens": 32,
-            "latency_ms": 50.0
-        }
-
-    completion_text = worker_res["content"]
-
-    # Handle Server-Sent Events (SSE) Streaming
+    # Handle Server-Sent Events (SSE) Streaming directly without duplicate blocking inference
     if payload.stream:
-        # If endpoint_id provided, record request in telemetry
         if endpoint_id:
             try:
                 ep = db.query(InferenceEndpoint).filter(InferenceEndpoint.id == endpoint_id).first()
@@ -387,62 +373,121 @@ def create_chat_completion(
             except Exception as e:
                 print(f"[GATEWAY] Failed to update endpoint request count: {e}")
 
+        from app.cluster_worker_router import worker_tunnel_manager
+        tunnel_worker_id = worker_tunnel_manager.select_online_inference_worker(
+            db, model_id=actual_model, preferred_user_id=current_user.id
+        )
+
         async def event_generator() -> AsyncGenerator[str, None]:
+            stream_start = time.time()
             try:
-                from app.inference_engine import inference_engine
-                for token_chunk in inference_engine.generate_stream(
-                    messages=raw_messages,
-                    model_id=actual_model,
-                    adapter_url=adapter_url,
-                    temperature=payload.temperature or 0.7,
-                    max_tokens=payload.max_tokens or 512
-                ):
-                    chunk_data = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_timestamp,
-                        "model": payload.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": token_chunk},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                if tunnel_worker_id:
+                    async for ev in worker_tunnel_manager.stream_inference(
+                        worker_id=tunnel_worker_id,
+                        messages=raw_messages,
+                        model_id=actual_model,
+                        adapter_url=adapter_url,
+                        temperature=payload.temperature or 0.7,
+                        max_tokens=payload.max_tokens or 512,
+                    ):
+                        if ev.get("done"):
+                            break
+                        token_chunk = ev.get("token", "")
+                        if token_chunk:
+                            chunk_data = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_timestamp,
+                                "model": payload.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": token_chunk},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(chunk_data)}\n\n"
+
+                    # Record worker earnings on streamed GPU inference completion
+                    try:
+                        from app.database import SessionLocal
+                        from app.worker import attribute_worker_earnings
+                        db_earn = SessionLocal()
+                        try:
+                            attribute_worker_earnings(
+                                db=db_earn,
+                                task_id=f"inf-{uuid.uuid4().hex[:8]}",
+                                gross_cost=0.0052,
+                                description=f"Host 70% share for streamed GPU inference ({actual_model})",
+                                worker_id=tunnel_worker_id,
+                            )
+                        finally:
+                            db_earn.close()
+                    except Exception:
+                        pass
+                else:
+                    from app.inference_engine import inference_engine
+                    for token_chunk in inference_engine.generate_stream(
+                        messages=raw_messages,
+                        model_id=actual_model,
+                        adapter_url=adapter_url,
+                        temperature=payload.temperature or 0.7,
+                        max_tokens=payload.max_tokens or 512,
+                    ):
+                        chunk_data = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_timestamp,
+                            "model": payload.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": token_chunk},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_timestamp,
+                    "model": payload.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
             except Exception as e:
                 print(f"[STREAM] Real neural streaming error: {e}")
-                # Resilient fallback stream
-                fallback_words = f"NetworkNebula inference online for {payload.model}.".split(" ")
-                for word in fallback_words:
-                    chunk_data = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_timestamp,
-                        "model": payload.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": word + " "},
-                            "finish_reason": None
-                        }]
+                err_chunk = {
+                    "error": {
+                        "message": str(e),
+                        "type": "inference_error",
+                        "code": "model_execution_failed",
                     }
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
-
-            # Final finish chunk
-            final_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_timestamp,
-                "model": payload.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
+                }
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    try:
+        worker_res = serve_inference_request(
+            model=actual_model,
+            messages=raw_messages,
+            temperature=payload.temperature or 0.7,
+            max_tokens=payload.max_tokens or 512,
+            endpoint_id=endpoint_id,
+            adapter_url=adapter_url,
+            preferred_user_id=current_user.id,
+        )
+    except Exception as e:
+        print(f"[GATEWAY] Real neural inference error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+    completion_text = worker_res["content"]
 
     # Standard Non-Streaming JSON Response
     return {

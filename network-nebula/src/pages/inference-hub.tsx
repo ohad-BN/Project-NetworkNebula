@@ -218,15 +218,44 @@ export function InferenceHubPage() {
 
       if (isStream) {
         const streamEndpoint = `${getApiBaseUrl()}/v1/chat/completions`;
+        let apiKey = localStorage.getItem("api_key");
+        let apiSecret = localStorage.getItem("api_secret");
+        if (!apiKey) {
+          try {
+            const stored = localStorage.getItem("auth-storage");
+            if (stored) {
+              const parsedAuth = JSON.parse(stored);
+              apiKey = parsedAuth.state?.apiKey || parsedAuth.apiKey;
+              apiSecret = parsedAuth.state?.apiSecret || parsedAuth.apiSecret;
+            }
+          } catch {
+            // ignore storage parse error
+          }
+        }
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (apiKey) headers["X-API-Key"] = apiKey;
+        if (apiSecret) headers["X-API-Secret"] = apiSecret;
+
         const response = await fetch(streamEndpoint, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify({
             model: selectedModel,
             messages,
             stream: true,
           }),
         });
+
+        if (!response.ok) {
+          let errMsg = `Inference request failed (HTTP ${response.status})`;
+          try {
+            const errJson = await response.json();
+            errMsg = errJson?.detail || errJson?.error?.message || errMsg;
+          } catch {
+            // ignore json parse failure
+          }
+          throw new Error(errMsg);
+        }
 
         if (!response.body) throw new Error("No readable stream");
         const reader = response.body.getReader();
@@ -236,20 +265,29 @@ export function InferenceHubPage() {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const chunk = decoder.decode(value);
+          const chunk = decoder.decode(value, { stream: true });
           const lines = chunk.split("\n");
           for (const line of lines) {
             if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+              let parsed: any = null;
               try {
-                const parsed = JSON.parse(line.slice(6));
-                const text = parsed.choices?.[0]?.delta?.content || "";
+                parsed = JSON.parse(line.slice(6));
+              } catch {
+                continue;
+              }
+              if (parsed?.error?.message) {
+                throw new Error(parsed.error.message);
+              }
+              const text = parsed?.choices?.[0]?.delta?.content || "";
+              if (text) {
                 accumulated += text;
                 setPlaygroundOutput(accumulated);
-              } catch {
-                // Ignore parse chunk
               }
             }
           }
+        }
+        if (!accumulated.trim()) {
+          throw new Error("Model stream returned an empty response.");
         }
         setGenerationStats({ latency: Math.round(performance.now() - startTime) });
       } else {
@@ -259,7 +297,11 @@ export function InferenceHubPage() {
           stream: false,
         });
         const choice = res.data?.choices?.[0];
-        setPlaygroundOutput(choice?.message?.content || "No response");
+        const content = choice?.message?.content;
+        if (!content || !String(content).trim()) {
+          throw new Error("Model returned an empty completion.");
+        }
+        setPlaygroundOutput(content);
         setGenerationStats({
           tokens: res.data?.usage?.total_tokens,
           latency: Math.round(performance.now() - startTime),
@@ -267,7 +309,9 @@ export function InferenceHubPage() {
         fetchEndpoints();
       }
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || "Inference call failed");
+      const errMsg = err?.response?.data?.detail || err?.message || "Inference call failed";
+      setPlaygroundOutput(`[Error] ${errMsg}`);
+      toast.error(errMsg);
     } finally {
       setIsGenerating(false);
     }

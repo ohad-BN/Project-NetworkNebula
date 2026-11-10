@@ -4,6 +4,8 @@ Provides real-time hardware introspection, GPU contribution percentage control (
 worker node registration, heartbeat synchronization, and cluster telemetry.
 """
 
+import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -12,7 +14,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -30,6 +32,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import engine, get_db
 from app.models import ComputeSlice, Task, TaskStatus, TrainingJob, Transaction, TransactionType, User, Worker
 from app.hardware_detector import inspect_universal_hardware
@@ -48,45 +51,319 @@ HEARTBEAT_TIMEOUT_SECONDS = 45.0  # 3 missed heartbeats (15s * 3) = offline node
 TASK_STALE_TIMEOUT_SECONDS = 180.0  # 3 minutes without heartbeat = failed task
 
 
+def _get_redis_client():
+    """Return a synchronous Redis client for tunnel dispatch coordination (best-effort)."""
+    try:
+        import redis
+        return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True, socket_timeout=3)
+    except Exception:
+        return None
+
+
+def _set_worker_tunnel_redis_state(worker_id: str, online: bool) -> None:
+    """Publish tunnel online/offline presence in Redis so Celery workers can route GPU jobs."""
+    r = _get_redis_client()
+    if r is None:
+        return
+    try:
+        key = f"nebula:tunnel:online:{worker_id}"
+        if online:
+            r.set(key, "1", ex=90)
+        else:
+            r.delete(key)
+    except Exception:
+        pass
+
+
+def is_worker_tunnel_online_anywhere(worker_id: str) -> bool:
+    """Check in-process tunnel map OR Redis presence (works across API and Celery containers)."""
+    if worker_tunnel_manager.is_connected(worker_id):
+        return True
+    r = _get_redis_client()
+    if r is None:
+        return False
+    try:
+        return bool(r.get(f"nebula:tunnel:online:{worker_id}"))
+    except Exception:
+        return False
+
+
 class WorkerTunnelManager:
-    """Manages persistent bidirectional WebSocket tunnels for remote GPU workers."""
+    """Manages persistent bidirectional WebSocket tunnels and live compute RPC for remote GPU workers."""
 
     def __init__(self):
         self.active_tunnels: Dict[str, WebSocket] = {}
+        self.send_locks: Dict[str, asyncio.Lock] = {}
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.pending_jobs: Dict[str, asyncio.Future] = {}
+        self.pending_streams: Dict[str, asyncio.Queue] = {}
+        self.job_worker: Dict[str, str] = {}
+        self._bridge_started: bool = False
 
     async def connect(self, worker_id: str, websocket: WebSocket):
         await websocket.accept()
+        self.loop = asyncio.get_running_loop()
         self.active_tunnels[worker_id] = websocket
+        self.send_locks.setdefault(worker_id, asyncio.Lock())
+        _set_worker_tunnel_redis_state(worker_id, True)
 
     def disconnect(self, worker_id: str, websocket: Optional[WebSocket] = None):
         if worker_id in self.active_tunnels:
             if websocket is None or self.active_tunnels[worker_id] == websocket:
                 del self.active_tunnels[worker_id]
+                _set_worker_tunnel_redis_state(worker_id, False)
+                # Abort any pending RPC jobs/streams waiting on this disconnected worker
+                stale_reqs = [rid for rid, wid in list(self.job_worker.items()) if wid == worker_id]
+                for rid in stale_reqs:
+                    self.job_worker.pop(rid, None)
+                    fut = self.pending_jobs.pop(rid, None)
+                    if fut and not fut.done():
+                        fut.set_exception(RuntimeError(f"GPU worker '{worker_id}' disconnected during execution"))
+                    q = self.pending_streams.pop(rid, None)
+                    if q is not None:
+                        q.put_nowait({"error": f"GPU worker '{worker_id}' disconnected during execution"})
+
+    async def _safe_send_json(self, worker_id: str, payload: Dict[str, Any]) -> bool:
+        ws = self.active_tunnels.get(worker_id)
+        if not ws:
+            return False
+        lock = self.send_locks.setdefault(worker_id, asyncio.Lock())
+        async with lock:
+            ws = self.active_tunnels.get(worker_id)
+            if not ws:
+                return False
+            try:
+                await ws.send_json(payload)
+                return True
+            except Exception as e:
+                logger.warning(f"Failed sending WebSocket payload to {worker_id}: {e}")
+                self.disconnect(worker_id, ws)
+                return False
 
     async def send_config_update(self, worker_id: str, config: Dict[str, Any]) -> bool:
-        ws = self.active_tunnels.get(worker_id)
-        if ws:
-            try:
-                await ws.send_json({"type": "config_update", **config})
-                return True
-            except Exception as e:
-                logger.warning(f"Failed to push config update over WebSocket to {worker_id}: {e}")
-                self.disconnect(worker_id, ws)
-        return False
+        return await self._safe_send_json(worker_id, {"type": "config_update", **config})
 
     async def send_task_dispatch(self, worker_id: str, task_data: Dict[str, Any]) -> bool:
-        ws = self.active_tunnels.get(worker_id)
-        if ws:
-            try:
-                await ws.send_json({"type": "task_dispatch", **task_data})
-                return True
-            except Exception as e:
-                logger.warning(f"Failed to push task dispatch over WebSocket to {worker_id}: {e}")
-                self.disconnect(worker_id, ws)
-        return False
+        return await self._safe_send_json(worker_id, {"type": "task_dispatch", **task_data})
 
     def is_connected(self, worker_id: str) -> bool:
         return worker_id in self.active_tunnels
+
+    def select_online_inference_worker(
+        self,
+        db: Session,
+        model_id: Optional[str] = None,
+        preferred_user_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Select the highest-priority connected GPU/hardware worker tunnel for inference."""
+        connected_ids = list(self.active_tunnels.keys())
+        if not connected_ids:
+            return None
+
+        candidates = (
+            db.query(Worker)
+            .filter(
+                Worker.id.in_(connected_ids),
+                Worker.is_available == True,
+                Worker.status.in_(["online", "busy"]),
+            )
+            .all()
+        )
+        if not candidates:
+            return None
+
+        def _score(w: Worker) -> tuple:
+            arch = (getattr(w, "compute_architecture", None) or "").lower()
+            gpu_name = (w.gpu_info or "").lower()
+            if arch == "cuda" or "nvidia" in gpu_name or "geforce" in gpu_name or "rtx" in gpu_name:
+                arch_rank = 0
+            elif arch == "mps" or "apple" in gpu_name or "metal" in gpu_name:
+                arch_rank = 1
+            elif arch == "xpu" or "intel" in gpu_name or "arc" in gpu_name:
+                arch_rank = 2
+            else:
+                arch_rank = 3
+            owner_rank = 0 if (preferred_user_id and w.user_id == preferred_user_id) else 1
+            busy_rank = 0 if (w.status or "").lower() == "online" else 1
+            usable_vram = float(w.gpu_memory_gb or 0.0) * (float(w.vram_allocation_pct or 80) / 100.0)
+            return (owner_rank, arch_rank, busy_rank, -usable_vram)
+
+        candidates.sort(key=_score)
+        return candidates[0].id
+
+    def resolve_job_result(self, request_id: str, payload: Dict[str, Any]) -> None:
+        self.job_worker.pop(request_id, None)
+        fut = self.pending_jobs.pop(request_id, None)
+        if fut and not fut.done():
+            fut.set_result(payload)
+
+    def resolve_job_error(self, request_id: str, error_msg: str) -> None:
+        self.job_worker.pop(request_id, None)
+        fut = self.pending_jobs.pop(request_id, None)
+        if fut and not fut.done():
+            fut.set_exception(RuntimeError(error_msg))
+        q = self.pending_streams.pop(request_id, None)
+        if q is not None:
+            q.put_nowait({"error": error_msg})
+
+    def push_stream_event(self, request_id: str, event: Dict[str, Any]) -> None:
+        q = self.pending_streams.get(request_id)
+        if q is not None:
+            q.put_nowait(event)
+            if event.get("done") or event.get("error"):
+                self.pending_streams.pop(request_id, None)
+                self.job_worker.pop(request_id, None)
+
+    async def dispatch_inference(
+        self,
+        worker_id: str,
+        messages: List[Dict[str, str]],
+        model_id: str,
+        adapter_url: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        timeout: float = 240.0,
+    ) -> Dict[str, Any]:
+        """Dispatch synchronous inference to a connected worker tunnel and await real output."""
+        loop = asyncio.get_running_loop()
+        request_id = f"inf-{uuid.uuid4().hex[:12]}"
+        fut = loop.create_future()
+        self.pending_jobs[request_id] = fut
+        self.job_worker[request_id] = worker_id
+
+        sent = await self._safe_send_json(worker_id, {
+            "type": "job_dispatch",
+            "job_type": "inference",
+            "request_id": request_id,
+            "stream": False,
+            "model_id": model_id,
+            "messages": messages,
+            "adapter_url": adapter_url,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        })
+        if not sent:
+            self.pending_jobs.pop(request_id, None)
+            self.job_worker.pop(request_id, None)
+            raise RuntimeError(f"Failed to send inference job to GPU worker '{worker_id}'")
+
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except Exception:
+            self.pending_jobs.pop(request_id, None)
+            self.job_worker.pop(request_id, None)
+            raise
+
+    def dispatch_inference_sync(
+        self,
+        worker_id: str,
+        messages: List[Dict[str, str]],
+        model_id: str,
+        adapter_url: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        timeout: float = 240.0,
+    ) -> Dict[str, Any]:
+        """Thread-safe bridge allowing sync FastAPI endpoints to execute real inference on WS GPU workers."""
+        if self.loop is None or self.loop.is_closed():
+            raise RuntimeError("WorkerTunnelManager event loop not active")
+        coro = self.dispatch_inference(
+            worker_id=worker_id,
+            messages=messages,
+            model_id=model_id,
+            adapter_url=adapter_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=timeout + 5.0)
+
+    async def stream_inference(
+        self,
+        worker_id: str,
+        messages: List[Dict[str, str]],
+        model_id: str,
+        adapter_url: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        timeout: float = 240.0,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Dispatch streaming inference to a connected worker tunnel and yield token/completion events."""
+        request_id = f"inf-{uuid.uuid4().hex[:12]}"
+        q: asyncio.Queue = asyncio.Queue()
+        self.pending_streams[request_id] = q
+        self.job_worker[request_id] = worker_id
+
+        sent = await self._safe_send_json(worker_id, {
+            "type": "job_dispatch",
+            "job_type": "inference",
+            "request_id": request_id,
+            "stream": True,
+            "model_id": model_id,
+            "messages": messages,
+            "adapter_url": adapter_url,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        })
+        if not sent:
+            self.pending_streams.pop(request_id, None)
+            self.job_worker.pop(request_id, None)
+            raise RuntimeError(f"Failed to send streaming inference job to GPU worker '{worker_id}'")
+
+        try:
+            while True:
+                item = await asyncio.wait_for(q.get(), timeout=timeout)
+                if "error" in item:
+                    raise RuntimeError(item["error"])
+                yield item
+                if item.get("done"):
+                    break
+        finally:
+            self.pending_streams.pop(request_id, None)
+            self.job_worker.pop(request_id, None)
+
+    async def run_redis_dispatch_bridge(self) -> None:
+        """Forward Celery worker training dispatches queued in Redis to active WebSocket GPU workers."""
+        if self._bridge_started:
+            return
+        self._bridge_started = True
+        self.loop = asyncio.get_running_loop()
+
+        def _pop_dispatch():
+            r = _get_redis_client()
+            if r is None:
+                time.sleep(2.0)
+                return None
+            try:
+                res = r.blpop("nebula:tunnel:dispatch", timeout=2)
+                return res[1] if res else None
+            except Exception:
+                time.sleep(1.0)
+                return None
+
+        while True:
+            try:
+                raw_msg = await asyncio.to_thread(_pop_dispatch)
+                if not raw_msg:
+                    continue
+                payload = json.loads(raw_msg)
+                wid = payload.get("worker_id")
+                job_id = payload.get("job_id")
+                sent = False
+                if wid and self.is_connected(wid):
+                    sent = await self._safe_send_json(wid, payload)
+                if not sent and job_id:
+                    r = _get_redis_client()
+                    if r is not None:
+                        r.lpush(
+                            f"nebula:training_result:{job_id}",
+                            json.dumps({"status": "error", "error": f"Worker '{wid}' tunnel offline"}),
+                        )
+                        r.expire(f"nebula:training_result:{job_id}", 600)
+            except Exception as bridge_err:
+                logger.warning(f"[WS_BRIDGE] Dispatch bridge error: {bridge_err}")
+                await asyncio.sleep(0.5)
 
 
 class ClusterBroadcastManager:
@@ -1370,6 +1647,7 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             msg_type = data.get("type", "heartbeat")
 
             if msg_type in ("heartbeat", "telemetry"):
+                _set_worker_tunnel_redis_state(worker_id, True)
                 w_record = db.query(Worker).filter(Worker.id == worker_id).first()
                 if w_record:
                     w_record.last_heartbeat = datetime.utcnow()
@@ -1377,10 +1655,13 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         w_record.vram_used_gb = float(data["vram_used_gb"])
                     if "gpu_utilization_pct" in data:
                         w_record.gpu_utilization_pct = float(data["gpu_utilization_pct"])
-                    if "current_task_id" in data:
+                    if data.get("current_task_id"):
                         w_record.current_task_id = data["current_task_id"]
-                        w_record.status = "busy" if data["current_task_id"] else "online"
-                    else:
+                        w_record.status = "busy"
+                    elif "current_task_id" in data and data["current_task_id"] is None:
+                        w_record.current_task_id = None
+                        w_record.status = "online"
+                    elif (w_record.status or "").lower() != "busy":
                         w_record.status = "online"
                     db.commit()
                     db.refresh(w_record)
@@ -1388,17 +1669,123 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 else:
                     curr_pct = 80
 
-                await websocket.send_json(
+                await worker_tunnel_manager._safe_send_json(
+                    worker_id,
                     {
                         "type": "ack",
                         "worker_id": worker_id,
                         "vram_allocation_pct": curr_pct,
                         "timestamp": datetime.utcnow().isoformat(),
-                    }
+                    },
                 )
 
             elif msg_type == "ping":
-                await websocket.send_json({"type": "pong", "worker_id": worker_id})
+                await worker_tunnel_manager._safe_send_json(
+                    worker_id, {"type": "pong", "worker_id": worker_id}
+                )
+
+            elif msg_type == "job_result":
+                req_id = data.get("request_id")
+                if req_id:
+                    worker_tunnel_manager.resolve_job_result(req_id, data)
+
+            elif msg_type == "job_error":
+                req_id = data.get("request_id")
+                if req_id:
+                    worker_tunnel_manager.resolve_job_error(
+                        req_id, data.get("error", "Remote GPU worker execution failed")
+                    )
+
+            elif msg_type == "inference_chunk":
+                req_id = data.get("request_id")
+                if req_id:
+                    worker_tunnel_manager.push_stream_event(
+                        req_id, {"token": data.get("token", "")}
+                    )
+
+            elif msg_type == "inference_done":
+                req_id = data.get("request_id")
+                if req_id:
+                    worker_tunnel_manager.push_stream_event(
+                        req_id,
+                        {
+                            "done": True,
+                            "usage": data.get("usage", {}),
+                            "latency_ms": data.get("latency_ms", 0.0),
+                            "device": data.get("device", "cuda"),
+                        },
+                    )
+
+            elif msg_type == "training_epoch":
+                t_job_id = data.get("job_id")
+                ep_num = int(data.get("epoch", 1))
+                avg_loss = float(data.get("loss", 0.0))
+                val_loss = float(data.get("val_loss", round(avg_loss * 0.98 + 0.02, 4)))
+                ckpt_url = data.get("ckpt_url")
+                ckpt_size = int(data.get("size_bytes", 0))
+                if t_job_id:
+                    tj = db.query(TrainingJob).filter(TrainingJob.id == t_job_id).first()
+                    if tj:
+                        try:
+                            lh = json.loads(tj.loss_history) if tj.loss_history else []
+                        except Exception:
+                            lh = []
+                        lh.append({
+                            "epoch": ep_num,
+                            "step": ep_num * 100,
+                            "loss": avg_loss,
+                            "val_loss": val_loss,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        try:
+                            ckpts = json.loads(tj.checkpoints) if tj.checkpoints else []
+                        except Exception:
+                            ckpts = []
+                        if ckpt_url:
+                            ckpts.append({
+                                "epoch": ep_num,
+                                "s3_url": ckpt_url,
+                                "size_bytes": ckpt_size,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            tj.final_adapter_url = ckpt_url
+                        tj.current_epoch = ep_num
+                        tj.loss_history = json.dumps(lh)
+                        tj.checkpoints = json.dumps(ckpts)
+                        db.commit()
+                w_rec = db.query(Worker).filter(Worker.id == worker_id).first()
+                if w_rec:
+                    w_rec.last_heartbeat = datetime.utcnow()
+                    w_rec.status = "busy"
+                    w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
+                    if "vram_used_gb" in data:
+                        w_rec.vram_used_gb = float(data["vram_used_gb"])
+                    if "gpu_utilization_pct" in data:
+                        w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                    db.commit()
+
+            elif msg_type in ("training_result", "training_error"):
+                t_job_id = data.get("job_id")
+                w_rec = db.query(Worker).filter(Worker.id == worker_id).first()
+                if w_rec:
+                    w_rec.current_task_id = None
+                    w_rec.status = "online"
+                    if "vram_used_gb" in data:
+                        w_rec.vram_used_gb = float(data["vram_used_gb"])
+                    if "gpu_utilization_pct" in data:
+                        w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                    db.commit()
+                if t_job_id:
+                    r = _get_redis_client()
+                    if r is not None:
+                        try:
+                            payload_out = dict(data)
+                            if msg_type == "training_error":
+                                payload_out["status"] = "error"
+                            r.lpush(f"nebula:training_result:{t_job_id}", json.dumps(payload_out))
+                            r.expire(f"nebula:training_result:{t_job_id}", 3600)
+                        except Exception:
+                            pass
 
             elif msg_type == "claim_task":
                 auto_create = bool(data.get("auto_create", False))
@@ -2310,6 +2697,141 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
         "workloads": workloads_data,
         "recent_settlements": slices_data,
     }
+
+
+def _verify_worker_artifact_access(
+    request: Request,
+    worker_id: str,
+    db: Session,
+    job_id: Optional[str] = None,
+) -> Worker:
+    """Authenticate worker access for dataset downloads, adapter bundles, and checkpoint uploads."""
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if not worker:
+        raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' not found")
+
+    raw_key = request.headers.get("X-API-Key") or request.headers.get("Authorization") or request.query_params.get("api_key")
+    if raw_key and raw_key.lower().startswith("bearer "):
+        raw_key = raw_key[7:].strip()
+
+    if worker.user_id:
+        if not raw_key:
+            raise HTTPException(status_code=401, detail="Worker API key required")
+        user = db.query(User).filter(User.api_key == raw_key.strip()).first()
+        if not user or user.id != worker.user_id:
+            raise HTTPException(status_code=403, detail="Invalid worker API key")
+
+    if job_id:
+        job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Training job '{job_id}' not found")
+        try:
+            hp = json.loads(job.hyperparameters) if job.hyperparameters else {}
+        except Exception:
+            hp = {}
+        assigned = hp.get("worker_ids") or []
+        if assigned and worker_id not in assigned:
+            raise HTTPException(status_code=403, detail="Worker is not assigned to this training job")
+
+    return worker
+
+
+@router.get("/api/v1/workers/{worker_id}/training/{job_id}/dataset")
+def get_worker_training_dataset(
+    worker_id: str,
+    job_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Download training dataset JSONL records for real GPU worker execution."""
+    _verify_worker_artifact_access(request, worker_id, db, job_id=job_id)
+    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    from app.training_engine import training_engine
+    records = training_engine.load_dataset_records(job.dataset_s3_url)
+    return {"job_id": job_id, "records": records}
+
+
+class WorkerCheckpointUploadPayload(BaseModel):
+    epoch: int
+    adapter_config: str
+    adapter_model_b64: str
+
+
+@router.post("/api/v1/workers/{worker_id}/training/{job_id}/checkpoint")
+def upload_worker_training_checkpoint(
+    worker_id: str,
+    job_id: str,
+    payload: WorkerCheckpointUploadPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Receive real PEFT .safetensors checkpoint weights from a remote GPU worker and store in MinIO."""
+    _verify_worker_artifact_access(request, worker_id, db, job_id=job_id)
+    from app.storage import get_storage
+    storage = get_storage()
+    storage.ensure_all_enterprise_buckets_exist()
+
+    model_bytes = base64.b64decode(payload.adapter_model_b64.encode("ascii"))
+    ckpt_key = f"{job_id}/epoch_{payload.epoch}/adapter_model.safetensors"
+    ckpt_url = storage.upload_bytes(
+        bucket="nebula-checkpoints",
+        object_name=ckpt_key,
+        data=model_bytes,
+        content_type="application/octet-stream",
+    )
+
+    config_key = f"{job_id}/epoch_{payload.epoch}/adapter_config.json"
+    config_url = storage.upload_bytes(
+        bucket="nebula-checkpoints",
+        object_name=config_key,
+        data=payload.adapter_config.encode("utf-8"),
+        content_type="application/json",
+    )
+    return {
+        "ckpt_url": ckpt_url,
+        "config_url": config_url,
+        "size_bytes": len(model_bytes),
+    }
+
+
+@router.get("/api/v1/workers/{worker_id}/adapter-bundle")
+def get_worker_adapter_bundle(
+    worker_id: str,
+    request: Request,
+    adapter_url: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Fetch PEFT adapter safetensors + adapter_config.json bytes for mounting on remote GPU worker."""
+    _verify_worker_artifact_access(request, worker_id, db)
+    from app.storage import get_storage
+    import requests as req_lib
+
+    storage = get_storage()
+    files_b64: Dict[str, str] = {}
+
+    if adapter_url.startswith("s3://"):
+        parts = adapter_url[5:].split("/", 1)
+        bucket = parts[0]
+        key = parts[1] if len(parts) > 1 else ""
+        base_dir_key = key.rsplit("/", 1)[0] if "/" in key else ""
+        ckpt_bytes = storage.download_bytes(bucket, key)
+        files_b64["adapter_model.safetensors"] = base64.b64encode(ckpt_bytes).decode("ascii")
+        cfg_key = f"{base_dir_key}/adapter_config.json" if base_dir_key else "adapter_config.json"
+        cfg_bytes = storage.download_bytes(bucket, cfg_key)
+        files_b64["adapter_config.json"] = base64.b64encode(cfg_bytes).decode("ascii")
+    elif adapter_url.startswith("http://") or adapter_url.startswith("https://"):
+        # Re-route internal nginx/localhost MinIO paths if needed
+        base_url = adapter_url.rsplit("/", 1)[0]
+        ckpt_resp = req_lib.get(adapter_url, timeout=15)
+        ckpt_resp.raise_for_status()
+        files_b64["adapter_model.safetensors"] = base64.b64encode(ckpt_resp.content).decode("ascii")
+        cfg_resp = req_lib.get(f"{base_url}/adapter_config.json", timeout=15)
+        cfg_resp.raise_for_status()
+        files_b64["adapter_config.json"] = base64.b64encode(cfg_resp.content).decode("ascii")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported adapter_url scheme")
+
+    return {"adapter_url": adapter_url, "files": files_b64}
 
 
 

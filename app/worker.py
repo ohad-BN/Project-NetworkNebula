@@ -944,18 +944,85 @@ def execute_training_job(*args, **kwargs):
                     finally:
                         db_dt.close()
             else:
-                from app.training_engine import training_engine
-                train_res = training_engine.train_job(
-                    job_id=job_id,
-                    base_model_id=target_base_model,
-                    dataset_s3_url=target_dataset_s3_url,
-                    total_epochs=total_epochs,
-                    check_cancelled_fn=is_cancelled,
-                    on_epoch_complete=on_epoch
+                target_wid = participating_workers[0] if participating_workers else None
+                from app.cluster_worker_router import (
+                    is_worker_tunnel_online_anywhere,
+                    _get_redis_client,
                 )
-                if train_res.get("status") == "cancelled":
-                    return {"status": "cancelled", "job_id": job_id}
-                final_adapter_url = train_res.get("final_adapter_url")
+                r_client = _get_redis_client()
+                if target_wid and is_worker_tunnel_online_anywhere(target_wid) and r_client is not None:
+                    from app.training_engine import training_engine
+                    records = training_engine.load_dataset_records(target_dataset_s3_url)
+                    dispatch_payload = {
+                        "type": "job_dispatch",
+                        "job_type": "training",
+                        "job_id": job_id,
+                        "worker_id": target_wid,
+                        "base_model_id": target_base_model,
+                        "dataset_s3_url": target_dataset_s3_url,
+                        "total_epochs": total_epochs,
+                        "lr": float(hyperparams.get("learning_rate", 1e-4)),
+                        "lora_r": int(hyperparams.get("lora_r", 16)),
+                        "lora_alpha": int(hyperparams.get("lora_alpha", 32)),
+                        "records": records if len(records) <= 500 else None,
+                    }
+                    result_key = f"nebula:training_result:{job_id}"
+                    r_client.delete(result_key)
+                    r_client.rpush("nebula:tunnel:dispatch", json.dumps(dispatch_payload))
+                    print(f"[WORKER] Dispatched REAL LoRA training {job_id} to remote GPU worker '{target_wid}' via tunnel.")
+
+                    train_res = None
+                    wait_start = time.time()
+                    last_online_seen = wait_start
+                    while time.time() - wait_start < 3600:
+                        if is_cancelled():
+                            return {"status": "cancelled", "job_id": job_id}
+                        popped = r_client.blpop(result_key, timeout=2)
+                        if popped:
+                            train_res = json.loads(popped[1])
+                            break
+                        if is_worker_tunnel_online_anywhere(target_wid):
+                            last_online_seen = time.time()
+                        elif time.time() - last_online_seen > 20.0:
+                            raise RuntimeError(f"Remote GPU worker '{target_wid}' tunnel disconnected during training.")
+
+                    if train_res is None:
+                        raise RuntimeError(f"Timed out waiting for remote GPU worker '{target_wid}' training completion.")
+                    if train_res.get("status") == "error" or train_res.get("error"):
+                        raise RuntimeError(train_res.get("error") or "Remote GPU training failed")
+                    if train_res.get("status") == "cancelled":
+                        return {"status": "cancelled", "job_id": job_id}
+
+                    final_adapter_url = train_res.get("final_adapter_url")
+                    db_sync = SessionLocal()
+                    try:
+                        sync_job = db_sync.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+                        if sync_job:
+                            if not final_adapter_url:
+                                final_adapter_url = sync_job.final_adapter_url
+                            try:
+                                loss_history = json.loads(sync_job.loss_history) if sync_job.loss_history else []
+                            except Exception:
+                                loss_history = []
+                            try:
+                                checkpoints_list = json.loads(sync_job.checkpoints) if sync_job.checkpoints else []
+                            except Exception:
+                                checkpoints_list = []
+                    finally:
+                        db_sync.close()
+                else:
+                    from app.training_engine import training_engine
+                    train_res = training_engine.train_job(
+                        job_id=job_id,
+                        base_model_id=target_base_model,
+                        dataset_s3_url=target_dataset_s3_url,
+                        total_epochs=total_epochs,
+                        check_cancelled_fn=is_cancelled,
+                        on_epoch_complete=on_epoch
+                    )
+                    if train_res.get("status") == "cancelled":
+                        return {"status": "cancelled", "job_id": job_id}
+                    final_adapter_url = train_res.get("final_adapter_url")
         except Exception as e:
             print(f"[WORKER] Real PyTorch training engine failed: {e}")
             db_fail = SessionLocal()
@@ -1060,19 +1127,16 @@ def serve_inference_request(
     temperature: float = 0.7,
     max_tokens: int = 512,
     endpoint_id: str = None,
-    adapter_url: str = None
+    adapter_url: str = None,
+    preferred_user_id: str = None,
 ):
     """
-    Execute enterprise model inference on decentralized GPU worker.
-    Processes messages prompt, executes LLM generation, computes token telemetry,
-    supports dynamic PEFT adapter hot-swapping from S3, and updates endpoint serving metrics.
+    Execute real enterprise model inference on a connected GPU worker tunnel when online,
+    or fall back to the server's real HuggingFace weights (zero simulated responses).
     """
-    from datetime import datetime
-    import time
     from app.database import SessionLocal
     from app.models import InferenceEndpoint
 
-    start_time = time.time()
     resolved_adapter_url = adapter_url
 
     # Lookup adapter_url from endpoint if not passed directly
@@ -1087,55 +1151,51 @@ def serve_inference_request(
         finally:
             db_ep.close()
 
+    executed_worker_id = None
+    tunnel_worker_id = None
     try:
+        from app.cluster_worker_router import worker_tunnel_manager
+        if worker_tunnel_manager.loop is not None and not worker_tunnel_manager.loop.is_closed():
+            db_w = SessionLocal()
+            try:
+                tunnel_worker_id = worker_tunnel_manager.select_online_inference_worker(
+                    db_w, model_id=model, preferred_user_id=preferred_user_id
+                )
+            finally:
+                db_w.close()
+    except Exception:
+        tunnel_worker_id = None
+
+    if tunnel_worker_id:
+        from app.cluster_worker_router import worker_tunnel_manager
+        engine_res = worker_tunnel_manager.dispatch_inference_sync(
+            worker_id=tunnel_worker_id,
+            messages=messages,
+            model_id=model,
+            adapter_url=resolved_adapter_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        completion_text = engine_res["content"]
+        prompt_tokens = int(engine_res["prompt_tokens"])
+        completion_tokens = int(engine_res["completion_tokens"])
+        total_tokens = int(engine_res["total_tokens"])
+        latency_ms = float(engine_res["latency_ms"])
+        executed_worker_id = tunnel_worker_id
+    else:
         from app.inference_engine import inference_engine
         engine_res = inference_engine.generate(
             messages=messages,
             model_id=model,
             adapter_url=resolved_adapter_url,
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
         )
         completion_text = engine_res["content"]
         prompt_tokens = engine_res["prompt_tokens"]
         completion_tokens = engine_res["completion_tokens"]
         total_tokens = engine_res["total_tokens"]
         latency_ms = engine_res["latency_ms"]
-    except Exception as e:
-        print(f"[WORKER] Neural inference fallback triggered: {e}")
-        user_prompt = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                user_prompt = m.get("content", "")
-                break
-        if not user_prompt and messages:
-            user_prompt = messages[-1].get("content", "")
-
-        # Clean model identifier
-        clean_model_name = model.split("/")[-1]
-
-        # Synthesize intelligent neural assistant response
-        if "code" in user_prompt.lower() or "python" in user_prompt.lower():
-            completion_text = (
-                f"Here is the solution generated by {clean_model_name} on NetworkNebula:\n\n"
-                f"```python\ndef process_data(records):\n    \"\"\"Zero-trust decentralized processing\"\"\"\n"
-                f"    return [record.strip() for record in records if record]\n```\n"
-                f"Execution completed across decentralized compute nodes with verified tensor integrity."
-            )
-        elif "test" in user_prompt.lower() or "ping" in user_prompt.lower():
-            completion_text = f"NetworkNebula inference gateway online. Model '{model}' responded successfully."
-        else:
-            completion_text = (
-                f"As {clean_model_name} hosted on the Project NetworkNebula enterprise cluster, "
-                f"I have processed your query: '{user_prompt}'. "
-                f"All gradient checks and distributed tensor barriers completed with optimal throughput."
-            )
-
-        # Token calculations
-        prompt_tokens = max(1, sum(len(m.get("content", "").split()) for m in messages) * 4 // 3 + 4)
-        completion_tokens = max(1, len(completion_text.split()) * 4 // 3 + 2)
-        total_tokens = prompt_tokens + completion_tokens
-        latency_ms = round((time.time() - start_time) * 1000 + 45.0, 2)
 
     # Update endpoint telemetry in DB if endpoint_id provided
     if endpoint_id:
@@ -1156,7 +1216,6 @@ def serve_inference_request(
     import uuid
     db_earn = SessionLocal()
     try:
-        # Standard token compute fee ($0.0052 per inference request)
         inference_cost = 0.0052
         import socket
         safe_host = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
@@ -1165,7 +1224,7 @@ def serve_inference_request(
             task_id=f"inf-{uuid.uuid4().hex[:8]}",
             gross_cost=inference_cost,
             description=f"Host 70% share for neural inference ({model}, {total_tokens} tokens)",
-            worker_id=f"node-{safe_host}",
+            worker_id=executed_worker_id or f"node-{safe_host}",
         )
     except Exception as earn_err:
         print(f"[WORKER] Failed to attribute inference worker earnings: {earn_err}")
@@ -1175,10 +1234,11 @@ def serve_inference_request(
     return {
         "content": completion_text,
         "model": model,
+        "worker_id": executed_worker_id,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
-        "latency_ms": latency_ms
+        "latency_ms": latency_ms,
     }
 
 

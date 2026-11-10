@@ -165,9 +165,7 @@ class PeftTrainingEngine:
         Computes authentic gradient backward passes, logs loss descent,
         and saves genuine .safetensors adapter checkpoints to S3.
         """
-        target_model_id = base_model_id
-        if not self.model_cache.is_cached_locally(target_model_id):
-            target_model_id = DEFAULT_FOUNDATION_MODEL
+        target_model_id = (base_model_id or "").strip() or DEFAULT_FOUNDATION_MODEL
 
         print(f"[TRAINING_ENGINE] Initializing LoRA fine-tuning for job {job_id} using '{target_model_id}' on {self.device.upper()}...")
 

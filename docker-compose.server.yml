@@ -87,6 +87,8 @@ services:
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-nebula123}
       - MINIO_BUCKET=nebula-datasets
       - MODEL_CACHE_DIR=/models/cache
+      - HF_HOME=/root/.cache/huggingface
+      - FAST_POC_MODE=false
       - APP_ENV=production
     depends_on:
       db:
@@ -97,6 +99,7 @@ services:
         condition: service_started
     volumes:
       - model_cache:/models/cache
+      - hf_cache:/root/.cache/huggingface
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
   # ----------------------------------------------------------------------------
@@ -117,6 +120,8 @@ services:
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-nebula}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-nebula123}
       - MODEL_CACHE_DIR=/models/cache
+      - HF_HOME=/root/.cache/huggingface
+      - FAST_POC_MODE=false
     depends_on:
       db:
         condition: service_healthy
@@ -126,6 +131,7 @@ services:
         condition: service_started
     volumes:
       - model_cache:/models/cache
+      - hf_cache:/root/.cache/huggingface
     command: celery -A app.worker.celery_app worker --loglevel=info -P solo
 
   # ----------------------------------------------------------------------------
@@ -148,3 +154,4 @@ volumes:
   redis_data:
   minio_data:
   model_cache:
+  hf_cache:

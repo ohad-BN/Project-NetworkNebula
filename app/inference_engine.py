@@ -50,12 +50,9 @@ class NeuralInferenceEngine:
         return cls._instance
 
     def _resolve_model_id(self, requested_model: Optional[str]) -> str:
-        """
-        Resolve the target foundation model. If requested model is locally cached
-        or matches default, load it; otherwise route to cached DEFAULT_FOUNDATION_MODEL.
-        """
-        if requested_model and self.model_cache.is_cached_locally(requested_model):
-            return requested_model
+        """Resolve requested foundation model ID without silently swapping uncached models."""
+        if requested_model and requested_model.strip():
+            return requested_model.strip()
         return DEFAULT_FOUNDATION_MODEL
 
     def _format_chat_prompt(self, messages: List[Dict[str, str]], tokenizer: Any) -> str:
@@ -191,79 +188,51 @@ class NeuralInferenceEngine:
         max_tokens: int = 256,
     ) -> Dict[str, Any]:
         """
-        Execute full synchronous neural generation on the active GPU.
+        Execute real synchronous neural generation on the active hardware.
         Supports dynamic LoRA adapter mounting from MinIO S3 checkpoints.
         """
         start_time = time.time()
         target_model_id = self._resolve_model_id(model_id)
 
-        try:
-            base_model, tokenizer = self.model_cache.load_model(target_model_id)
-            active_model, mounted_adapter = self._mount_adapter(base_model, adapter_url)
+        base_model, tokenizer = self.model_cache.load_model(target_model_id)
+        active_model, mounted_adapter = self._mount_adapter(base_model, adapter_url)
 
-            prompt_text = self._format_chat_prompt(messages, tokenizer)
-            inputs = tokenizer([prompt_text], return_tensors="pt").to(active_model.device)
-            prompt_tokens = int(inputs["input_ids"].shape[1])
+        prompt_text = self._format_chat_prompt(messages, tokenizer)
+        inputs = tokenizer([prompt_text], return_tensors="pt").to(active_model.device)
+        prompt_tokens = int(inputs["input_ids"].shape[1])
 
-            # Generation hyperparameters
-            gen_kwargs = {
-                **inputs,
-                "max_new_tokens": max(1, min(max_tokens, 1024)),
-                "pad_token_id": tokenizer.eos_token_id or tokenizer.pad_token_id,
-            }
-            if temperature > 0.0:
-                gen_kwargs["temperature"] = max(temperature, 0.01)
-                gen_kwargs["do_sample"] = True
-            else:
-                gen_kwargs["do_sample"] = False
+        gen_kwargs = {
+            **inputs,
+            "max_new_tokens": max(1, min(max_tokens, 1024)),
+            "pad_token_id": tokenizer.eos_token_id or tokenizer.pad_token_id,
+        }
+        if temperature > 0.0:
+            gen_kwargs["temperature"] = max(temperature, 0.01)
+            gen_kwargs["do_sample"] = True
+        else:
+            gen_kwargs["do_sample"] = False
 
-            with torch.inference_mode():
-                output_ids = active_model.generate(**gen_kwargs)
+        with torch.inference_mode():
+            output_ids = active_model.generate(**gen_kwargs)
 
-            # Extract generated tokens (excluding prompt)
-            new_tokens = output_ids[0][prompt_tokens:]
-            completion_tokens = int(len(new_tokens))
-            completion_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        new_tokens = output_ids[0][prompt_tokens:]
+        completion_tokens = int(len(new_tokens))
+        completion_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-            latency_ms = round((time.time() - start_time) * 1000, 2)
+        latency_ms = round((time.time() - start_time) * 1000, 2)
 
-            return {
-                "content": completion_text,
-                "model": model_id or target_model_id,
-                "engine_model": target_model_id,
-                "adapter": mounted_adapter,
-                "adapter_url": adapter_url,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-                "latency_ms": latency_ms,
-            }
-
-        except Exception as e:
-            logger.error(f"Neural inference generation failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-            latency_ms = round((time.time() - start_time) * 1000 + 45.0, 2)
-            fallback_text = (
-                f"As {model_id or target_model_id} hosted on NetworkNebula enterprise cluster, "
-                f"I processed your query with verified neural gradient checks."
-            )
-            prompt_tokens = max(1, sum(len(m.get("content", "").split()) for m in messages) * 4 // 3 + 4)
-            completion_tokens = max(1, len(fallback_text.split()) * 4 // 3 + 2)
-
-            return {
-                "content": fallback_text,
-                "model": model_id or target_model_id,
-                "engine_model": target_model_id,
-                "adapter": None,
-                "adapter_url": adapter_url,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-                "latency_ms": latency_ms,
-                "fallback": True,
-            }
+        return {
+            "content": completion_text,
+            "model": model_id or target_model_id,
+            "engine_model": target_model_id,
+            "device": str(active_model.device),
+            "adapter": mounted_adapter,
+            "adapter_url": adapter_url,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "latency_ms": latency_ms,
+        }
 
     def generate_stream(
         self,
@@ -274,53 +243,53 @@ class NeuralInferenceEngine:
         max_tokens: int = 256,
     ) -> Generator[str, None, None]:
         """
-        Execute real token-by-token neural streaming via TextIteratorStreamer
-        on the active GPU, with dynamic LoRA adapter support.
+        Execute real token-by-token neural streaming via TextIteratorStreamer,
+        raising real exceptions on model load/generation errors.
         """
         target_model_id = self._resolve_model_id(model_id)
 
-        try:
-            base_model, tokenizer = self.model_cache.load_model(target_model_id)
-            active_model, mounted_adapter = self._mount_adapter(base_model, adapter_url)
+        base_model, tokenizer = self.model_cache.load_model(target_model_id)
+        active_model, mounted_adapter = self._mount_adapter(base_model, adapter_url)
 
-            prompt_text = self._format_chat_prompt(messages, tokenizer)
-            inputs = tokenizer([prompt_text], return_tensors="pt").to(active_model.device)
+        prompt_text = self._format_chat_prompt(messages, tokenizer)
+        inputs = tokenizer([prompt_text], return_tensors="pt").to(active_model.device)
 
-            streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-            gen_kwargs = {
-                **inputs,
-                "streamer": streamer,
-                "max_new_tokens": max(1, min(max_tokens, 1024)),
-                "pad_token_id": tokenizer.eos_token_id or tokenizer.pad_token_id,
-            }
-            if temperature > 0.0:
-                gen_kwargs["temperature"] = max(temperature, 0.01)
-                gen_kwargs["do_sample"] = True
-            else:
-                gen_kwargs["do_sample"] = False
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs = {
+            **inputs,
+            "streamer": streamer,
+            "max_new_tokens": max(1, min(max_tokens, 1024)),
+            "pad_token_id": tokenizer.eos_token_id or tokenizer.pad_token_id,
+        }
+        if temperature > 0.0:
+            gen_kwargs["temperature"] = max(temperature, 0.01)
+            gen_kwargs["do_sample"] = True
+        else:
+            gen_kwargs["do_sample"] = False
 
-            # Run generation in worker thread so caller can stream tokens immediately
-            thread = threading.Thread(target=active_model.generate, kwargs=gen_kwargs)
-            thread.start()
+        gen_errors: List[BaseException] = []
 
-            for chunk in streamer:
-                if chunk:
-                    yield chunk
+        def _run_generate() -> None:
+            try:
+                with torch.inference_mode():
+                    active_model.generate(**gen_kwargs)
+            except BaseException as exc:
+                gen_errors.append(exc)
+                try:
+                    streamer.end()
+                except Exception:
+                    pass
 
-            thread.join()
+        thread = threading.Thread(target=_run_generate, daemon=True)
+        thread.start()
 
-        except Exception as e:
-            logger.error(f"Neural streaming generation failed: {e}")
-            import traceback
-            traceback.print_exc()
+        for chunk in streamer:
+            if chunk:
+                yield chunk
 
-            fallback_words = (
-                f"As {model_id or target_model_id} hosted on NetworkNebula enterprise cluster, "
-                f"your request was processed with live streaming token telemetry."
-            ).split(" ")
-            for i, word in enumerate(fallback_words):
-                yield word + (" " if i < len(fallback_words) - 1 else "")
-                time.sleep(0.02)
+        thread.join()
+        if gen_errors:
+            raise gen_errors[0]
 
 
 # Global singleton access

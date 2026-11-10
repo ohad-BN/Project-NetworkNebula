@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Stable Diffusion & Execution Modes
     MODEL_CACHE_DIR: str = "/models/cache"
     SD_MODEL_ID: str = "runwayml/stable-diffusion-v1-5"
-    FAST_POC_MODE: bool = True
+    FAST_POC_MODE: bool = False
 
     # Resend & Email
     RESEND_API_KEY: str = ""

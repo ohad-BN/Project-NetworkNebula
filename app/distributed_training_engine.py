@@ -307,9 +307,7 @@ class DistributedTrainingEngine:
         5. Saves unified .safetensors checkpoint to MinIO S3 (nebula-checkpoints)
         """
         num_workers = max(1, len(worker_ids))
-        target_model_id = base_model_id
-        if not self.model_cache.is_cached_locally(target_model_id):
-            target_model_id = DEFAULT_FOUNDATION_MODEL
+        target_model_id = (base_model_id or "").strip() or DEFAULT_FOUNDATION_MODEL
 
         # Register distributed task in coordinator
         dist_task = setup_distributed_training(

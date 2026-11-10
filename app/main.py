@@ -136,7 +136,11 @@ manager = ConnectionManager()
 
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
+    import asyncio
+    from app.cluster_worker_router import worker_tunnel_manager
+    worker_tunnel_manager.loop = asyncio.get_running_loop()
+    asyncio.create_task(worker_tunnel_manager.run_redis_dispatch_bridge())
     Base.metadata.create_all(bind=engine)
     # Ensure Closed Alpha columns & seed invite codes exist
     try:
