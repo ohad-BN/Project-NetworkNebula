@@ -74,13 +74,22 @@ def dispatch_queued_training_jobs(db: Session) -> int:
         if not eligible_for_job and not allow_fallback:
             continue
 
-        # Mark dispatching atomically before enqueuing to avoid duplicate triggers on concurrent heartbeats
+        # Guard against concurrent heartbeat dispatch with Redis lock (keeps DB status='queued' cleanly for UI)
+        try:
+            import redis
+            from app.config import settings
+            r_lock = redis.from_url(settings.REDIS_URL, socket_timeout=1.0)
+            if not r_lock.set(f"nebula:train_dispatch:{q_job.id}", "1", nx=True, ex=15):
+                continue
+        except Exception:
+            if not hp.get("waiting_for_worker"):
+                continue
+
         target_count = max(1, int(q_job.num_gpus or 1)) if eligible_for_job else 0
         if eligible_for_job:
             hp["worker_ids"] = [w.id for w in eligible_for_job[:target_count]]
         hp.pop("waiting_for_worker", None)
         q_job.hyperparameters = json.dumps(hp)
-        q_job.status = "dispatching"
         db.commit()
         dispatch_training_job_resilient(q_job.id)
         dispatched += 1

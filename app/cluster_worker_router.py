@@ -2131,6 +2131,7 @@ def get_cluster_monitor_snapshot(db: Session = Depends(get_db)):
     - real-time PoDS minted settlements ticker
     """
     reap_stale_workers_and_tasks(db)
+    now = datetime.now(timezone.utc)
 
     # Query workers, tasks, training jobs, and compute slices
     workers = db.query(Worker).order_by(Worker.created_at.asc()).all()

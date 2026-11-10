@@ -711,13 +711,13 @@ def execute_training_job(*args, **kwargs):
     import math
     from datetime import datetime, timezone
     from app.database import SessionLocal
-    from app.models import TrainingJob
+    from app.models import TrainingJob, Worker
     from app.storage import get_storage
+    from app.cluster_worker_router import reap_stale_workers_and_tasks, get_eligible_training_workers
 
     print(f"[WORKER] Initiating enterprise training job: {job_id}")
     db = SessionLocal()
     try:
-        from app.models import Worker
         job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
         if not job:
             print(f"[WORKER] Error: Training job {job_id} not found in database")
@@ -727,10 +727,12 @@ def execute_training_job(*args, **kwargs):
             return {"status": job.status, "job_id": job_id}
 
         try:
-            from app.cluster_worker_router import reap_stale_workers_and_tasks
             reap_stale_workers_and_tasks(db)
         except Exception:
-            pass
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
         # Parse hyperparameters & settings
         total_epochs = max(1, job.total_epochs or 3)
