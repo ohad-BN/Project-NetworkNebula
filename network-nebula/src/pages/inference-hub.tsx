@@ -24,7 +24,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { apiClient } from "@/services/api/client";
+import { apiClient, getApiBaseUrl } from "@/services/api/client";
 import { toast } from "sonner";
 
 interface EndpointItem {
@@ -217,9 +217,7 @@ export function InferenceHubPage() {
       ];
 
       if (isStream) {
-        const streamEndpoint = typeof window !== "undefined" && window.location.port !== "5173"
-          ? "/v1/chat/completions"
-          : "http://localhost:8000/v1/chat/completions";
+        const streamEndpoint = `${getApiBaseUrl()}/v1/chat/completions`;
         const response = await fetch(streamEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -23,9 +23,8 @@ export const getApiBaseUrl = (): string => {
       return envApi.trim().replace(/\/+$/, "");
     }
 
-    // 4. Local dev port
+    // 4. Local dev server only (avoid breaking remote Nginx mapped on port 5173)
     if (
-      window.location.port === "5173" ||
       window.location.hostname === "localhost" ||
       window.location.hostname === "127.0.0.1"
     ) {
