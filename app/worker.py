@@ -979,7 +979,7 @@ def execute_training_job(*args, **kwargs):
                     and r_client is not None
                 ):
                     from app.training_engine import training_engine
-                    records = training_engine.load_dataset_records(target_dataset_s3_url)
+                    records = training_engine.prepare_gpu_training_records(target_dataset_s3_url, min_records=64)
                     dispatch_payload = {
                         "type": "job_dispatch",
                         "job_type": "training",

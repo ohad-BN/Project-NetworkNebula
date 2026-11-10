@@ -126,6 +126,31 @@ class PeftTrainingEngine:
 
         return records
 
+    def prepare_gpu_training_records(
+        self,
+        dataset_s3_url: Optional[str] = None,
+        min_records: int = 64,
+    ) -> List[Dict[str, str]]:
+        """
+        Load dataset records for remote GPU execution and ensure default/small datasets
+        contain at least `min_records` optimization steps per epoch for sustained CUDA training.
+        """
+        base_records = self.load_dataset_records(dataset_s3_url)
+        if not base_records:
+            base_records = list(DEFAULT_TRAINING_RECORDS)
+        if len(base_records) >= min_records:
+            return base_records
+        expanded: List[Dict[str, str]] = []
+        idx = 0
+        while len(expanded) < min_records:
+            item = base_records[idx % len(base_records)]
+            expanded.append({
+                "instruction": item["instruction"],
+                "response": item["response"],
+            })
+            idx += 1
+        return expanded
+
     def tokenize_records(
         self,
         records: List[Dict[str, str]],

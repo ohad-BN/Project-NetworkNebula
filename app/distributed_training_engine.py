@@ -346,15 +346,16 @@ class DistributedTrainingEngine:
         ]
 
         if online_tunnel_workers and r_client is not None:
+            gpu_records = training_engine.prepare_gpu_training_records(dataset_s3_url, min_records=64)
             active_weights = {wid: worker_weights.get(wid, 1.0) for wid in online_tunnel_workers}
             active_shards = self.partition_dataset_shards(
-                all_records, online_tunnel_workers, weights=active_weights
+                gpu_records, online_tunnel_workers, weights=active_weights
             )
             result_key = f"nebula:training_result:{job_id}"
             r_client.delete(result_key)
 
             for wid in online_tunnel_workers:
-                shard_records = active_shards.get(wid) or all_records
+                shard_records = active_shards.get(wid) or gpu_records
                 dispatch_payload = {
                     "type": "job_dispatch",
                     "job_type": "training",
