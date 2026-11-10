@@ -427,7 +427,7 @@ class _WorkerGpuRuntime:
 
         dev = self._get_device()
         if dev == "cuda":
-            dtype = torch.bfloat16 if (for_training and torch.cuda.is_bf16_supported()) else torch.float16
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         elif dev == "mps":
             dtype = torch.float16
         else:

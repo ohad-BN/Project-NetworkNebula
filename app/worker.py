@@ -786,6 +786,24 @@ def execute_training_job(*args, **kwargs):
                 if active_w:
                     participating_workers = [active_w.id]
 
+        if not allow_server_fallback and participating_workers:
+            from app.cluster_worker_router import (
+                is_worker_tunnel_v2_online_anywhere,
+                is_worker_tunnel_online_anywhere,
+                get_eligible_training_workers,
+            )
+            tunnel_workers = [
+                wid for wid in participating_workers
+                if is_worker_tunnel_v2_online_anywhere(wid) or is_worker_tunnel_online_anywhere(wid)
+            ]
+            if not tunnel_workers:
+                all_elig = get_eligible_training_workers(db)
+                tunnel_workers = [
+                    w.id for w in all_elig
+                    if is_worker_tunnel_v2_online_anywhere(w.id) or is_worker_tunnel_online_anywhere(w.id)
+                ]
+            participating_workers = tunnel_workers[:max(1, num_gpus)]
+
         if not participating_workers:
             if allow_server_fallback:
                 import socket
@@ -796,7 +814,7 @@ def execute_training_job(*args, **kwargs):
                 hyperparams["waiting_for_worker"] = True
                 job.hyperparameters = json.dumps(hyperparams)
                 db.commit()
-                print(f"[WORKER] Training job {job_id} remains queued: no active online workers.")
+                print(f"[WORKER] Training job {job_id} remains queued: no active GPU tunnel workers online.")
                 return {"status": "queued", "job_id": job_id, "reason": "no_active_workers"}
 
         hyperparams.pop("waiting_for_worker", None)
@@ -933,6 +951,10 @@ def execute_training_job(*args, **kwargs):
                 if train_res.get("status") == "cancelled":
                     return {"status": "cancelled", "job_id": job_id}
                 final_adapter_url = train_res.get("final_adapter_url")
+                if train_res.get("loss_history"):
+                    loss_history = train_res["loss_history"]
+                if train_res.get("checkpoints"):
+                    checkpoints_list = train_res["checkpoints"]
                 if "shard_telemetry" in train_res:
                     hyperparams["distributed_telemetry"] = train_res["shard_telemetry"]
                     db_dt = SessionLocal()
@@ -947,10 +969,15 @@ def execute_training_job(*args, **kwargs):
                 target_wid = participating_workers[0] if participating_workers else None
                 from app.cluster_worker_router import (
                     is_worker_tunnel_v2_online_anywhere,
+                    is_worker_tunnel_online_anywhere,
                     _get_redis_client,
                 )
                 r_client = _get_redis_client()
-                if target_wid and is_worker_tunnel_v2_online_anywhere(target_wid) and r_client is not None:
+                if (
+                    target_wid
+                    and (is_worker_tunnel_v2_online_anywhere(target_wid) or is_worker_tunnel_online_anywhere(target_wid))
+                    and r_client is not None
+                ):
                     from app.training_engine import training_engine
                     records = training_engine.load_dataset_records(target_dataset_s3_url)
                     dispatch_payload = {
@@ -981,9 +1008,9 @@ def execute_training_job(*args, **kwargs):
                         if popped:
                             train_res = json.loads(popped[1])
                             break
-                        if is_worker_tunnel_v2_online_anywhere(target_wid):
+                        if is_worker_tunnel_v2_online_anywhere(target_wid) or is_worker_tunnel_online_anywhere(target_wid):
                             last_online_seen = time.time()
-                        elif time.time() - last_online_seen > 20.0:
+                        elif time.time() - last_online_seen > 25.0:
                             raise RuntimeError(f"Remote GPU worker '{target_wid}' tunnel disconnected during training.")
 
                     if train_res is None:
@@ -1011,6 +1038,11 @@ def execute_training_job(*args, **kwargs):
                     finally:
                         db_sync.close()
                 else:
+                    if not allow_server_fallback:
+                        raise RuntimeError(
+                            f"No active GPU compute tunnel connected for worker '{target_wid}'. "
+                            f"Ensure nebula_worker.py is running with an active WebSocket tunnel."
+                        )
                     from app.training_engine import training_engine
                     train_res = training_engine.train_job(
                         job_id=job_id,

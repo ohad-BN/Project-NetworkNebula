@@ -147,7 +147,7 @@ export function TrainingStudioPage() {
       let targetGpus = 1;
       if (!isSingle) {
         if (gpuScale === "auto") {
-          targetGpus = Math.max(2, onlineNodes.length);
+          targetGpus = Math.max(1, onlineNodes.length);
         } else {
           targetGpus = parseInt(gpuScale, 10);
         }
