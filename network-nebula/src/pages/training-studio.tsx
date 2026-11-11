@@ -163,6 +163,14 @@ interface TrainingJobItem {
   dataset_s3_url: string;
   hyperparameters: Record<string, any>;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  training_phase?: {
+    phase: string;
+    detail?: string;
+    progress_pct?: number | null;
+    downloaded_mb?: number | null;
+    total_mb?: number | null;
+    updated_at?: string;
+  } | null;
   current_epoch: number;
   total_epochs: number;
   loss_history: Array<{ epoch: number; step: number; loss: number; val_loss?: number; timestamp: string }>;
@@ -188,12 +196,17 @@ const POPULAR_PRESETS = [
 ];
 
 function getModelParamsB(modelId: string): number {
-  const preset = POPULAR_PRESETS.find((p) => p.id === modelId);
+  const cleanId = (modelId || "").trim().toLowerCase();
+  if (!cleanId) return 7.0;
+  const preset = POPULAR_PRESETS.find((p) => p.id.toLowerCase() === cleanId);
   if (preset) return preset.params;
-  const match = modelId.match(/([0-9]+(?:\.[0-9]+)?)[bB]/);
+  const match = cleanId.match(/(?:^|[-/_])([0-9]+(?:\.[0-9]+)?)\s*([bm])(?=$|[^a-z0-9])/i);
   if (match) {
     const val = parseFloat(match[1]);
-    if (!isNaN(val) && val > 0) return val;
+    if (!isNaN(val) && val > 0) {
+      const unit = match[2].toLowerCase();
+      return unit === "m" ? Math.round((val / 1000) * 1000) / 1000 : val;
+    }
   }
   return 7.0; // fallback standard 7B
 }
@@ -243,9 +256,13 @@ export function TrainingStudioPage() {
   const [keyRecoveryTargetJob, setKeyRecoveryTargetJob] = useState<TrainingJobItem | null>(null);
   const [manualDekInput, setManualDekInput] = useState("");
 
-  // Derived cluster capacity (strictly isolate training-capable GPUs from monitor/inference-only nodes)
-  const onlineNodes = clusterNodes.filter((n) => n.status === "online" && n.is_available !== false);
+  // Derived cluster capacity (strictly isolate training-capable GPUs from monitor/inference-only nodes, while keeping active busy GPUs counted)
+  const onlineNodes = clusterNodes.filter(
+    (n) => (n.status === "online" || n.status === "busy") && n.is_available !== false
+  );
   const trainingReadyNodes = onlineNodes.filter(isNodeTrainingCapable);
+  const idleTrainingNodes = trainingReadyNodes.filter((n) => n.status === "online");
+  const busyTrainingNodes = trainingReadyNodes.filter((n) => n.status === "busy");
   const monitorOnlyNodes = onlineNodes.filter((n) => !isNodeTrainingCapable(n));
   const totalOnlineVram = trainingReadyNodes.reduce((acc, n) => acc + (n.vram_allocated_gb || n.vram_total_gb || 0), 0);
 
@@ -286,7 +303,10 @@ export function TrainingStudioPage() {
         : `Requires ~${currentEstimatedVram} GB VRAM. No workers online — job will stay Queued until a node joins.`;
   } else if (currentEstimatedVram <= maxSingleGpuGb) {
     vramFitStatus = "fit";
-    vramFitMessage = `Fits on single GPU (${maxSingleGpuGb.toFixed(1)} GB available). Instant dispatch ready.`;
+    vramFitMessage =
+      idleTrainingNodes.length === 0 && busyTrainingNodes.length > 0
+        ? `Fits on single GPU (${maxSingleGpuGb.toFixed(1)} GB available). ${busyTrainingNodes.length} GPU currently busy — job will queue and auto-dispatch next.`
+        : `Fits on single GPU (${maxSingleGpuGb.toFixed(1)} GB available). Instant dispatch ready.`;
   } else if (currentEstimatedVram <= maxCollectiveVramGb) {
     vramFitStatus = "fit";
     vramFitMessage = `Fits on multi-GPU collective VRAM (${maxCollectiveVramGb.toFixed(1)} GB available on node via device_map="auto").`;
@@ -300,6 +320,7 @@ export function TrainingStudioPage() {
       setIsLoading(true);
       const res = await apiClient.get<TrainingJobItem[]>("/api/v1/training/jobs");
       setJobs(res.data);
+      setSelectedJob((prev) => (prev ? res.data.find((j) => j.id === prev.id) || prev : prev));
     } catch {
       toast.error("Failed to fetch training jobs");
     } finally {
@@ -717,7 +738,7 @@ export function TrainingStudioPage() {
                         className="font-mono text-sm"
                       />
                       <p className="text-[11px] text-muted-foreground">
-                        Accepts any public or private HuggingFace model repository ID.
+                        Accepts any public or private HuggingFace model repository ID. Uncached weights download directly to your worker on first run (GPU starts once downloaded).
                       </p>
                     </div>
                   ) : (
@@ -770,7 +791,7 @@ export function TrainingStudioPage() {
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-muted-foreground">Est. Model Size:</span>
                       <Badge variant="secondary" className="font-mono text-xs">
-                        ~{modelParamsB}B Params
+                        ~{modelParamsB < 0.5 ? `${Math.round(modelParamsB * 1000)}M` : `${modelParamsB}B`} Params
                       </Badge>
                     </div>
                   </div>
@@ -1162,6 +1183,11 @@ export function TrainingStudioPage() {
             <CardTitle className="text-2xl font-bold font-mono text-primary">
               {totalOnlineVram.toFixed(1)} GB
             </CardTitle>
+            {trainingReadyNodes.length > 0 && (
+              <p className="text-[11px] text-muted-foreground">
+                {idleTrainingNodes.length} idle • {busyTrainingNodes.length} active
+              </p>
+            )}
           </CardHeader>
         </Card>
       </div>
@@ -1218,7 +1244,16 @@ export function TrainingStudioPage() {
                       <td className="py-3 px-4">
                         {job.current_epoch} / {job.total_epochs}
                       </td>
-                      <td className="py-3 px-4">{getStatusBadge(job.status)}</td>
+                      <td className="py-3 px-4">
+                        <div className="space-y-1">
+                          <div>{getStatusBadge(job.status)}</div>
+                          {(job.status === "running" || job.status === "queued") && job.training_phase?.detail && (
+                            <div className="text-[11px] text-muted-foreground max-w-[260px] truncate" title={job.training_phase.detail}>
+                              {job.training_phase.detail}
+                            </div>
+                          )}
+                        </div>
+                      </td>
                       <td className="py-3 px-4">
                         <Badge variant="outline">{job.checkpoints?.length || 0} saved</Badge>
                       </td>
@@ -1535,6 +1570,26 @@ export function TrainingStudioPage() {
                   </div>
                 </div>
               </div>
+
+              {(selectedJob.status === "running" || selectedJob.status === "queued") && selectedJob.training_phase?.detail && (
+                <div className="p-3 rounded-lg border border-sky-500/30 bg-sky-500/10 text-xs text-sky-300 space-y-1.5">
+                  <div className="flex items-center justify-between font-medium">
+                    <span>Worker Phase: {selectedJob.training_phase.phase}</span>
+                    {typeof selectedJob.training_phase.progress_pct === "number" && (
+                      <span className="font-mono">{selectedJob.training_phase.progress_pct.toFixed(1)}%</span>
+                    )}
+                  </div>
+                  <div className="text-[11px] opacity-90">{selectedJob.training_phase.detail}</div>
+                  {typeof selectedJob.training_phase.progress_pct === "number" && (
+                    <div className="w-full h-1.5 bg-sky-950/60 rounded overflow-hidden">
+                      <div
+                        className="h-full bg-sky-400 transition-all"
+                        style={{ width: `${Math.max(2, Math.min(100, selectedJob.training_phase.progress_pct))}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Loss Descent Curve Table */}
               <div>

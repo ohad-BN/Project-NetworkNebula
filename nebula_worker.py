@@ -1139,6 +1139,121 @@ class _WorkerGpuRuntime:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def prefetch_model_with_progress(
+        self,
+        model_id: str,
+        hf_token: Optional[str] = None,
+        on_status=None,
+        cancel_event=None,
+    ) -> bool:
+        """
+        Pre-download uncached HuggingFace weights OUTSIDE self._lock with per-file cancel checks
+        and live byte-progress reporting. Returns False only if aborted cleanly via cancel_event.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if "ensure_model" in getattr(self, "__dict__", {}):
+            return True
+        if self.model is not None and self.active_model_id == model_id:
+            return True
+
+        try:
+            from huggingface_hub import HfApi, hf_hub_download
+        except Exception:
+            return True
+
+        active_token = hf_token if hf_token is not None else os.environ.get("HF_TOKEN")
+        try:
+            api = HfApi(token=active_token)
+            info = api.repo_info(repo_id=model_id, repo_type="model", files_metadata=True, timeout=8.0)
+        except Exception:
+            return True
+
+        siblings = list(getattr(info, "siblings", None) or [])
+        if not siblings:
+            return True
+
+        has_safetensors = any(str(getattr(s, "rfilename", "")).endswith(".safetensors") for s in siblings)
+        selected = []
+        for s in siblings:
+            rf = str(getattr(s, "rfilename", "") or "")
+            low = rf.lower()
+            if not rf or low.startswith(("onnx/", ".git")):
+                continue
+            if low.endswith((".msgpack", ".h5", ".ot", ".tflite", ".onnx", ".png", ".jpg", ".md")):
+                continue
+            if has_safetensors and low.endswith(".bin") and "training_args" not in low:
+                continue
+            selected.append((rf, int(getattr(s, "size", 0) or 0)))
+
+        if not selected:
+            return True
+
+        total_bytes = sum(sz for _, sz in selected if sz > 0)
+        total_mb = round(total_bytes / (1024 * 1024), 1) if total_bytes > 0 else None
+
+        hub_dir = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.path.expanduser(os.environ.get("HF_HOME") or "~/.cache/huggingface"),
+            "hub",
+        )
+        blobs_dir = os.path.join(hub_dir, f"models--{model_id.replace('/', '--')}", "blobs")
+
+        def _measure_cached_bytes() -> int:
+            if not os.path.isdir(blobs_dir):
+                return 0
+            acc = 0
+            try:
+                for entry in os.scandir(blobs_dir):
+                    if entry.is_file() and not entry.name.endswith(".lock"):
+                        try:
+                            acc += entry.stat().st_size
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return acc
+
+        import threading
+        watch_stop = threading.Event()
+
+        def _emit_progress():
+            while not watch_stop.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                dl_bytes = _measure_cached_bytes()
+                dl_mb = round(dl_bytes / (1024 * 1024), 1)
+                pct = (
+                    round(min(99.0, (dl_bytes / total_bytes) * 100.0), 1)
+                    if total_bytes > 0
+                    else None
+                )
+                detail = (
+                    f"Downloading {model_id} ({dl_mb:.1f} / {total_mb:.1f} MB)"
+                    if total_mb
+                    else f"Downloading {model_id} ({dl_mb:.1f} MB cached)"
+                )
+                if on_status is not None:
+                    on_status("downloading_model", detail, pct, dl_mb, total_mb)
+                if watch_stop.wait(2.0):
+                    break
+
+        watcher = threading.Thread(target=_emit_progress, daemon=True)
+        watcher.start()
+        try:
+            for rf, _sz in selected:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+                try:
+                    hf_hub_download(repo_id=model_id, filename=rf, token=active_token)
+                except Exception as dl_err:
+                    print(f"[GPU_WORKER] Prefetch notice ({model_id}/{rf}): {dl_err}")
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+        finally:
+            watch_stop.set()
+            watcher.join(timeout=1.0)
+        return not (cancel_event is not None and cancel_event.is_set())
+
     def ensure_model(self, model_id: str, for_training: bool = False, train_type: str = "lora", hf_token: Optional[str] = None):
         import torch
         try:
@@ -1397,6 +1512,7 @@ class _WorkerGpuRuntime:
         headers: Dict[str, str],
         on_epoch=None,
         cancel_event=None,
+        on_status=None,
     ) -> Dict[str, Any]:
         import gc
         import torch
@@ -1413,6 +1529,17 @@ class _WorkerGpuRuntime:
         base_model_id = (job_payload.get("base_model_id") or "").strip() or "Qwen/Qwen2.5-0.5B-Instruct"
         train_type = (job_payload.get("train_type") or "lora").strip().lower()
         storage_retention = (job_payload.get("storage_retention") or "zero_retention").strip().lower()
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "status": "cancelled",
+                "job_id": job_id,
+                "total_epochs": 0,
+                "final_adapter_url": None,
+            }
+
+        if on_status is not None:
+            on_status("initializing", f"Preparing dataset & secrets for {base_model_id}", None, None, None)
 
         # Unseal ephemeral secrets in RAM if sealed envelope present (Milestone 3)
         sealed_payload = job_payload.get("sealed_secrets") or job_payload.get("sealed_secrets_b64")
@@ -1465,10 +1592,41 @@ class _WorkerGpuRuntime:
         if not records:
             raise RuntimeError("Training dataset is empty")
 
+        if not self.prefetch_model_with_progress(
+            base_model_id, hf_token=hf_token, on_status=on_status, cancel_event=cancel_event
+        ):
+            print(f"[GPU_WORKER] Aborting job {job_id[:8]} cleanly during model download (cancelled).")
+            zero_memory(raw_secrets_buf, unsealed_secrets)
+            return {
+                "status": "cancelled",
+                "job_id": job_id,
+                "total_epochs": 0,
+                "final_adapter_url": None,
+            }
+
+        if on_status is not None:
+            on_status("loading_weights", f"Loading {base_model_id} onto compute device...", None, None, None)
+
         with self._lock:
+            if cancel_event is not None and cancel_event.is_set():
+                zero_memory(raw_secrets_buf, unsealed_secrets)
+                return {
+                    "status": "cancelled",
+                    "job_id": job_id,
+                    "total_epochs": 0,
+                    "final_adapter_url": None,
+                }
             base_model, tokenizer, dev = self.ensure_model(
                 base_model_id, for_training=True, train_type=train_type, hf_token=hf_token
             )
+            if cancel_event is not None and cancel_event.is_set():
+                zero_memory(raw_secrets_buf, unsealed_secrets)
+                return {
+                    "status": "cancelled",
+                    "job_id": job_id,
+                    "total_epochs": 0,
+                    "final_adapter_url": None,
+                }
             if train_type == "qlora" and dev == "cuda":
                 try:
                     from peft import prepare_model_for_kbit_training
@@ -1530,6 +1688,14 @@ class _WorkerGpuRuntime:
                             "total_epochs": epoch - 1,
                             "final_adapter_url": final_adapter_url,
                         }
+                    if on_status is not None:
+                        on_status(
+                            "training",
+                            f"{dev.upper()} active — running epoch {epoch} / {total_epochs}",
+                            round(((epoch - 1) / max(1, total_epochs)) * 100.0, 1),
+                            None,
+                            None,
+                        )
                     ep_losses = []
                     for input_ids, labels in train_batches:
                         if cancel_event is not None and cancel_event.is_set():
@@ -1965,10 +2131,14 @@ def cmd_join(args: argparse.Namespace) -> int:
                             await _safe_send({
                                 "type": "capabilities",
                                 "protocol_version": 2,
+                                "worker_version": "2026-11-11.2",
                                 "compute_capabilities": live_caps["compute_capabilities"],
                                 "supported_task_types": live_caps["supported_task_types"],
                                 "training_ready": live_caps["training_ready"],
                                 "missing_training_packages": live_caps["missing_training_packages"],
+                                "tunnel_pubkey_x25519": _gpu_runtime.tunnel_pubkey_x25519,
+                                "supports_sealed_env": bool(_gpu_runtime.tunnel_pubkey_x25519),
+                                "supports_zero_disk_shm": True,
                             })
                             if not args.json:
                                 if live_caps["training_ready"]:
@@ -2065,12 +2235,39 @@ def cmd_join(args: argparse.Namespace) -> int:
 
                                 elif job_type == "training":
                                     job_id = msg.get("job_id")
-                                    task_label = f"train-{str(job_id)[:8]}"
+                                    job_key = str(job_id or "")
+                                    if job_key and job_key in active_job_cancels:
+                                        if not args.json:
+                                            print(f"[NEBULA_WORKER] Ignoring duplicate dispatch for already-active job {job_key[:8]}.")
+                                        return
+                                    task_label = f"train-{job_key[:8]}"
                                     active_task["id"] = task_label
                                     cancel_ev = threading.Event()
-                                    if job_id:
-                                        active_job_cancels[str(job_id)] = cancel_ev
+                                    if job_key:
+                                        active_job_cancels[job_key] = cancel_ev
                                     ev_q: asyncio.Queue = asyncio.Queue()
+
+                                    def _on_status(
+                                        phase: str,
+                                        detail: str,
+                                        progress_pct: Optional[float] = None,
+                                        downloaded_mb: Optional[float] = None,
+                                        total_mb: Optional[float] = None,
+                                    ):
+                                        if cancel_ev.is_set() or stop_event.is_set():
+                                            return
+                                        hw_snap = discover_hardware()
+                                        loop.call_soon_threadsafe(ev_q.put_nowait, {
+                                            "type": "training_status",
+                                            "job_id": job_id,
+                                            "phase": phase,
+                                            "detail": detail,
+                                            "progress_pct": progress_pct,
+                                            "downloaded_mb": downloaded_mb,
+                                            "total_mb": total_mb,
+                                            "vram_used_gb": hw_snap["vram_used_gb"],
+                                            "gpu_utilization_pct": hw_snap["gpu_utilization_pct"],
+                                        })
 
                                     def _on_epoch(ep_num: int, avg_loss: float, val_loss: float, ckpt_url: str, size_bytes: int):
                                         if cancel_ev.is_set() or stop_event.is_set():
@@ -2085,7 +2282,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                             "ckpt_url": ckpt_url,
                                             "size_bytes": size_bytes,
                                             "vram_used_gb": hw_snap["vram_used_gb"],
-                                            "gpu_utilization_pct": max(hw_snap["gpu_utilization_pct"], 50.0),
+                                            "gpu_utilization_pct": hw_snap["gpu_utilization_pct"],
                                         })
 
                                     async def _drain_epochs():
@@ -2102,7 +2299,13 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         def _exec_train():
                                             try:
                                                 return _gpu_runtime.run_lora_training(
-                                                    msg, server_url, registered_id, headers, on_epoch=_on_epoch, cancel_event=cancel_ev
+                                                    msg,
+                                                    server_url,
+                                                    registered_id,
+                                                    headers,
+                                                    on_epoch=_on_epoch,
+                                                    cancel_event=cancel_ev,
+                                                    on_status=_on_status,
                                                 )
                                             finally:
                                                 loop.call_soon_threadsafe(ev_q.put_nowait, None)

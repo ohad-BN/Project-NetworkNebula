@@ -7,11 +7,17 @@ export interface WorkerCapabilityLike {
 
 /**
  * Determine whether a worker node can participate in LoRA/QLoRA training workloads.
- * Requires node online availability, verified ML training dependencies (`training_ready !== false`),
+ * Requires active availability (`online`, or `busy` when `allowBusy` is enabled),
+ * verified ML training dependencies (`training_ready !== false`),
  * and `training` or `distributed_training` in `supported_task_types`.
  */
-export function isWorkerTrainingCapable(node: WorkerCapabilityLike): boolean {
-  if (node.status && node.status !== "online") return false;
+export function isWorkerTrainingCapable(
+  node: WorkerCapabilityLike,
+  options?: { allowBusy?: boolean },
+): boolean {
+  const allowBusy = options?.allowBusy ?? true;
+  const st = String(node.status || "").trim().toLowerCase();
+  if (st && st !== "online" && !(allowBusy && st === "busy")) return false;
   if (node.is_available === false) return false;
   if (node.training_ready === false) return false;
 

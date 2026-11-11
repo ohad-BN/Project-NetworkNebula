@@ -22,19 +22,41 @@ from app.worker import execute_training_job
 import threading
 
 
-def dispatch_training_job_resilient(job_id: str):
+def dispatch_training_job_resilient(job_id: str, *, lock_acquired: bool = False):
     """Dispatch training job to Celery worker if available; otherwise execute in background thread."""
+    r_disp = None
+    try:
+        from app.cluster_worker_router import _get_redis_client
+        r_disp = _get_redis_client()
+    except Exception:
+        r_disp = None
+
+    if not lock_acquired and r_disp is not None:
+        try:
+            if not r_disp.set(f"nebula:train_dispatch:{job_id}", "1", nx=True, ex=30):
+                return
+        except Exception:
+            pass
+
     try:
         from app.worker import celery_app
-        insp = celery_app.control.inspect(timeout=0.25)
-        active_workers = insp.ping() if insp else None
-        if active_workers:
+        celery_online = False
+        if r_disp is not None:
+            try:
+                celery_online = bool(r_disp.get("nebula:celery:online"))
+            except Exception:
+                celery_online = False
+        if not celery_online:
+            insp = celery_app.control.inspect(timeout=0.35)
+            active_workers = insp.ping() if insp else None
+            celery_online = bool(active_workers)
+        if celery_online:
             execute_training_job.delay(job_id)
             return
     except Exception:
         pass
 
-    # Threaded background runner ensures immediate progress without stalled queues
+    # Threaded background runner ensures immediate progress when no Celery worker is running
     thread = threading.Thread(target=execute_training_job, args=(job_id,), daemon=True)
     thread.start()
 
@@ -94,7 +116,7 @@ def dispatch_queued_training_jobs(db: Session) -> int:
         hp.pop("waiting_for_worker", None)
         q_job.hyperparameters = json.dumps(hp)
         db.commit()
-        dispatch_training_job_resilient(q_job.id)
+        dispatch_training_job_resilient(q_job.id, lock_acquired=True)
         dispatched += 1
     return dispatched
 
@@ -285,6 +307,16 @@ def format_job_response(job: TrainingJob) -> Dict[str, Any]:
     except Exception:
         parsed_checkpoints = []
 
+    try:
+        from app.cluster_worker_router import get_training_job_phase
+        training_phase = (
+            get_training_job_phase(job.id)
+            if job.status in ("queued", "running")
+            else None
+        )
+    except Exception:
+        training_phase = None
+
     return {
         "id": job.id,
         "user_id": job.user_id,
@@ -301,6 +333,7 @@ def format_job_response(job: TrainingJob) -> Dict[str, Any]:
         "storage_retention": getattr(job, "storage_retention", "zero_retention"),
         "hyperparameters": parsed_hyperparams,
         "status": job.status,
+        "training_phase": training_phase,
         "current_epoch": job.current_epoch,
         "total_epochs": job.total_epochs,
         "loss_history": parsed_loss,
@@ -742,7 +775,8 @@ def cancel_training_job(
 
     # Release any worker nodes bound to this cancelled job & notify via WS tunnel
     from app.models import Worker
-    from app.cluster_worker_router import dispatch_job_cancel
+    from app.cluster_worker_router import dispatch_job_cancel, clear_training_job_phase
+    clear_training_job_phase(job_id)
     cancel_targets: List[str] = []
     try:
         hp = json.loads(job.hyperparameters) if job.hyperparameters else {}
@@ -759,7 +793,7 @@ def cancel_training_job(
         w.current_task_id = None
         if w.is_available:
             w.status = "online"
-            w.gpu_utilization_pct = 10.0
+            w.gpu_utilization_pct = 0.0
 
     db.commit()
     dispatch_job_cancel(job_id, cancel_targets, reason="user_cancelled")

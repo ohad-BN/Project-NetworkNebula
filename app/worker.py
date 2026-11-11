@@ -37,6 +37,60 @@ celery_app.conf.update(
 )
 
 
+def _refresh_celery_presence_once() -> None:
+    """Publish ephemeral Celery worker liveness in Redis so API dispatch won't misfire under `-P solo`."""
+    try:
+        from app.cluster_worker_router import _get_redis_client
+        r = _get_redis_client()
+        if r is not None:
+            r.set("nebula:celery:online", "1", ex=30)
+    except Exception:
+        pass
+
+
+_celery_presence_stop = None
+
+
+@celery_app.on_after_configure.connect
+def _setup_celery_presence(sender=None, **kwargs):
+    return None
+
+
+try:
+    from celery.signals import worker_ready, worker_shutdown
+    import threading as _threading
+
+    @worker_ready.connect
+    def _on_celery_worker_ready(**kwargs):
+        global _celery_presence_stop
+        _refresh_celery_presence_once()
+        if _celery_presence_stop is not None and not _celery_presence_stop.is_set():
+            return
+        stop_ev = _threading.Event()
+        _celery_presence_stop = stop_ev
+
+        def _beat():
+            while not stop_ev.wait(10.0):
+                _refresh_celery_presence_once()
+
+        _threading.Thread(target=_beat, daemon=True).start()
+
+    @worker_shutdown.connect
+    def _on_celery_worker_shutdown(**kwargs):
+        global _celery_presence_stop
+        if _celery_presence_stop is not None:
+            _celery_presence_stop.set()
+        try:
+            from app.cluster_worker_router import _get_redis_client
+            r = _get_redis_client()
+            if r is not None:
+                r.delete("nebula:celery:online")
+        except Exception:
+            pass
+except Exception:
+    pass
+
+
 def get_gpu_info():
     """Detect GPU and return info dict."""
     info = {
@@ -713,10 +767,16 @@ def execute_training_job(*args, **kwargs):
     from app.database import SessionLocal
     from app.models import TrainingJob, Worker
     from app.storage import get_storage
-    from app.cluster_worker_router import reap_stale_workers_and_tasks, get_eligible_training_workers
+    from app.cluster_worker_router import (
+        reap_stale_workers_and_tasks,
+        get_eligible_training_workers,
+        clear_training_job_phase,
+        set_training_job_phase,
+    )
 
     print(f"[WORKER] Initiating enterprise training job: {job_id}")
     db = SessionLocal()
+    claimed_rows = 0
     try:
         job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
         if not job:
@@ -725,6 +785,18 @@ def execute_training_job(*args, **kwargs):
         if job.status in ("completed", "cancelled", "running"):
             print(f"[WORKER] Skipping training job {job_id} already in state '{job.status}'")
             return {"status": job.status, "job_id": job_id}
+
+        claimed_rows = (
+            db.query(TrainingJob)
+            .filter(TrainingJob.id == job_id, TrainingJob.status == "queued")
+            .update({"status": "running"}, synchronize_session=False)
+        )
+        db.commit()
+        if claimed_rows == 0:
+            db.refresh(job)
+            print(f"[WORKER] Skipping training job {job_id} concurrently claimed (status='{job.status}')")
+            return {"status": job.status, "job_id": job_id}
+        db.refresh(job)
 
         try:
             reap_stale_workers_and_tasks(db)
@@ -848,7 +920,7 @@ def execute_training_job(*args, **kwargs):
         checkpoints_list = []
         final_adapter_url = None
 
-        def set_workers_state(status_str: str, current_task: Optional[str], util_pct: float):
+        def set_workers_state(status_str: str, current_task: Optional[str], util_pct: Optional[float] = None):
             db_w = SessionLocal()
             try:
                 for wid in participating_workers:
@@ -859,7 +931,8 @@ def execute_training_job(*args, **kwargs):
                         else:
                             w_rec.status = status_str
                         w_rec.current_task_id = current_task
-                        w_rec.gpu_utilization_pct = util_pct
+                        if util_pct is not None:
+                            w_rec.gpu_utilization_pct = util_pct
                         w_rec.last_heartbeat = datetime.now(timezone.utc)
                 db_w.commit()
             except Exception as e_w:
@@ -867,8 +940,16 @@ def execute_training_job(*args, **kwargs):
             finally:
                 db_w.close()
 
-        # Mark participating worker nodes as BUSY with training task bound
-        set_workers_state("busy", f"train-{job_id[:8]}", 85.0)
+        # Mark participating worker nodes as BUSY without fabricating fake GPU utilization
+        set_workers_state("busy", f"train-{job_id[:8]}", None)
+        set_training_job_phase(
+            job_id,
+            {
+                "phase": "dispatching",
+                "detail": f"Dispatching {job.base_model} to worker tunnel...",
+                "worker_id": participating_workers[0] if participating_workers else None,
+            },
+        )
 
         print(
             f"[WORKER] Training config: base_model={job.base_model}, epochs={total_epochs}, "
@@ -918,7 +999,7 @@ def execute_training_job(*args, **kwargs):
             ckpt_size: int,
             extra_step_meta: dict = None,
         ):
-            set_workers_state("busy", f"train-{job_id[:8]}", min(98.0, 80.0 + (epoch % 5) * 3.5))
+            set_workers_state("busy", f"train-{job_id[:8]}", None)
             step_data = {
                 "epoch": epoch,
                 "step": epoch * 100,
@@ -1002,6 +1083,8 @@ def execute_training_job(*args, **kwargs):
                     and (is_worker_tunnel_v2_online_anywhere(target_wid) or is_worker_tunnel_online_anywhere(target_wid))
                     and r_sec is not None
                 ):
+                    if is_cancelled():
+                        return {"status": "cancelled", "job_id": job_id}
                     r_client = r_sec
                     records = training_engine.prepare_gpu_training_records(
                         target_dataset_s3_url, min_records=64, job_id=job_id
@@ -1171,10 +1254,16 @@ def execute_training_job(*args, **kwargs):
             pass
         return {"status": "failed", "job_id": job_id, "error": str(e)}
     finally:
-        try:
-            set_workers_state("online", None, 12.0)
-        except Exception:
-            pass
+        if claimed_rows == 1:
+            try:
+                clear_training_job_phase(job_id)
+            except Exception:
+                pass
+            if "set_workers_state" in locals():
+                try:
+                    set_workers_state("online", None, 0.0)
+                except Exception:
+                    pass
         if db is not None:
             try:
                 db.close()

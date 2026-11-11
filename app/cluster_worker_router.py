@@ -107,6 +107,89 @@ def is_worker_tunnel_v2_online_anywhere(worker_id: str) -> bool:
         return False
 
 
+_TRAINING_PHASE_RAM_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def set_training_job_phase(job_id: Optional[str], phase_data: Dict[str, Any]) -> None:
+    """Persist ephemeral worker execution phase (e.g., downloading weights) in Redis/RAM."""
+    clean_id = str(job_id or "").strip()
+    if not clean_id:
+        return
+    record = {
+        **phase_data,
+        "job_id": clean_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _TRAINING_PHASE_RAM_CACHE[clean_id] = record
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            r.set(f"nebula:training_phase:{clean_id}", json.dumps(record), ex=600)
+        except Exception:
+            pass
+
+
+def get_training_job_phase(job_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Fetch the latest ephemeral execution phase for a queued/running training job."""
+    clean_id = str(job_id or "").strip()
+    if not clean_id:
+        return None
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            raw = r.get(f"nebula:training_phase:{clean_id}")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    return _TRAINING_PHASE_RAM_CACHE.get(clean_id)
+
+
+def clear_training_job_phase(job_id: Optional[str]) -> None:
+    """Wipe ephemeral execution phase telemetry once a training job reaches a terminal state."""
+    clean_id = str(job_id or "").strip()
+    if not clean_id:
+        return
+    _TRAINING_PHASE_RAM_CACHE.pop(clean_id, None)
+    r = _get_redis_client()
+    if r is not None:
+        try:
+            r.delete(f"nebula:training_phase:{clean_id}")
+        except Exception:
+            pass
+
+
+def resolve_live_train_task_id(
+    db: Session,
+    raw_task_id: Optional[str],
+) -> Tuple[Optional[str], Optional[Tuple[str, str]]]:
+    """
+    Validate an incoming `train-...` task reference against DB TrainingJob state.
+    Returns (valid_task_id, stale_terminal_info) where stale_terminal_info=(full_job_id, status)
+    signals that the job is already cancelled/failed/completed or missing so heartbeats must not
+    resurrect worker `busy` status or fake utilization.
+    """
+    tid = str(raw_task_id or "").strip()
+    if not tid:
+        return None, None
+    if not tid.startswith("train-"):
+        return tid, None
+    prefix = tid[len("train-"):]
+    if not prefix:
+        return None, (tid, "terminal")
+    tj = (
+        db.query(TrainingJob)
+        .filter(TrainingJob.id.like(f"{prefix}%"))
+        .order_by(TrainingJob.created_at.desc())
+        .first()
+    )
+    if not tj:
+        return None, (prefix, "missing")
+    if tj.status in ("completed", "failed", "cancelled"):
+        return None, (tj.id, tj.status)
+    return tid, None
+
+
 class WorkerTunnelManager:
     """Manages persistent bidirectional WebSocket tunnels and live compute RPC for remote GPU workers."""
 
@@ -1752,22 +1835,24 @@ def worker_node_heartbeat(
         )
 
     worker.last_heartbeat = datetime.utcnow()
-    task_id = payload.current_task_id if payload and payload.current_task_id is not None else None
-    if task_id is None and isinstance(current_task_id, str):
-        task_id = current_task_id.strip() or None
+    raw_task_id = payload.current_task_id if payload and payload.current_task_id is not None else None
+    if raw_task_id is None and isinstance(current_task_id, str):
+        raw_task_id = current_task_id.strip() or None
+
+    task_id, stale_cancel = resolve_live_train_task_id(db, raw_task_id)
+    explicit_clear = bool(
+        payload is not None
+        and "current_task_id" in getattr(payload, "model_fields_set", set())
+        and payload.current_task_id is None
+    )
 
     existing_task = worker.current_task_id or ""
     active_train_running = False
-    if not task_id and existing_task.startswith("train-"):
-        prefix = existing_task.replace("train-", "")
-        running_tj = (
-            db.query(TrainingJob)
-            .filter(TrainingJob.status == "running", TrainingJob.id.like(f"{prefix}%"))
-            .first()
-        )
-        if running_tj:
+    if not task_id and stale_cancel is None and not explicit_clear and existing_task.startswith("train-"):
+        valid_existing, _ = resolve_live_train_task_id(db, existing_task)
+        if valid_existing:
             active_train_running = True
-            task_id = existing_task
+            task_id = valid_existing
 
     worker.current_task_id = task_id
 
@@ -1775,11 +1860,7 @@ def worker_node_heartbeat(
         if payload.vram_used_gb is not None:
             worker.vram_used_gb = float(payload.vram_used_gb)
         if payload.gpu_utilization_pct is not None:
-            reported_util = float(payload.gpu_utilization_pct)
-            if (task_id and str(task_id).startswith("train-")) or active_train_running:
-                worker.gpu_utilization_pct = max(reported_util, 72.0)
-            else:
-                worker.gpu_utilization_pct = reported_util
+            worker.gpu_utilization_pct = float(payload.gpu_utilization_pct)
         if payload.latency_ping_ms is not None:
             worker.latency_ping_ms = float(payload.latency_ping_ms)
         if payload.region:
@@ -1810,6 +1891,8 @@ def worker_node_heartbeat(
             )
         if not worker.is_available:
             worker.status = "offline"
+        elif stale_cancel is not None:
+            worker.status = "online"
         elif active_train_running or (task_id and str(task_id).startswith("train-")):
             worker.status = "busy"
         elif payload.status:
@@ -2005,6 +2088,11 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                             w_cap.training_ready = True
                         if raw_missing is not None:
                             w_cap.missing_training_packages = json.dumps(list(raw_missing))
+                        if data.get("tunnel_pubkey_x25519"):
+                            w_cap.tunnel_pubkey_x25519 = str(data["tunnel_pubkey_x25519"]).strip()
+                            w_cap.supports_sealed_env = bool(data.get("supports_sealed_env", True))
+                        if "supports_zero_disk_shm" in data:
+                            w_cap.supports_zero_disk_shm = bool(data["supports_zero_disk_shm"])
                         if data.get("supported_task_types") or data.get("training_ready") is not None or caps:
                             w_cap.supported_task_types = derive_worker_supported_task_types(
                                 raw_tasks=data.get("supported_task_types") or w_cap.supported_task_types,
@@ -2027,6 +2115,7 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                     _set_worker_tunnel_redis_state(worker_id, True, is_v2=is_v2)
 
                 curr_pct = 80
+                stale_cancel_info = None
                 db_hb = SessionLocal()
                 try:
                     w_record = db_hb.query(Worker).filter(Worker.id == worker_id).first()
@@ -2037,15 +2126,18 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         if "gpu_utilization_pct" in data:
                             w_record.gpu_utilization_pct = float(data["gpu_utilization_pct"])
                         if data.get("current_task_id"):
-                            w_record.current_task_id = data["current_task_id"]
-                            w_record.status = "busy"
-                            if str(data["current_task_id"]).startswith("train-"):
-                                w_record.gpu_utilization_pct = max(float(w_record.gpu_utilization_pct or 0.0), 75.0)
+                            valid_tid, stale_cancel_info = resolve_live_train_task_id(db_hb, data["current_task_id"])
+                            if stale_cancel_info is not None:
+                                w_record.current_task_id = None
+                                w_record.status = "online" if w_record.is_available else "offline"
+                            else:
+                                w_record.current_task_id = valid_tid
+                                w_record.status = "busy" if w_record.is_available else "offline"
                         elif "current_task_id" in data and data["current_task_id"] is None:
                             w_record.current_task_id = None
-                            w_record.status = "online"
+                            w_record.status = "online" if w_record.is_available else "offline"
                         elif (w_record.status or "").lower() != "busy":
-                            w_record.status = "online"
+                            w_record.status = "online" if w_record.is_available else "offline"
                         db_hb.commit()
                         db_hb.refresh(w_record)
                         curr_pct = int(w_record.vram_allocation_pct or 80)
@@ -2053,6 +2145,13 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                             _trigger_queued_training_dispatch(db_hb)
                 finally:
                     db_hb.close()
+
+                if stale_cancel_info is not None:
+                    c_jid, c_status = stale_cancel_info
+                    await worker_tunnel_manager._safe_send_json(
+                        worker_id,
+                        {"type": "job_cancel", "job_id": c_jid, "reason": f"job_{c_status}"},
+                    )
 
                 await worker_tunnel_manager._safe_send_json(
                     worker_id,
@@ -2099,6 +2198,55 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                             "latency_ms": data.get("latency_ms", 0.0),
                             "device": data.get("device", "cuda"),
                         },
+                    )
+
+            elif msg_type == "training_status":
+                worker_tunnel_manager.mark_v2_capable(worker_id)
+                t_job_id = data.get("job_id")
+                job_is_terminal = False
+                terminal_status = None
+                db_st = SessionLocal()
+                try:
+                    if t_job_id:
+                        tj = db_st.query(TrainingJob).filter(TrainingJob.id == t_job_id).first()
+                        if tj and tj.status in ("failed", "cancelled", "completed"):
+                            job_is_terminal = True
+                            terminal_status = tj.status
+                        else:
+                            set_training_job_phase(
+                                t_job_id,
+                                {
+                                    "phase": str(data.get("phase") or "running"),
+                                    "detail": str(data.get("detail") or ""),
+                                    "progress_pct": data.get("progress_pct"),
+                                    "downloaded_mb": data.get("downloaded_mb"),
+                                    "total_mb": data.get("total_mb"),
+                                    "worker_id": worker_id,
+                                },
+                            )
+                    w_rec = db_st.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_rec:
+                        w_rec.last_heartbeat = datetime.utcnow()
+                        if job_is_terminal:
+                            w_rec.current_task_id = None
+                            if w_rec.is_available:
+                                w_rec.status = "online"
+                        else:
+                            w_rec.status = "busy" if w_rec.is_available else "offline"
+                            if t_job_id:
+                                w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
+                        if "vram_used_gb" in data and data["vram_used_gb"] is not None:
+                            w_rec.vram_used_gb = float(data["vram_used_gb"])
+                        if "gpu_utilization_pct" in data and data["gpu_utilization_pct"] is not None:
+                            w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
+                        db_st.commit()
+                finally:
+                    db_st.close()
+                if job_is_terminal and terminal_status in ("failed", "cancelled") and t_job_id:
+                    clear_training_job_phase(t_job_id)
+                    await worker_tunnel_manager._safe_send_json(
+                        worker_id,
+                        {"type": "job_cancel", "job_id": t_job_id, "reason": f"job_{terminal_status}"},
                     )
 
             elif msg_type == "training_epoch":
@@ -2171,9 +2319,19 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                         if "gpu_utilization_pct" in data:
                             w_rec.gpu_utilization_pct = float(data["gpu_utilization_pct"])
                     db_tr.commit()
+                    if t_job_id and not job_is_terminal:
+                        set_training_job_phase(
+                            t_job_id,
+                            {
+                                "phase": "training",
+                                "detail": f"Completed epoch {ep_num} (loss {avg_loss:.4f})",
+                                "worker_id": worker_id,
+                            },
+                        )
                 finally:
                     db_tr.close()
                 if job_is_terminal and terminal_status in ("failed", "cancelled") and t_job_id:
+                    clear_training_job_phase(t_job_id)
                     await worker_tunnel_manager._safe_send_json(
                         worker_id,
                         {"type": "job_cancel", "job_id": t_job_id, "reason": f"job_{terminal_status}"},
@@ -2182,6 +2340,7 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             elif msg_type in ("training_result", "training_error"):
                 worker_tunnel_manager.mark_v2_capable(worker_id)
                 t_job_id = data.get("job_id")
+                clear_training_job_phase(t_job_id)
                 err_text = str(data.get("error") or "")
                 missing_pkg_err = (
                     msg_type == "training_error"

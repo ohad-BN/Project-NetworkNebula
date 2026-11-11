@@ -468,13 +468,21 @@ class PeftTrainingEngine:
         contain at least `min_records` optimization steps per epoch for sustained CUDA training.
         Consumes volatile client RAM streams first when `dataset_s3_url` uses `tunnel_stream://`.
         """
+        ds_str = str(dataset_s3_url or "").strip()
+        is_tunnel_stream = ds_str.startswith("tunnel_stream://")
         base_records: List[Dict[str, str]] = []
-        if job_id and str(dataset_s3_url or "").startswith("tunnel_stream://"):
-            try:
-                from app.cluster_worker_router import pop_buffered_client_stream_records
-                base_records = pop_buffered_client_stream_records(job_id)
-            except Exception as exc:
-                logger.warning(f"Failed consuming tunnel_stream RAM buffer for {job_id}: {exc}")
+        if is_tunnel_stream:
+            stream_job_id = job_id or ds_str[len("tunnel_stream://"):].strip()
+            if stream_job_id:
+                try:
+                    from app.cluster_worker_router import pop_buffered_client_stream_records
+                    base_records = pop_buffered_client_stream_records(stream_job_id)
+                except Exception as exc:
+                    logger.warning(f"Failed consuming tunnel_stream RAM buffer for {stream_job_id}: {exc}")
+            if not base_records:
+                raise RuntimeError(
+                    f"Volatile zero-storage RAM dataset stream '{ds_str}' is empty or expired before worker dispatch."
+                )
 
         if not base_records:
             base_records = self.load_dataset_records(dataset_s3_url)
