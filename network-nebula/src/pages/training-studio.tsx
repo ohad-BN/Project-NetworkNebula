@@ -38,7 +38,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { apiClient, getApiBaseUrl, resolveAssetUrl } from "@/services/api/client";
+import { apiClient, getApiBaseUrl } from "@/services/api/client";
 import { toast } from "sonner";
 import {
   sealEnvelope,
@@ -554,6 +554,56 @@ export function TrainingStudioPage() {
   };
 
   // Local Decryption & Safe Download of .safetensors Adapter
+  const extractDownloadError = (err: any): string => {
+    const raw = err?.response?.data;
+    if (raw instanceof ArrayBuffer) {
+      try {
+        const text = new TextDecoder().decode(new Uint8Array(raw));
+        const parsed = JSON.parse(text);
+        if (parsed?.detail) return String(parsed.detail);
+        if (text.trim()) return text.trim();
+      } catch {
+        // fallback below
+      }
+    } else if (typeof raw === "string" && raw.trim()) {
+      return raw.trim();
+    } else if (raw?.detail) {
+      return String(raw.detail);
+    }
+    return err?.message || String(err);
+  };
+
+  const fetchCheckpointArrayBuffer = async (
+    job: TrainingJobItem,
+    epoch: number,
+    rawUrl?: string | null
+  ): Promise<ArrayBuffer> => {
+    const cleanUrl = (rawUrl || "").trim();
+    const isInternalPrivateUrl =
+      !cleanUrl ||
+      cleanUrl.startsWith("s3://") ||
+      cleanUrl.includes("/nebula-checkpoints/") ||
+      /^https?:\/\/(minio|localhost|127\.0\.0\.1):9000\//i.test(cleanUrl);
+
+    if (!isInternalPrivateUrl && /^https?:\/\//i.test(cleanUrl)) {
+      const resp = await fetch(cleanUrl);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching external checkpoint file`);
+      const ctype = (resp.headers.get("content-type") || "").toLowerCase();
+      if (ctype.includes("text/html")) {
+        throw new Error("External checkpoint URL returned HTML instead of binary weights.");
+      }
+      return await resp.arrayBuffer();
+    }
+
+    const downloadEndpoint = `/api/v1/training/jobs/${job.id}/checkpoints/${epoch}/download`;
+    const resp = await apiClient.get(downloadEndpoint, { responseType: "arraybuffer" });
+    const ctype = String(resp.headers?.["content-type"] || "").toLowerCase();
+    if (ctype.includes("text/html")) {
+      throw new Error("Checkpoint download endpoint returned HTML instead of binary weights.");
+    }
+    return resp.data;
+  };
+
   const handleDecryptAndDownload = async (job: TrainingJobItem) => {
     const dek = getJobDek(job.id);
     if (!dek) {
@@ -571,26 +621,12 @@ export function TrainingStudioPage() {
       setIsDecryptingJobId(job.id);
       toast.info(`Fetching adapter weights for ${job.name || job.id}...`);
 
-      let downloadUrl = "";
-      if (job.checkpoints && job.checkpoints.length > 0) {
-        const lastCkpt = job.checkpoints[job.checkpoints.length - 1];
-        downloadUrl = resolveAssetUrl(lastCkpt.s3_url) || "";
-      } else if (job.final_adapter_url) {
-        downloadUrl = resolveAssetUrl(job.final_adapter_url) || "";
-      } else {
-        downloadUrl = `/api/v1/training/jobs/${job.id}/checkpoints/${job.current_epoch || 1}/download`;
-      }
-
-      let arrayBuffer: ArrayBuffer;
-      try {
-        const resp = await apiClient.get(downloadUrl, { responseType: "arraybuffer" });
-        arrayBuffer = resp.data;
-      } catch {
-        // Fallback direct fetch if cross-origin or presigned S3
-        const resp = await fetch(downloadUrl);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching checkpoint file`);
-        arrayBuffer = await resp.arrayBuffer();
-      }
+      const lastCkpt = job.checkpoints?.length
+        ? job.checkpoints[job.checkpoints.length - 1]
+        : null;
+      const targetEpoch = lastCkpt?.epoch || job.current_epoch || 1;
+      const rawUrl = lastCkpt?.s3_url || job.final_adapter_url;
+      const arrayBuffer = await fetchCheckpointArrayBuffer(job, targetEpoch, rawUrl);
 
       toast.info("Decrypting .safetensors in browser memory using client DEK...");
       const decryptedBytes = await decryptSafetensors(arrayBuffer, dekB64, job.id);
@@ -600,7 +636,26 @@ export function TrainingStudioPage() {
       toast.success(`Successfully decrypted & saved '${filename}'!`);
       setKeyRecoveryModalOpen(false);
     } catch (err: any) {
-      toast.error(`Decryption failed: ${err.message || String(err)}`);
+      toast.error(`Decryption failed: ${extractDownloadError(err)}`);
+    } finally {
+      setIsDecryptingJobId(null);
+    }
+  };
+
+  const handleDownloadRawCheckpoint = async (
+    job: TrainingJobItem,
+    epoch: number,
+    rawUrl?: string | null
+  ) => {
+    try {
+      setIsDecryptingJobId(job.id);
+      const arrayBuffer = await fetchCheckpointArrayBuffer(job, epoch, rawUrl);
+      const safeName = (job.name || job.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const filename = `${safeName}-epoch${epoch}-adapter.safetensors`;
+      downloadSafetensorsFile(new Uint8Array(arrayBuffer), filename);
+      toast.success(`Downloaded '${filename}'`);
+    } catch (err: any) {
+      toast.error(`Download failed: ${extractDownloadError(err)}`);
     } finally {
       setIsDecryptingJobId(null);
     }
@@ -1679,15 +1734,15 @@ export function TrainingStudioPage() {
                             <Key className="h-3 w-3" />
                             Export .nebulakey
                           </Button>
-                          <a
-                            href={resolveAssetUrl(ckpt.s3_url)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                          <Button
+                            size="sm"
+                            disabled={isDecryptingJobId === selectedJob.id}
+                            className="text-xs gap-1.5"
+                            onClick={() => handleDownloadRawCheckpoint(selectedJob, ckpt.epoch, ckpt.s3_url)}
                           >
                             <Download className="h-3.5 w-3.5" />
                             Raw Checkpoint
-                          </a>
+                          </Button>
                         </div>
                       </div>
                     ))}

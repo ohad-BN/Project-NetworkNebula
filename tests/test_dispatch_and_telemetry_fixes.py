@@ -354,3 +354,78 @@ def test_worker_prefetch_emits_progress_and_aborts_on_cancel_mid_download():
         )
     assert res["status"] == "cancelled"
     assert res["total_epochs"] == 0
+
+
+def test_authenticated_checkpoint_download_owner_and_isolation(client, db_session, worker_job_fixture):
+    user = worker_job_fixture["user"]
+    job = worker_job_fixture["job"]
+    job.status = "completed"
+    job.current_epoch = 3
+    job.total_epochs = 3
+    job.checkpoints = json.dumps([
+        {
+            "epoch": 3,
+            "s3_url": f"http://minio:9000/nebula-checkpoints/{job.id}/epoch_3/adapter_model.safetensors",
+            "size_bytes": 16,
+        }
+    ])
+    job.final_adapter_url = f"http://minio:9000/nebula-checkpoints/{job.id}/epoch_3/adapter_model.safetensors"
+
+    other_suffix = uuid.uuid4().hex[:8]
+    other_user = User(
+        id=f"user-other-{other_suffix}",
+        email=f"other_{other_suffix}@example.com",
+        api_key=f"nebula_other_key_{other_suffix}",
+        api_secret=f"nebula_other_sec_{other_suffix}",
+        name="Other Tenant",
+        is_active=True,
+    )
+    db_session.add(other_user)
+    db_session.commit()
+
+    fake_safetensors = b"\x08\x00\x00\x00\x00\x00\x00\x00{\"k\":1}payload"
+    fake_storage = MagicMock()
+    fake_storage.download_bytes.return_value = fake_safetensors
+
+    try:
+        owner_headers = {"X-API-Key": user.api_key, "X-API-Secret": user.api_secret}
+        other_headers = {"X-API-Key": other_user.api_key, "X-API-Secret": other_user.api_secret}
+
+        # Unauthenticated request rejected
+        unauth = client.get(f"/api/v1/training/jobs/{job.id}/checkpoints/3/download")
+        assert unauth.status_code in (401, 403)
+
+        # Cross-tenant request rejected with 404 (AUD-03)
+        cross = client.get(
+            f"/api/v1/training/jobs/{job.id}/checkpoints/3/download",
+            headers=other_headers,
+        )
+        assert cross.status_code == 404
+
+        with patch("app.enterprise_training_router.get_storage", return_value=fake_storage):
+            # Disallowed artifact filename rejected cleanly (no path traversal)
+            bad_file = client.get(
+                f"/api/v1/training/jobs/{job.id}/checkpoints/3/download?file=../../etc/passwd",
+                headers=owner_headers,
+            )
+            assert bad_file.status_code == 400
+
+            # Owner receives authentic binary payload
+            ok_resp = client.get(
+                f"/api/v1/training/jobs/{job.id}/checkpoints/3/download",
+                headers=owner_headers,
+            )
+            assert ok_resp.status_code == 200
+            assert ok_resp.content == fake_safetensors
+            assert "application/octet-stream" in ok_resp.headers.get("content-type", "")
+            assert ok_resp.headers.get("x-content-type-options") == "nosniff"
+            fake_storage.download_bytes.assert_called_with(
+                "nebula-checkpoints",
+                f"{job.id}/epoch_3/adapter_model.safetensors",
+            )
+    finally:
+        try:
+            db_session.delete(other_user)
+            db_session.commit()
+        except Exception:
+            db_session.rollback()

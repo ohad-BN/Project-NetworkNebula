@@ -4,8 +4,8 @@
  * Client-Side Cryptography for NetworkNebula Zero-Storage Architecture.
  * Implements:
  * 1. X25519 ECDH via @noble/curves/ed25519 (x25519)
- * 2. HKDF-SHA256 key derivation via WebCrypto SubtleCrypto
- * 3. AES-256-GCM authenticated encryption/decryption bound to job_id AAD
+ * 2. HKDF-SHA256 key derivation via WebCrypto SubtleCrypto (with @noble/hashes fallback for HTTP)
+ * 3. AES-256-GCM authenticated encryption/decryption bound to job_id AAD (with @noble/ciphers fallback for HTTP)
  * 4. Binary envelope packing matching worker unseal_envelope:
  *    PK_C (32B) + salt (16B) + IV (12B) + Tag (16B) + Ciphertext
  * 5. DEK generation, session/local storage retention, and .nebulakey export/import
@@ -13,6 +13,9 @@
  */
 
 import { x25519 } from "@noble/curves/ed25519.js";
+import { gcm } from "@noble/ciphers/aes.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 
 export interface SealedEnvelopeResult {
   sealed_secrets_b64: string;
@@ -65,12 +68,21 @@ export function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
-function getSubtleCrypto(): SubtleCrypto {
-  const subtle = globalThis.crypto?.subtle || (globalThis as any).crypto?.webcrypto?.subtle;
-  if (!subtle) {
-    throw new Error("WebCrypto SubtleCrypto is not available in this environment.");
+function getOptionalSubtleCrypto(): SubtleCrypto | null {
+  return globalThis.crypto?.subtle || (globalThis as any).crypto?.webcrypto?.subtle || null;
+}
+
+const SEALED_ENVELOPE_INFO = "nebula-sealed-envelope-v1";
+
+function looksLikeHtmlDocument(bytes: Uint8Array): boolean {
+  const sampleLen = Math.min(bytes.length, 64);
+  if (sampleLen < 5) return false;
+  let prefix = "";
+  for (let i = 0; i < sampleLen; i++) {
+    prefix += String.fromCharCode(bytes[i]);
   }
-  return subtle;
+  const trimmed = prefix.trimStart().toLowerCase();
+  return trimmed.startsWith("<!doctype") || trimmed.startsWith("<html");
 }
 
 function getRandomBytes(length: number): Uint8Array {
@@ -96,7 +108,7 @@ export async function sealEnvelope(
   workerPubkeyB64: string,
   jobId: string
 ): Promise<SealedEnvelopeResult> {
-  const subtle = getSubtleCrypto();
+  const subtle = getOptionalSubtleCrypto();
 
   // 1. Parse worker X25519 public key (32 bytes)
   const workerPkBytes = base64ToUint8Array(workerPubkeyB64);
@@ -116,45 +128,52 @@ export async function sealEnvelope(
   const salt = getRandomBytes(16);
   const iv = getRandomBytes(12);
 
-  // 5. Derive 32-byte AES-GCM key using HKDF-SHA256 (info = "nebula-sealed-envelope-v1")
-  const hkdfKey = await subtle.importKey(
-    "raw",
-    sharedSecret as unknown as BufferSource,
-    { name: "HKDF" },
-    false,
-    ["deriveKey"]
-  );
-
-  const derivedAesKey = await subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: salt as unknown as BufferSource,
-      info: new TextEncoder().encode("nebula-sealed-envelope-v1") as unknown as BufferSource,
-    },
-    hkdfKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt"]
-  );
-
-  // 6. Encrypt plaintext secrets with AES-256-GCM bound to AAD = jobId
+  // 5-6. Derive 32-byte AES-GCM key (HKDF-SHA256) and encrypt plaintext bound to AAD = jobId
+  const infoBytes = new TextEncoder().encode(SEALED_ENVELOPE_INFO);
   const plaintext = new TextEncoder().encode(JSON.stringify(secrets));
   const aad = new TextEncoder().encode(jobId);
 
-  const encryptedBuffer = await subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv: iv as unknown as BufferSource,
-      additionalData: aad as unknown as BufferSource,
-      tagLength: 128,
-    },
-    derivedAesKey,
-    plaintext as unknown as BufferSource
-  );
+  let encBytes: Uint8Array;
+  if (subtle) {
+    const hkdfKey = await subtle.importKey(
+      "raw",
+      sharedSecret as unknown as BufferSource,
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
+    );
 
-  const encBytes = new Uint8Array(encryptedBuffer);
-  // WebCrypto AES-GCM puts 16-byte tag at the end of ciphertext
+    const derivedAesKey = await subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: salt as unknown as BufferSource,
+        info: infoBytes as unknown as BufferSource,
+      },
+      hkdfKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt"]
+    );
+
+    const encryptedBuffer = await subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv as unknown as BufferSource,
+        additionalData: aad as unknown as BufferSource,
+        tagLength: 128,
+      },
+      derivedAesKey,
+      plaintext as unknown as BufferSource
+    );
+    encBytes = new Uint8Array(encryptedBuffer);
+  } else {
+    // Pure-JS fallback for non-HTTPS origins where window.crypto.subtle is unavailable
+    const derivedKeyBytes = hkdf(sha256, sharedSecret, salt, infoBytes, 32);
+    encBytes = new Uint8Array(gcm(derivedKeyBytes, iv, aad).encrypt(plaintext));
+  }
+
+  // WebCrypto AES-GCM and @noble/ciphers gcm both append 16-byte tag at the end of ciphertext
   const ciphertext = encBytes.subarray(0, encBytes.length - 16);
   const tag = encBytes.subarray(encBytes.length - 16);
 
@@ -364,12 +383,17 @@ export async function decryptSafetensors(
   dekB64: string,
   jobId?: string
 ): Promise<Uint8Array> {
-  const subtle = getSubtleCrypto();
   const rawBytes = input instanceof Uint8Array ? input : new Uint8Array(input);
 
-  // Check if already raw unencrypted safetensors
+  // Check if already raw unencrypted safetensors (does not require DEK or SubtleCrypto)
   if (isSafetensorsFile(rawBytes)) {
     return rawBytes;
+  }
+
+  if (looksLikeHtmlDocument(rawBytes)) {
+    throw new Error(
+      "Downloaded response is HTML instead of .safetensors weights (private bucket URL cannot be fetched directly)."
+    );
   }
 
   // Parse DEK
@@ -378,23 +402,26 @@ export async function decryptSafetensors(
     throw new Error(`Invalid DEK length: expected 32 bytes, got ${dekBytes.length}`);
   }
 
-  const aesKey = await subtle.importKey(
-    "raw",
-    dekBytes as unknown as BufferSource,
-    { name: "AES-GCM" },
-    false,
-    ["decrypt"]
-  );
-
   // An encrypted safetensors payload needs at least 12 (IV) + 16 (Tag) = 28 bytes
   if (rawBytes.length < 28) {
     throw new Error("Ciphertext too short to contain IV and authentication tag.");
   }
 
+  const subtle = getOptionalSubtleCrypto();
+  const aesKey = subtle
+    ? await subtle.importKey(
+        "raw",
+        dekBytes as unknown as BufferSource,
+        { name: "AES-GCM" },
+        false,
+        ["decrypt"]
+      )
+    : null;
+
   // Candidates for AAD
-  const aadCandidates: (BufferSource | undefined)[] = [];
+  const aadCandidates: (Uint8Array | undefined)[] = [];
   if (jobId) {
-    aadCandidates.push(new TextEncoder().encode(jobId) as unknown as BufferSource);
+    aadCandidates.push(new TextEncoder().encode(jobId));
   }
   aadCandidates.push(undefined);
 
@@ -420,18 +447,22 @@ export async function decryptSafetensors(
   for (const aad of aadCandidates) {
     for (const payload of payloadCandidates) {
       try {
-        const decryptedBuffer = await subtle.decrypt(
-          {
-            name: "AES-GCM",
-            iv: iv as unknown as BufferSource,
-            additionalData: aad,
-            tagLength: 128,
-          },
-          aesKey,
-          payload as unknown as BufferSource
-        );
-        const result = new Uint8Array(decryptedBuffer);
-        return result;
+        if (subtle && aesKey) {
+          const decryptedBuffer = await subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: iv as unknown as BufferSource,
+              additionalData: aad as unknown as BufferSource | undefined,
+              tagLength: 128,
+            },
+            aesKey,
+            payload as unknown as BufferSource
+          );
+          return new Uint8Array(decryptedBuffer);
+        } else {
+          const cipher = aad ? gcm(dekBytes, iv, aad) : gcm(dekBytes, iv);
+          return new Uint8Array(cipher.decrypt(payload));
+        }
       } catch (err: any) {
         lastError = err;
       }

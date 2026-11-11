@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -748,6 +748,109 @@ def get_training_checkpoints(
         checkpoints = []
 
     return checkpoints
+
+
+_ALLOWED_CHECKPOINT_FILES = {"adapter_model.safetensors", "adapter_config.json"}
+
+
+def _resolve_checkpoint_bucket_and_key(job: TrainingJob, epoch: int, filename: str) -> tuple[str, str]:
+    """Resolve MinIO bucket and object key for a job epoch checkpoint without exposing internal bucket URLs."""
+    if filename not in _ALLOWED_CHECKPOINT_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported checkpoint artifact '{filename}'. Allowed: {sorted(_ALLOWED_CHECKPOINT_FILES)}",
+        )
+
+    raw_url = None
+    try:
+        checkpoints = json.loads(job.checkpoints) if job.checkpoints else []
+    except Exception:
+        checkpoints = []
+
+    for ckpt in checkpoints:
+        if isinstance(ckpt, dict) and int(ckpt.get("epoch") or 0) == epoch:
+            raw_url = ckpt.get("s3_url")
+            break
+    if not raw_url and job.final_adapter_url and int(job.current_epoch or 0) in (0, epoch):
+        raw_url = job.final_adapter_url
+
+    bucket = "nebula-checkpoints"
+    object_key = f"{job.id}/epoch_{epoch}/{filename}"
+
+    if isinstance(raw_url, str) and raw_url.strip():
+        clean = raw_url.strip()
+        parsed_key = None
+        if clean.startswith("s3://"):
+            s3_parts = clean[5:].split("/", 1)
+            if len(s3_parts) == 2 and s3_parts[0] and s3_parts[1]:
+                bucket = s3_parts[0]
+                parsed_key = s3_parts[1]
+        elif "/nebula-checkpoints/" in clean:
+            bucket = "nebula-checkpoints"
+            parsed_key = clean.split("/nebula-checkpoints/", 1)[1].split("?", 1)[0].lstrip("/")
+
+        if parsed_key:
+            if filename == "adapter_config.json":
+                prefix = parsed_key.rsplit("/", 1)[0] if "/" in parsed_key else ""
+                object_key = f"{prefix}/adapter_config.json" if prefix else "adapter_config.json"
+            else:
+                object_key = parsed_key
+
+    return bucket, object_key
+
+
+@router.get("/jobs/{job_id}/checkpoints/{epoch}/download")
+def download_training_checkpoint(
+    job_id: str,
+    epoch: int,
+    file: str = Query("adapter_model.safetensors"),
+    current_user: User = Depends(verify_enterprise_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Authenticated owner download for private MinIO training checkpoints (keeps nginx AUD-02 lockdown intact).
+    """
+    if epoch < 1:
+        raise HTTPException(status_code=400, detail="Epoch must be >= 1")
+
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.user_id == current_user.id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
+
+    bucket, object_key = _resolve_checkpoint_bucket_and_key(job, epoch, file)
+    from botocore.exceptions import ClientError
+
+    storage = get_storage()
+    try:
+        artifact_bytes = storage.download_bytes(bucket, object_key)
+    except ClientError as exc:
+        err_code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if err_code in ("NoSuchKey", "404", "NoSuchBucket"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Checkpoint artifact '{file}' for job {job_id} epoch {epoch} not found",
+            )
+        raise HTTPException(status_code=502, detail="Failed to retrieve checkpoint from storage")
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Checkpoint artifact '{file}' for job {job_id} epoch {epoch} not found",
+        )
+
+    safe_name = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (job.name or job.id))
+    media_type = "application/json" if file.endswith(".json") else "application/octet-stream"
+    return Response(
+        content=artifact_bytes,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}-epoch{epoch}-{file}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.post("/jobs/{job_id}/cancel")
