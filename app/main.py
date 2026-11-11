@@ -169,6 +169,57 @@ async def startup_event():
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS input_idle_sec FLOAT DEFAULT 300.0;"))
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS gpu_temp_c FLOAT DEFAULT 50.0;"))
             conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS duty_cycle_pct INTEGER DEFAULT 100;"))
+
+            # Milestone 3: Zero-Storage, Private Model Registry & Sealed Envelope schema additions
+            from sqlalchemy import inspect as sqla_inspect
+            insp = sqla_inspect(conn)
+            existing_tables = set(insp.get_table_names())
+            if "training_jobs" in existing_tables:
+                tj_cols = {c["name"] for c in insp.get_columns("training_jobs")}
+                if "privacy_mode" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN privacy_mode VARCHAR(32) DEFAULT 'encrypted_staked_mesh';"))
+                if "data_source_type" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN data_source_type VARCHAR(32) DEFAULT 'tunnel_stream';"))
+                if "storage_retention" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN storage_retention VARCHAR(32) DEFAULT 'zero_retention';"))
+                if "required_vram_gb" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN required_vram_gb FLOAT DEFAULT 4.0;"))
+                if "private_model_id" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN private_model_id VARCHAR(36);"))
+                if "artifact_manifest_json" not in tj_cols:
+                    conn.execute(text("ALTER TABLE training_jobs ADD COLUMN artifact_manifest_json TEXT DEFAULT '{}';"))
+                try:
+                    conn.execute(text("ALTER TABLE training_jobs ALTER COLUMN dataset_s3_url DROP NOT NULL;"))
+                except Exception:
+                    pass
+
+            if "workers" in existing_tables:
+                w_cols = {c["name"] for c in insp.get_columns("workers")}
+                if "tunnel_pubkey_x25519" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN tunnel_pubkey_x25519 VARCHAR(128);"))
+                if "supports_sealed_env" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN supports_sealed_env BOOLEAN DEFAULT FALSE;"))
+                if "supports_zero_disk_shm" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN supports_zero_disk_shm BOOLEAN DEFAULT FALSE;"))
+                if "tee_attestation_type" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN tee_attestation_type VARCHAR(32) DEFAULT 'none';"))
+                if "gpu_count" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN gpu_count INTEGER DEFAULT 1;"))
+                if "collective_vram_gb" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN collective_vram_gb FLOAT DEFAULT 0.0;"))
+                if "largest_single_gpu_gb" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN largest_single_gpu_gb FLOAT DEFAULT 0.0;"))
+                if "training_ready" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN training_ready BOOLEAN DEFAULT TRUE;"))
+                if "missing_training_packages" not in w_cols:
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN missing_training_packages TEXT DEFAULT '[]';"))
+
+            if "inference_endpoints" in existing_tables:
+                ie_cols = {c["name"] for c in insp.get_columns("inference_endpoints")}
+                if "privacy_mode" not in ie_cols:
+                    conn.execute(text("ALTER TABLE inference_endpoints ADD COLUMN privacy_mode VARCHAR(32) DEFAULT 'encrypted_staked_mesh';"))
+                if "private_model_id" not in ie_cols:
+                    conn.execute(text("ALTER TABLE inference_endpoints ADD COLUMN private_model_id VARCHAR(36);"))
             conn.commit()
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             try:
@@ -1247,6 +1298,11 @@ app.include_router(invite_router)
 from app.user_profile_router import router as user_profile_router
 
 app.include_router(user_profile_router)
+
+# Include Private Model Registry & Worker Public Key Router (Milestone 3)
+from app.private_registry_router import router as private_registry_router
+
+app.include_router(private_registry_router)
 # ==============================================================================
 # Single-Page Application (SPA) Static Files & Client-Side Route Fallback
 # ==============================================================================

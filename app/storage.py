@@ -38,22 +38,31 @@ class StorageClient:
                 logger.error(f"Could not create bucket {target_bucket}: {e}")
                 raise
         
-        # Ensure public read policy for browser access
-        try:
-            import json
-            policy = json.dumps({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Sid": "PublicReadGetObject",
-                    "Effect": "Allow",
-                    "Principal": "*",
-                    "Action": ["s3:GetObject"],
-                    "Resource": [f"arn:aws:s3:::{target_bucket}/*"]
-                }]
-            })
-            self.s3.put_bucket_policy(Bucket=target_bucket, Policy=policy)
-        except Exception as e:
-            logger.warning(f"Could not set public bucket policy on {target_bucket}: {e}")
+        # AUD-02: Private training buckets must NEVER have public-read bucket policies
+        PRIVATE_BUCKETS = {"nebula-datasets", "nebula-checkpoints", "nebula-models"}
+        if target_bucket not in PRIVATE_BUCKETS:
+            # Only set public read policy for explicitly public buckets (e.g. nebula-renders)
+            try:
+                import json
+                policy = json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Sid": "PublicReadGetObject",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": ["s3:GetObject"],
+                        "Resource": [f"arn:aws:s3:::{target_bucket}/*"]
+                    }]
+                })
+                self.s3.put_bucket_policy(Bucket=target_bucket, Policy=policy)
+            except Exception as e:
+                logger.warning(f"Could not set public bucket policy on {target_bucket}: {e}")
+        else:
+            # Ensure any existing public read policy on private buckets is removed
+            try:
+                self.s3.delete_bucket_policy(Bucket=target_bucket)
+            except Exception:
+                pass
         self._verified_buckets.add(target_bucket)
 
     def ensure_all_enterprise_buckets_exist(self) -> List[str]:

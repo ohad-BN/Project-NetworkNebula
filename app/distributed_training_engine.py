@@ -64,18 +64,24 @@ class DistributedTrainingEngine:
         self,
         db,
         num_gpus: int,
-        required_vram_gb: float = 2.0,
+        required_vram_gb: Optional[float] = None,
         enforce_region: Optional[str] = None,
         max_latency_ms: Optional[float] = None,
+        base_model_id: Optional[str] = None,
+        train_type: str = "lora",
+        batch_size: int = 4,
+        max_seq_length: int = 512,
+        lora_r: int = 16,
+        strict_worker_count: bool = False,
+        require_active_tunnel: bool = False,
     ) -> List[str]:
         """
-        Select `num_gpus` optimal GPU worker nodes from PostgreSQL using `ClusterScheduler`.
-        Enforces geographic data sovereignty and low-latency clustering constraints.
-        If fewer than `num_gpus` eligible physical workers are currently registered on a single-GPU
-        development host, automatically provisions peer shard worker records within the target region
-        so multi-node sharding, Ring All-Reduce, and proportional multi-worker SLA payouts execute seamlessly.
+        Select optimal training-eligible GPU worker nodes from PostgreSQL using `ClusterScheduler`.
+        Enforces geographic data sovereignty, task compatibility (`training`), package readiness,
+        and strict dynamic VRAM eligibility gating.
+        When `strict_worker_count` is False (e.g. Auto-Swarm), scales gracefully down to available
+        training-eligible GPUs instead of hanging in queued or recruiting non-training machines.
         """
-        from app.models import Worker, User
         from app.scheduler import cluster_scheduler
 
         try:
@@ -83,6 +89,19 @@ class DistributedTrainingEngine:
             sync_primary_local_worker(db)
         except Exception:
             pass
+
+        if required_vram_gb is None:
+            if base_model_id:
+                from app.vram_estimator import estimate_required_vram_gb
+                required_vram_gb = estimate_required_vram_gb(
+                    model_id=base_model_id,
+                    train_type=train_type,
+                    batch_size=batch_size,
+                    max_seq_length=max_seq_length,
+                    lora_r=lora_r,
+                )
+            else:
+                required_vram_gb = 2.0
 
         sched_res = cluster_scheduler.select_optimal_workers(
             db=db,
@@ -93,28 +112,33 @@ class DistributedTrainingEngine:
             max_latency_ms=max_latency_ms,
             topology_aware=True,
             record_dispatch=True,
+            model_id=base_model_id,
+            train_type=train_type,
+            batch_size=batch_size,
+            max_seq_length=max_seq_length,
+            lora_r=lora_r,
+            require_active_tunnel=require_active_tunnel,
         )
         worker_ids = list(sched_res.get("selected_worker_ids", []))
 
-        # If scheduler didn't return enough workers, select available real online workers
-        if len(worker_ids) < num_gpus:
-            available = (
-                db.query(Worker)
-                .filter(Worker.is_available == True, Worker.status == "online")
-                .all()
-            )
-            for w in available:
-                if w.id not in worker_ids:
-                    worker_ids.append(w.id)
-                if len(worker_ids) >= num_gpus:
-                    break
-
+        # Strict Scheduler VRAM & Capability Gating: never recruit unqualified nodes!
         if not worker_ids:
             if os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes"):
                 from app.cluster_worker_router import LOCAL_PRIMARY_NODE_ID
-                worker_ids = [LOCAL_PRIMARY_NODE_ID]
-            else:
+                return [LOCAL_PRIMARY_NODE_ID]
+            return []
+
+        if len(worker_ids) < num_gpus:
+            if strict_worker_count:
+                if os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes"):
+                    from app.cluster_worker_router import LOCAL_PRIMARY_NODE_ID
+                    return [LOCAL_PRIMARY_NODE_ID]
                 return []
+            print(
+                f"[DIST_ENGINE] Requested {num_gpus} GPUs, found {len(worker_ids)} training-eligible worker(s); "
+                f"scaling fleet down cleanly to {worker_ids}."
+            )
+            return worker_ids
 
         return worker_ids[:num_gpus]
 
@@ -297,6 +321,10 @@ class DistributedTrainingEngine:
         parallelism: str = "data_parallel",
         check_cancelled_fn: Optional[Callable[[], bool]] = None,
         on_epoch_complete: Optional[Callable[[int, float, float, str, int, Dict[str, Any]], None]] = None,
+        train_type: str = "lora",
+        sealed_secrets: Optional[Any] = None,
+        sealed_secrets_b64: Optional[str] = None,
+        storage_retention: str = "zero_retention",
     ) -> Dict[str, Any]:
         """
         Execute multi-node distributed PyTorch LoRA training across `worker_ids`:
@@ -337,8 +365,11 @@ class DistributedTrainingEngine:
         from app.cluster_worker_router import (
             is_worker_tunnel_v2_online_anywhere,
             is_worker_tunnel_online_anywhere,
+            dispatch_job_cancel,
             _get_redis_client,
         )
+        from app.training_engine import build_training_dispatch_payload
+
         r_client = _get_redis_client()
         online_tunnel_workers = [
             wid for wid in worker_ids
@@ -346,7 +377,9 @@ class DistributedTrainingEngine:
         ]
 
         if online_tunnel_workers and r_client is not None:
-            gpu_records = training_engine.prepare_gpu_training_records(dataset_s3_url, min_records=64)
+            gpu_records = training_engine.prepare_gpu_training_records(
+                dataset_s3_url, min_records=64, job_id=job_id
+            )
             active_weights = {wid: worker_weights.get(wid, 1.0) for wid in online_tunnel_workers}
             active_shards = self.partition_dataset_shards(
                 gpu_records, online_tunnel_workers, weights=active_weights
@@ -354,57 +387,146 @@ class DistributedTrainingEngine:
             result_key = f"nebula:training_result:{job_id}"
             r_client.delete(result_key)
 
-            for wid in online_tunnel_workers:
+            total_shards = len(online_tunnel_workers)
+            for s_idx, wid in enumerate(online_tunnel_workers):
                 shard_records = active_shards.get(wid) or gpu_records
-                dispatch_payload = {
-                    "type": "job_dispatch",
-                    "job_type": "training",
-                    "job_id": job_id,
-                    "worker_id": wid,
-                    "base_model_id": target_model_id,
-                    "dataset_s3_url": dataset_s3_url,
-                    "total_epochs": total_epochs,
-                    "lr": float(lr),
-                    "lora_r": int(lora_r),
-                    "lora_alpha": int(lora_alpha),
-                    "records": shard_records if len(shard_records) <= 500 else None,
-                }
+                dispatch_payload = build_training_dispatch_payload(
+                    job_id=job_id,
+                    worker_id=wid,
+                    base_model_id=target_model_id,
+                    dataset_s3_url=dataset_s3_url,
+                    total_epochs=total_epochs,
+                    train_type=train_type,
+                    lr=lr,
+                    lora_r=lora_r,
+                    lora_alpha=lora_alpha,
+                    records=shard_records,
+                    storage_retention=storage_retention,
+                    sealed_secrets=sealed_secrets,
+                    sealed_secrets_b64=sealed_secrets_b64,
+                    shard_index=s_idx,
+                    shard_count=total_shards,
+                )
                 r_client.rpush("nebula:tunnel:dispatch", json.dumps(dispatch_payload))
                 print(
-                    f"[DIST_ENGINE] Dispatched REAL distributed LoRA shard for job {job_id} "
-                    f"({len(shard_records)} records, {total_epochs} epochs) to remote GPU worker '{wid}' via tunnel."
+                    f"[DIST_ENGINE] Dispatched REAL distributed {train_type.upper()} shard {s_idx + 1}/{total_shards} "
+                    f"for job {job_id} ({len(shard_records)} records, {total_epochs} epochs) to remote GPU worker '{wid}'."
                 )
 
             completed_results: List[Dict[str, Any]] = []
+            pending_workers = list(online_tunnel_workers)
+            failed_workers_seen: List[str] = []
+            worker_shard_idx = {wid: idx for idx, wid in enumerate(online_tunnel_workers)}
             wait_start = time.time()
             last_online_seen = wait_start
             expected_count = len(online_tunnel_workers)
 
+            def _try_shard_failover(failed_wid: Optional[str], reason: str) -> Optional[str]:
+                """Attempt a single standby failover for a failed/disconnected shard when a healthy tunnel node exists."""
+                if not failed_wid or failed_workers_seen:
+                    return None
+                failed_workers_seen.append(failed_wid)
+                try:
+                    from app.database import SessionLocal
+                    from app.scheduler import cluster_scheduler
+                    from app.vram_estimator import estimate_required_vram_gb
+                    req_vram = estimate_required_vram_gb(
+                        model_id=target_model_id, train_type=train_type, lora_r=lora_r
+                    )
+                    db_fo = SessionLocal()
+                    try:
+                        exclusions = list(set(online_tunnel_workers + failed_workers_seen))
+                        fo = cluster_scheduler.trigger_task_failover(
+                            db=db_fo,
+                            task_id=job_id,
+                            failed_worker_id=failed_wid,
+                            required_vram_gb=req_vram,
+                            task_type="training",
+                            reason=reason,
+                            exclude_worker_ids=exclusions,
+                        )
+                    finally:
+                        db_fo.close()
+                    standby_id = fo.get("replacement_worker_id")
+                    if (
+                        fo.get("has_real_standby")
+                        and standby_id
+                        and standby_id not in online_tunnel_workers
+                        and (is_worker_tunnel_v2_online_anywhere(standby_id) or is_worker_tunnel_online_anywhere(standby_id))
+                    ):
+                        s_idx_fo = worker_shard_idx.get(failed_wid, 0)
+                        shard_recs = active_shards.get(failed_wid) or gpu_records
+                        active_shards[standby_id] = shard_recs
+                        online_tunnel_workers.append(standby_id)
+                        worker_shard_idx[standby_id] = s_idx_fo
+                        if failed_wid in pending_workers:
+                            pending_workers.remove(failed_wid)
+                        pending_workers.append(standby_id)
+                        fo_payload = build_training_dispatch_payload(
+                            job_id=job_id,
+                            worker_id=standby_id,
+                            base_model_id=target_model_id,
+                            dataset_s3_url=dataset_s3_url,
+                            total_epochs=total_epochs,
+                            train_type=train_type,
+                            lr=lr,
+                            lora_r=lora_r,
+                            lora_alpha=lora_alpha,
+                            records=shard_recs,
+                            storage_retention=storage_retention,
+                            sealed_secrets=sealed_secrets,
+                            sealed_secrets_b64=sealed_secrets_b64,
+                            shard_index=s_idx_fo,
+                            shard_count=total_shards,
+                        )
+                        r_client.rpush("nebula:tunnel:dispatch", json.dumps(fo_payload))
+                        print(f"[DIST_ENGINE] Shard failover: re-dispatched shard {s_idx_fo} from '{failed_wid}' to standby '{standby_id}'.")
+                        return standby_id
+                except Exception as fo_err:
+                    print(f"[DIST_ENGINE] Standby failover check error: {fo_err}")
+                return None
+
             while len(completed_results) < expected_count and time.time() - wait_start < 3600:
                 if check_cancelled_fn and check_cancelled_fn():
+                    dispatch_job_cancel(job_id, pending_workers, reason="user_cancelled")
                     dist_task.status = "failed"
                     return {"status": "cancelled", "job_id": job_id}
                 popped = r_client.blpop(result_key, timeout=2)
                 if popped:
                     res_item = json.loads(popped[1])
+                    res_wid = res_item.get("worker_id")
                     if res_item.get("status") == "error" or res_item.get("error"):
+                        standby_ok = _try_shard_failover(res_wid, "worker_shard_error")
+                        if standby_ok:
+                            last_online_seen = time.time()
+                            continue
+                        siblings = [w for w in pending_workers if w != res_wid]
+                        if siblings:
+                            dispatch_job_cancel(job_id, siblings, reason="peer_shard_failed")
                         dist_task.status = "failed"
-                        raise RuntimeError(res_item.get("error") or "Remote GPU distributed training failed")
+                        err_msg = res_item.get("error") or "Remote GPU distributed training failed"
+                        raise RuntimeError(f"Worker '{res_wid or 'unknown'}' failed: {err_msg}")
                     if res_item.get("status") == "cancelled":
+                        siblings = [w for w in pending_workers if w != res_wid]
+                        if siblings:
+                            dispatch_job_cancel(job_id, siblings, reason="peer_cancelled")
                         dist_task.status = "failed"
                         return {"status": "cancelled", "job_id": job_id}
+                    if res_wid and res_wid in pending_workers:
+                        pending_workers.remove(res_wid)
                     completed_results.append(res_item)
                     if len(completed_results) >= expected_count:
                         break
                 if any(
                     is_worker_tunnel_v2_online_anywhere(w) or is_worker_tunnel_online_anywhere(w)
-                    for w in online_tunnel_workers
+                    for w in pending_workers
                 ):
                     last_online_seen = time.time()
                 elif time.time() - last_online_seen > 25.0:
+                    dispatch_job_cancel(job_id, pending_workers, reason="tunnel_timeout")
                     dist_task.status = "failed"
                     raise RuntimeError(
-                        f"Remote GPU worker(s) {online_tunnel_workers} tunnel disconnected during distributed training."
+                        f"Remote GPU worker(s) {pending_workers} tunnel disconnected during distributed training."
                     )
 
             if not completed_results:

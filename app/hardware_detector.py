@@ -208,6 +208,10 @@ def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
         "compute_architecture": "apple_mps" if mps_available else "arm_neon",
         "hardware_tier": "apple_silicon",
         "is_unified_memory": True,
+        "gpu_count": 1,
+        "largest_single_gpu_gb": usable_unified_vram,
+        "collective_vram_gb": usable_unified_vram,
+        "interconnect": "unified_fabric",
         "vram_total_gb": usable_unified_vram,
         "vram_used_gb": vram_used,
         "vram_allocation_pct": 80,
@@ -256,6 +260,20 @@ def probe_windows_gpus() -> List[Dict[str, Any]]:
             if not name or any(v in name.lower() for v in ["mirage", "virtual", "remote", "vnc", "citrix"]):
                 continue
 
+            name_lower = name.lower()
+
+            # Filter out integrated display adapters (Intel UHD/Iris/HD Graphics, AMD Radeon APU/iGPU)
+            # Only discrete compute GPUs are aggregated
+            if "intel" in name_lower and "arc" not in name_lower:
+                continue
+            if "amd" in name_lower or "radeon" in name_lower:
+                is_igpu = any(ig in name_lower for ig in [
+                    "radeon(tm) graphics", "radeon graphics", "integrated", "apu",
+                    "vega 3", "vega 6", "vega 7", "vega 8", "vega 10", "vega 11",
+                ])
+                if is_igpu:
+                    continue
+
             raw_ram = card.get("AdapterRAM")
             vram_gb = 4.0
             if raw_ram and isinstance(raw_ram, int) and raw_ram > 0:
@@ -265,13 +283,12 @@ def probe_windows_gpus() -> List[Dict[str, Any]]:
                     vram_gb = 8.0
 
             # Determine Vendor
-            name_lower = name.lower()
-            if "nvidia" in name_lower or "geforce" in name_lower or "quadro" in name_lower or "tesla" in name_lower:
+            if "nvidia" in name_lower or "geforce" in name_lower or "quadro" in name_lower or "tesla" in name_lower or "rtx" in name_lower or "gtx" in name_lower:
                 vendor = "NVIDIA"
                 arch = "cuda"
-            elif "intel" in name_lower:
+            elif "intel" in name_lower and "arc" in name_lower:
                 vendor = "Intel"
-                arch = "intel_xpu" if "arc" in name_lower else "cpu_simd"
+                arch = "intel_xpu"
             elif "amd" in name_lower or "radeon" in name_lower:
                 vendor = "AMD"
                 arch = "amd_rocm"
@@ -355,12 +372,25 @@ def probe_pytorch_backends() -> Optional[Dict[str, Any]]:
             else:
                 tier = "consumer_gpu"
 
+            nvlink_detected = False
+            if dev_count > 1:
+                try:
+                    nvlink_detected = bool(torch.cuda.can_device_access_peer(0, 1))
+                except Exception:
+                    nvlink_detected = False
+            interconnect = "nvlink" if nvlink_detected else "pcie"
+            largest_gpu = max((g["vram_total_gb"] for g in gpus_list), default=0.0)
+
             return {
                 "gpu_model": display_name,
                 "gpu_vendor": "AMD" if is_hip else "NVIDIA",
                 "compute_architecture": arch,
                 "hardware_tier": tier,
                 "is_unified_memory": False,
+                "gpu_count": len(gpus_list),
+                "largest_single_gpu_gb": largest_gpu,
+                "collective_vram_gb": tot_vram,
+                "interconnect": interconnect,
                 "vram_total_gb": tot_vram,
                 "vram_used_gb": used_vram,
                 "vram_allocation_pct": 80,
@@ -389,6 +419,10 @@ def probe_pytorch_backends() -> Optional[Dict[str, Any]]:
                 "compute_architecture": "intel_xpu",
                 "hardware_tier": "intel_arc",
                 "is_unified_memory": False,
+                "gpu_count": xpu_count,
+                "largest_single_gpu_gb": total_gb,
+                "collective_vram_gb": round(total_gb * xpu_count, 2),
+                "interconnect": "pcie",
                 "vram_total_gb": total_gb,
                 "vram_used_gb": round(total_gb * 0.10, 2),
                 "vram_allocation_pct": 80,
@@ -488,6 +522,10 @@ def inspect_universal_hardware() -> Dict[str, Any]:
                 "compute_architecture": arch,
                 "hardware_tier": tier,
                 "is_unified_memory": False,
+                "gpu_count": len(win_gpus),
+                "largest_single_gpu_gb": max((g["vram_total_gb"] for g in win_gpus), default=0.0),
+                "collective_vram_gb": tot_vram,
+                "interconnect": "pcie",
                 "vram_total_gb": tot_vram,
                 "vram_used_gb": used_vram,
                 "vram_allocation_pct": 80,
@@ -522,6 +560,10 @@ def inspect_universal_hardware() -> Dict[str, Any]:
         "compute_architecture": arch_type,
         "hardware_tier": tier,
         "is_unified_memory": True,
+        "gpu_count": 0,
+        "largest_single_gpu_gb": 0.0,
+        "collective_vram_gb": 0.0,
+        "interconnect": "bus",
         "vram_total_gb": alloc_ram,
         "vram_used_gb": used_ram,
         "vram_allocation_pct": 70,

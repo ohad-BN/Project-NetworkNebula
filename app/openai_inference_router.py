@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
@@ -214,6 +214,89 @@ def get_model_cache_status(
     return model_cache.get_status()
 
 
+def _resolve_user_model_and_adapter(
+    db: Session,
+    user: User,
+    model_name: str,
+) -> Tuple[str, Optional[str]]:
+    """
+    AUD-04: Resolve model ID and optional adapter URL while strictly verifying tenant ownership.
+    Ensures InferenceEndpoint, PrivateModel, and ft: jobs match user_id == current_user.id.
+    Returns 404 Not Found on unauthorized model/adapter access.
+    """
+    if not model_name:
+        raise HTTPException(status_code=404, detail="Model name is required")
+
+    # 1. Check InferenceEndpoint owned by user
+    ep = db.query(InferenceEndpoint).filter(
+        InferenceEndpoint.name == model_name,
+        InferenceEndpoint.user_id == user.id,
+    ).first()
+    if ep:
+        return ep.model_id, ep.adapter_url
+
+    # Cross-tenant check for InferenceEndpoint:
+    # If another user owns an endpoint with this name, fail closed with 404
+    other_ep = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == model_name).first()
+    if other_ep and other_ep.user_id != user.id:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+
+    # 2. Check PrivateModel owned by user (if PrivateModel exists)
+    try:
+        from app.models import PrivateModel
+        pm = db.query(PrivateModel).filter(
+            (PrivateModel.id == model_name) | (PrivateModel.name == model_name),
+            PrivateModel.user_id == user.id,
+            PrivateModel.is_active == True,
+        ).first()
+        if pm:
+            target_uri = getattr(pm, "source_uri", None) or getattr(pm, "base_model", model_name)
+            target_adapter = getattr(pm, "adapter_url", None)
+            return target_uri, target_adapter
+
+        # Cross-tenant check for PrivateModel
+        other_pm = db.query(PrivateModel).filter(
+            (PrivateModel.id == model_name) | (PrivateModel.name == model_name),
+            PrivateModel.is_active == True,
+        ).first()
+        if other_pm and other_pm.user_id != user.id:
+            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    except Exception:
+        pass
+
+    # 3. Check completed fine-tuned job (ft:<job_id> or ft:<job_name>)
+    if model_name.startswith("ft:"):
+        target_id_or_name = model_name[3:]
+        job = db.query(TrainingJob).filter(
+            (TrainingJob.id == target_id_or_name) | (TrainingJob.name == target_id_or_name),
+            TrainingJob.user_id == user.id,
+        ).first()
+        if job and job.final_adapter_url:
+            return job.base_model, job.final_adapter_url
+        if job:
+            return job.base_model, None
+
+        # Cross-tenant or nonexistent ft: job
+        raise HTTPException(status_code=404, detail=f"Fine-tuned model '{model_name}' not found")
+
+    # 4. Standard public catalog models
+    return model_name, None
+
+
+def _verify_adapter_url_access(db: Session, user: User, adapter_url: Optional[str]) -> None:
+    """Verify that an explicitly passed adapter_url does not belong to another user."""
+    if not adapter_url:
+        return
+    job = db.query(TrainingJob).filter(
+        (TrainingJob.final_adapter_url == adapter_url) | (TrainingJob.checkpoints.contains(adapter_url))
+    ).first()
+    if job and job.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Adapter not found")
+    ep = db.query(InferenceEndpoint).filter(InferenceEndpoint.adapter_url == adapter_url).first()
+    if ep and ep.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Adapter not found")
+
+
 @router.post("/v1/chat/completions")
 def create_chat_completion(
     payload: ChatCompletionRequest,
@@ -228,6 +311,9 @@ def create_chat_completion(
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created_timestamp = int(time.time())
 
+    # AUD-04: Resolve user model and adapter while verifying tenant ownership
+    actual_model, resolved_adapter = _resolve_user_model_and_adapter(db, current_user, payload.model)
+
     # Check if requested model matches an active dedicated endpoint
     endpoint = db.query(InferenceEndpoint).filter(
         InferenceEndpoint.user_id == current_user.id,
@@ -235,8 +321,7 @@ def create_chat_completion(
     ).first()
     user_id_str = str(current_user.id)
     endpoint_id = endpoint.id if endpoint else None
-    actual_model = endpoint.model_id if endpoint else payload.model
-    adapter_url = endpoint.adapter_url if endpoint else None
+    adapter_url = endpoint.adapter_url if endpoint else resolved_adapter
     has_endpoint = endpoint is not None
     # Release DB read transaction immediately before long model execution
     db.commit()
@@ -674,14 +759,10 @@ def run_model_benchmark(
     """
     from app.evaluation_engine import evaluation_engine
 
-    # If the user specified an endpoint name, resolve its adapter_url if any
-    adapter_url = request.adapter_url
-    target_model = request.model_id
-    ep = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == target_model).first()
-    if ep:
-        target_model = ep.model_id
-        if not adapter_url and ep.adapter_url:
-            adapter_url = ep.adapter_url
+    # AUD-04: Resolve model and adapter strictly scoped to current user
+    target_model, resolved_adapter = _resolve_user_model_and_adapter(db, current_user, request.model_id)
+    adapter_url = request.adapter_url or resolved_adapter
+    _verify_adapter_url_access(db, current_user, adapter_url)
 
     try:
         results = evaluation_engine.evaluate_model(
@@ -713,21 +794,15 @@ def compare_models_side_by_side(
     """
     from app.evaluation_engine import evaluation_engine
 
-    model_a = request.model_a
-    adapter_a = request.adapter_url_a
-    ep_a = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == model_a).first()
-    if ep_a:
-        model_a = ep_a.model_id
-        if not adapter_a and ep_a.adapter_url:
-            adapter_a = ep_a.adapter_url
+    # AUD-04: Resolve model A and adapter strictly scoped to current user
+    model_a, resolved_adapter_a = _resolve_user_model_and_adapter(db, current_user, request.model_a)
+    adapter_a = request.adapter_url_a or resolved_adapter_a
+    _verify_adapter_url_access(db, current_user, adapter_a)
 
-    model_b = request.model_b
-    adapter_b = request.adapter_url_b
-    ep_b = db.query(InferenceEndpoint).filter(InferenceEndpoint.name == model_b).first()
-    if ep_b:
-        model_b = ep_b.model_id
-        if not adapter_b and ep_b.adapter_url:
-            adapter_b = ep_b.adapter_url
+    # AUD-04: Resolve model B and adapter strictly scoped to current user
+    model_b, resolved_adapter_b = _resolve_user_model_and_adapter(db, current_user, request.model_b)
+    adapter_b = request.adapter_url_b or resolved_adapter_b
+    _verify_adapter_url_access(db, current_user, adapter_b)
 
     try:
         comparison_res = evaluation_engine.compare_models(

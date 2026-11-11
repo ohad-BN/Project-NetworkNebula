@@ -26,7 +26,7 @@ import re
 import socket
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple, Union
 
 # Ensure project root and worker directories are in sys.path
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -286,6 +286,54 @@ def discover_hardware() -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Standalone NVIDIA GPU probe when PyTorch CUDA is unavailable or not yet installed
+    if not gpus_list:
+        try:
+            import subprocess
+            nv_raw = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=2.0,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore").strip()
+            if nv_raw:
+                for line in nv_raw.splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 5:
+                        idx = int(parts[0])
+                        gname = parts[1]
+                        tot_gb = round(float(parts[2]) / 1024.0, 2)
+                        used_gb = round(float(parts[3]) / 1024.0, 2)
+                        util_pct = round(float(parts[4]), 1)
+                        gpus_list.append({
+                            "index": idx,
+                            "name": gname,
+                            "vram_total_gb": tot_gb,
+                            "vram_allocated_gb": round(tot_gb * 0.8, 2),
+                            "vram_used_gb": used_gb,
+                            "vram_allocation_pct": 80,
+                            "gpu_utilization_pct": util_pct,
+                            "status": "online",
+                            "is_available": True,
+                        })
+                if gpus_list:
+                    primary_name = gpus_list[0]["name"]
+                    hw.update({
+                        "gpu_model": primary_name if len(gpus_list) == 1 else f"{len(gpus_list)}x {primary_name}",
+                        "gpu_memory_gb": round(sum(g["vram_total_gb"] for g in gpus_list), 2),
+                        "vram_used_gb": round(sum(g["vram_used_gb"] for g in gpus_list), 2),
+                        "gpu_utilization_pct": gpus_list[0]["gpu_utilization_pct"],
+                        "cuda_version": "CUDA Driver (PyTorch Missing)",
+                        "cuda_available": True,
+                        "compute_architecture": "cuda",
+                        "gpus": gpus_list,
+                    })
+        except Exception:
+            pass
+
     # macOS Apple Silicon fallback if PyTorch is absent or CPU-only
     if not hw["cuda_available"] and platform.system() == "Darwin":
         try:
@@ -320,14 +368,22 @@ def discover_hardware() -> Dict[str, Any]:
         hw["gpus"] = [{
             "index": 0,
             "name": hw.get("gpu_model", "CPU Accelerator"),
-            "vram_total_gb": hw.get("gpu_memory_gb", 8.0),
-            "vram_allocated_gb": round(hw.get("gpu_memory_gb", 8.0) * 0.8, 2),
+            "vram_total_gb": hw.get("gpu_memory_gb", 0.0 if hw.get("gpu_model") == "CPU Fallback Compute Node" else 8.0),
+            "vram_allocated_gb": round(hw.get("gpu_memory_gb", 0.0 if hw.get("gpu_model") == "CPU Fallback Compute Node" else 8.0) * 0.8, 2),
             "vram_used_gb": hw.get("vram_used_gb", 0.5),
             "vram_allocation_pct": 80,
             "gpu_utilization_pct": hw.get("gpu_utilization_pct", 10.0),
             "status": "online",
             "is_available": True,
         }]
+
+    if not hw.get("compute_architecture"):
+        if hw.get("cuda_available"):
+            hw["compute_architecture"] = "apple_mps" if "Apple" in str(hw.get("gpu_model", "")) else "cuda"
+        else:
+            hw["compute_architecture"] = "cpu_simd"
+            if hw.get("gpu_model") == "CPU Fallback Compute Node":
+                hw["gpu_memory_gb"] = 0.0
 
     return hw
 
@@ -357,10 +413,10 @@ def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
 
 
 def probe_compute_dependencies() -> Dict[str, Any]:
-    """Inspect whether local ML stack (torch, transformers, peft, safetensors) is installed."""
+    """Inspect whether local ML stack (torch, transformers, peft, safetensors, accelerate) is installed."""
     missing = []
     info: Dict[str, Any] = {"ready": True, "missing": missing, "device": "cpu"}
-    for mod in ("torch", "transformers", "peft", "safetensors"):
+    for mod in ("torch", "transformers", "peft", "safetensors", "accelerate"):
         try:
             __import__(mod)
         except ImportError:
@@ -378,6 +434,644 @@ def probe_compute_dependencies() -> Dict[str, Any]:
     return info
 
 
+def classify_worker_capabilities(hw: Dict[str, Any], dep_status: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute honest advertised worker capabilities & task types from both physical hardware
+    and installed ML dependencies. Prevents non-training or missing-package nodes from claiming `training`.
+    """
+    arch = str(hw.get("compute_architecture") or "cpu_simd").strip().lower()
+    if arch == "mps":
+        arch = "apple_mps"
+    vram = float(hw.get("largest_single_gpu_gb") or hw.get("collective_vram_gb") or hw.get("gpu_memory_gb") or 0.0)
+    raw_tasks = hw.get("supported_task_types")
+    if isinstance(raw_tasks, str) and raw_tasks.strip():
+        task_list = [t.strip().lower() for t in raw_tasks.split(",") if t.strip()]
+    elif isinstance(raw_tasks, list) and raw_tasks:
+        task_list = [str(t).strip().lower() for t in raw_tasks if str(t).strip()]
+    else:
+        task_list = ["batch_inference"]
+        if (arch in ("cuda", "apple_mps", "intel_xpu", "amd_rocm") and vram >= 3.5) or vram >= 8.0:
+            task_list.append("inference")
+        if (arch in ("cuda", "amd_rocm") and vram >= 6.0) or (arch == "apple_mps" and vram >= 12.0):
+            task_list.append("training")
+        if arch in ("cuda", "amd_rocm") and vram >= 8.0:
+            task_list.append("distributed_training")
+
+    deps_ready = bool(dep_status.get("ready", False))
+    hw_supports_training = any(t in task_list for t in ("training", "distributed_training"))
+    training_ready = bool(deps_ready and hw_supports_training)
+    if not training_ready:
+        task_list = [t for t in task_list if t not in ("training", "distributed_training")]
+        if not task_list:
+            task_list = ["batch_inference"]
+
+    ws_caps = []
+    if any(t in task_list for t in ("inference", "batch_inference")):
+        ws_caps.append("inference")
+    if training_ready:
+        ws_caps.append("training")
+    if not ws_caps:
+        ws_caps = ["inference"]
+
+    return {
+        "supported_task_types": ",".join(task_list),
+        "training_ready": training_ready,
+        "missing_training_packages": list(dep_status.get("missing") or []),
+        "compute_capabilities": ws_caps,
+    }
+
+
+def find_all_linear_names(model: Any) -> List[str]:
+    """
+    Dynamically discover all linear projection module names in model for LoRA targeting.
+    Inspects torch.nn.Linear and bitsandbytes Linear4bit/Linear8bit layers.
+    """
+    import torch.nn as nn
+    linear_classes = (nn.Linear,)
+    try:
+        import bitsandbytes as bnb
+        linear_classes = (nn.Linear, bnb.nn.Linear4bit, bnb.nn.Linear8bit)
+    except Exception:
+        pass
+
+    target_modules = set()
+    for name, module in model.named_modules():
+        if isinstance(module, linear_classes):
+            parts = name.split(".")
+            target_modules.add(parts[-1])
+
+    candidates = {
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj"
+    }
+    matched = list(target_modules.intersection(candidates))
+    if matched:
+        return sorted(matched)
+    return sorted(list(target_modules)) if target_modules else ["q_proj", "v_proj"]
+
+
+def extract_instruction_response(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Helper to convert any single dict structure into {instruction, response}."""
+    if not isinstance(item, dict):
+        return None
+
+    # Alpaca format
+    if "instruction" in item and "output" in item:
+        inst = str(item["instruction"]).strip()
+        inp = str(item.get("input", "") or "").strip()
+        if inp:
+            inst = f"{inst}\n{inp}"
+        out = str(item["output"]).strip()
+        if inst or out:
+            return {"instruction": inst, "response": out}
+
+    # Standard instruction/response
+    if "instruction" in item and "response" in item:
+        return {"instruction": str(item["instruction"]).strip(), "response": str(item["response"]).strip()}
+
+    # Prompt / completion
+    if "prompt" in item and "completion" in item:
+        return {"instruction": str(item["prompt"]).strip(), "response": str(item["completion"]).strip()}
+
+    # Input / output
+    if "input" in item and "output" in item:
+        return {"instruction": str(item["input"]).strip(), "response": str(item["output"]).strip()}
+
+    # Question / answer
+    if "question" in item and "answer" in item:
+        return {"instruction": str(item["question"]).strip(), "response": str(item["answer"]).strip()}
+
+    # DPO format: prompt, chosen, rejected
+    if "prompt" in item and "chosen" in item:
+        return {"instruction": str(item["prompt"]).strip(), "response": str(item["chosen"]).strip()}
+
+    # OpenAI Chat / Messages: messages: [{role, content}]
+    if "messages" in item and isinstance(item["messages"], list):
+        user_msgs = [str(m.get("content", "")) for m in item["messages"] if m.get("role") in ("user", "human")]
+        asst_msgs = [str(m.get("content", "")) for m in item["messages"] if m.get("role") in ("assistant", "gpt", "bot")]
+        if user_msgs and asst_msgs:
+            return {"instruction": "\n".join(user_msgs).strip(), "response": "\n".join(asst_msgs).strip()}
+
+    # ShareGPT format: conversations: [{from, value}]
+    if "conversations" in item and isinstance(item["conversations"], list):
+        human_vals = [str(c.get("value", "")) for c in item["conversations"] if c.get("from") in ("human", "user")]
+        gpt_vals = [str(c.get("value", "")) for c in item["conversations"] if c.get("from") in ("gpt", "assistant", "bot")]
+        if human_vals and gpt_vals:
+            return {"instruction": "\n".join(human_vals).strip(), "response": "\n".join(gpt_vals).strip()}
+
+    # Single text field
+    if "text" in item and str(item["text"]).strip():
+        txt = str(item["text"]).strip()
+        mid = max(1, len(txt) // 2)
+        return {"instruction": txt[:mid].strip(), "response": txt[mid:].strip()}
+
+    return None
+
+
+def chunk_text_sliding_window(
+    text: str,
+    window_tokens: int = 256,
+    overlap_tokens: int = 32
+) -> List[Dict[str, str]]:
+    """Split unstructured text into instruction-response chunks with sliding window."""
+    words = text.split()
+    if not words:
+        return []
+    records = []
+    step = max(1, window_tokens - overlap_tokens)
+    for i in range(0, len(words), step):
+        chunk_words = words[i : i + window_tokens]
+        if len(chunk_words) < 8 and records:
+            break
+        mid = max(1, len(chunk_words) // 2)
+        inst_text = " ".join(chunk_words[:mid])
+        resp_text = " ".join(chunk_words[mid:])
+        if inst_text and resp_text:
+            records.append({
+                "instruction": f"Continue the following text:\n{inst_text}",
+                "response": resp_text
+            })
+    if not records and words:
+        mid = max(1, len(words) // 2)
+        records.append({
+            "instruction": " ".join(words[:mid]),
+            "response": " ".join(words[mid:])
+        })
+    return records
+
+
+def _parse_csv_text(raw_text: str) -> List[Dict[str, str]]:
+    import csv
+    import io
+    records = []
+    reader = csv.reader(io.StringIO(raw_text))
+    rows = [r for r in reader if r]
+    if not rows:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    has_header = any(k in header for k in (
+        "instruction", "response", "prompt", "completion", "input", "output", "question", "answer", "text"
+    ))
+    if has_header and len(rows) > 1:
+        dict_reader = csv.DictReader(io.StringIO(raw_text))
+        for row in dict_reader:
+            rec = extract_instruction_response(row)
+            if rec:
+                records.append(rec)
+    else:
+        start_row = 1 if has_header else 0
+        for row in rows[start_row:]:
+            if len(row) >= 2 and (row[0].strip() or row[1].strip()):
+                records.append({"instruction": row[0].strip(), "response": row[1].strip()})
+            elif len(row) == 1 and row[0].strip():
+                txt = row[0].strip()
+                mid = max(1, len(txt) // 2)
+                records.append({"instruction": txt[:mid].strip(), "response": txt[mid:].strip()})
+    return records
+
+
+def parse_universal_dataset(
+    source: Any,
+    format_hint: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """
+    Universal dataset parser supporting 8 formats:
+      1. .jsonl (Alpaca, ChatML/Messages, ShareGPT, DPO, prompt/completion)
+      2. .json (list of records or dict container)
+      3. .csv (auto-detect columns or header mapping)
+      4. .parquet (pyarrow or fastparquet)
+      5. .txt (sliding-window chunking)
+      6. .md (markdown sections / sliding-window chunking)
+      7. .pdf (pypdf text extraction + sliding window)
+      8. .docx (zipfile XML / python-docx extraction + sliding window)
+      9. hf_dataset:// (HuggingFace datasets streaming)
+    """
+    import io
+    import csv
+
+    # Case 0: Already a list of dicts
+    if isinstance(source, list):
+        records = []
+        for item in source:
+            extracted = extract_instruction_response(item)
+            if extracted:
+                records.append(extracted)
+        if not records and source:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Case 1: HuggingFace dataset URI (hf_dataset://...)
+    if isinstance(source, str) and source.startswith("hf_dataset://"):
+        try:
+            from datasets import load_dataset
+            clean_repo = source.replace("hf_dataset://", "").strip()
+            ds = load_dataset(clean_repo, split="train", streaming=True)
+            records = []
+            for item in ds:
+                ext = extract_instruction_response(item)
+                if ext:
+                    records.append(ext)
+                if len(records) >= 500:
+                    break
+            if not records:
+                raise ValueError("Training dataset contains 0 valid samples")
+            return records
+        except Exception as e:
+            raise ValueError(f"Failed to load HuggingFace dataset '{source}': {e}") from e
+
+    # Acquire raw bytes or text from source (file path, S3, URL, or raw data)
+    raw_bytes: Optional[bytes] = None
+    raw_text: Optional[str] = None
+    ext = (format_hint or "").lower().strip()
+
+    if isinstance(source, bytes):
+        raw_bytes = source
+    elif isinstance(source, str):
+        if os.path.exists(source) and os.path.isfile(source):
+            if not ext:
+                ext = os.path.splitext(source)[1].lower()
+            with open(source, "rb") as f:
+                raw_bytes = f.read()
+        elif source.startswith("s3://"):
+            from app.storage import get_storage
+            parts = source[5:].split("/", 1)
+            bucket = parts[0]
+            key = parts[1] if len(parts) > 1 else ""
+            if not ext and "." in key:
+                ext = "." + key.rsplit(".", 1)[1].lower()
+            raw_bytes = get_storage().download_bytes(bucket, key)
+        elif source.startswith("http://") or source.startswith("https://"):
+            resp = requests.get(source, timeout=30)
+            resp.raise_for_status()
+            raw_bytes = resp.content
+            if not ext and "." in source.split("?")[0]:
+                ext = "." + source.split("?")[0].rsplit(".", 1)[1].lower()
+        else:
+            raw_text = source
+
+    if raw_bytes is not None and raw_text is None:
+        if not ext:
+            if raw_bytes.startswith(b"PAR1"):
+                ext = ".parquet"
+            elif raw_bytes.startswith(b"%PDF"):
+                ext = ".pdf"
+            elif raw_bytes.startswith(b"PK\x03\x04"):
+                ext = ".docx"
+
+    records: List[Dict[str, str]] = []
+
+    # Format: .parquet
+    if ext == ".parquet" or (raw_bytes and raw_bytes.startswith(b"PAR1")):
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(io.BytesIO(raw_bytes))
+            for row in table.to_pylist():
+                parsed = extract_instruction_response(row)
+                if parsed:
+                    records.append(parsed)
+        except Exception:
+            try:
+                import pandas as pd
+                df = pd.read_parquet(io.BytesIO(raw_bytes), engine="fastparquet")
+                for row in df.to_dict(orient="records"):
+                    parsed = extract_instruction_response(row)
+                    if parsed:
+                        records.append(parsed)
+            except Exception as e:
+                raise ValueError(f"Failed to parse Parquet dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .pdf
+    if ext == ".pdf" or (raw_bytes and raw_bytes.startswith(b"%PDF")):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+            extracted_pages = []
+            for page in reader.pages:
+                txt = page.extract_text()
+                if txt:
+                    extracted_pages.append(txt)
+            full_text = "\n\n".join(extracted_pages).strip()
+            if not full_text:
+                raise ValueError("Training dataset contains 0 valid samples")
+            records = chunk_text_sliding_window(full_text)
+        except Exception as e:
+            if "0 valid samples" in str(e):
+                raise
+            raise ValueError(f"Failed to parse PDF dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .docx
+    if ext == ".docx" or (raw_bytes and raw_bytes.startswith(b"PK\x03\x04")):
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            paragraphs = []
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                if "word/document.xml" in zf.namelist():
+                    tree = ET.fromstring(zf.read("word/document.xml"))
+                    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                    for p in tree.findall(".//w:p", ns):
+                        t_vals = [elem.text for elem in p.findall(".//w:t", ns) if elem.text]
+                        if t_vals:
+                            paragraphs.append("".join(t_vals))
+            full_text = "\n\n".join(paragraphs).strip()
+            if not full_text:
+                raise ValueError("Training dataset contains 0 valid samples")
+            records = chunk_text_sliding_window(full_text)
+        except Exception as e:
+            if "0 valid samples" in str(e):
+                raise
+            raise ValueError(f"Failed to parse DOCX dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    if raw_text is None and raw_bytes is not None:
+        try:
+            raw_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw_text = raw_bytes.decode("latin-1")
+            except Exception as e:
+                raise ValueError(f"Could not decode text file: {e}") from e
+
+    if not raw_text or not raw_text.strip():
+        raise ValueError("Training dataset contains 0 valid samples")
+
+    clean_text = raw_text.strip()
+
+    # Format: .csv
+    if ext == ".csv":
+        records = _parse_csv_text(clean_text)
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .txt / .md
+    if ext in (".txt", ".md"):
+        records = chunk_text_sliding_window(clean_text)
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .json / .jsonl or auto-detection
+    is_json_format = ext in (".json", ".jsonl") or clean_text.startswith("[") or clean_text.startswith("{")
+    if is_json_format:
+        try:
+            parsed_json = json.loads(clean_text)
+            if isinstance(parsed_json, list):
+                for item in parsed_json:
+                    rec = extract_instruction_response(item)
+                    if rec:
+                        records.append(rec)
+            elif isinstance(parsed_json, dict):
+                for key in ("data", "records", "samples", "conversations", "items", "dataset"):
+                    if key in parsed_json and isinstance(parsed_json[key], list):
+                        for item in parsed_json[key]:
+                            rec = extract_instruction_response(item)
+                            if rec:
+                                records.append(rec)
+                        break
+                if not records:
+                    single = extract_instruction_response(parsed_json)
+                    if single:
+                        records.append(single)
+        except json.JSONDecodeError:
+            pass
+
+        # Try line-by-line JSONL
+        if not records:
+            for line in clean_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    rec = extract_instruction_response(item)
+                    if rec:
+                        records.append(rec)
+                except json.JSONDecodeError:
+                    continue
+
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Try CSV fallback
+    if not records and "," in clean_text and "\n" in clean_text:
+        try:
+            csv_recs = _parse_csv_text(clean_text)
+            if csv_recs:
+                records = csv_recs
+        except Exception:
+            pass
+
+    # Unstructured text fallback
+    if not records:
+        records = chunk_text_sliding_window(clean_text)
+
+    if not records:
+        raise ValueError("Training dataset contains 0 valid samples")
+
+    return records
+
+
+# ==============================================================================
+# Ephemeral X25519 Sealed Envelope Cryptography & Memory Zeroing (Milestone 3)
+# ==============================================================================
+
+
+def seal_envelope(
+    secrets: Dict[str, Any],
+    worker_pubkey_b64: str,
+    job_id: str,
+) -> Dict[str, Any]:
+    """
+    Client-side sealed envelope creation (Milestone 3):
+    ECDH (X25519) + HKDF-SHA256 (32B key, info="nebula-sealed-envelope-v1") + AES-256-GCM
+    bound to associated_data = job_id.encode("utf-8").
+    Packs: PK_C (32B) + salt (16B) + IV (12B) + Tag (16B) + Ciphertext.
+    """
+    import os
+    import json
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.backends import default_backend
+
+    worker_pk_bytes = base64.b64decode(worker_pubkey_b64)
+    worker_pk = X25519PublicKey.from_public_bytes(worker_pk_bytes)
+
+    client_sk = X25519PrivateKey.generate()
+    client_pk_bytes = client_sk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    shared_secret = client_sk.exchange(worker_pk)
+    salt = os.urandom(16)
+    iv = os.urandom(12)
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        info=b"nebula-sealed-envelope-v1",
+        backend=default_backend(),
+    )
+    key = hkdf.derive(shared_secret)
+
+    plaintext = json.dumps(secrets).encode("utf-8")
+    aad = job_id.encode("utf-8")
+
+    aesgcm = AESGCM(key)
+    enc_result = aesgcm.encrypt(iv, plaintext, aad)
+    ciphertext = enc_result[:-16]
+    tag = enc_result[-16:]
+
+    envelope_bin = client_pk_bytes + salt + iv + tag + ciphertext
+    envelope_b64 = base64.b64encode(envelope_bin).decode("ascii")
+
+    return {
+        "sealed_secrets_b64": envelope_b64,
+        "ephemeral_pubkey_x25519": base64.b64encode(client_pk_bytes).decode("ascii"),
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(iv).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "aad": job_id,
+    }
+
+
+def unseal_envelope(
+    sealed_payload: Any,
+    worker_private_key: Any,
+    job_id: str,
+) -> Tuple[Dict[str, Any], bytearray]:
+    """
+    Unseal an X25519 + AES-256-GCM sealed envelope in worker RAM.
+    Strictly enforces AAD == job_id.encode("utf-8").
+    Returns (secrets_dict, raw_mutable_bytearray_buffer).
+    """
+    import json
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.backends import default_backend
+
+    if worker_private_key is None:
+        raise RuntimeError("Worker does not possess an ephemeral X25519 private key")
+
+    client_pk_bytes = None
+    salt = None
+    iv = None
+    tag = None
+    ciphertext = None
+
+    if isinstance(sealed_payload, dict):
+        if "sealed_secrets_b64" in sealed_payload:
+            return unseal_envelope(sealed_payload["sealed_secrets_b64"], worker_private_key, job_id)
+        if "sealed_secrets" in sealed_payload:
+            return unseal_envelope(sealed_payload["sealed_secrets"], worker_private_key, job_id)
+        if "ciphertext" in sealed_payload and ("nonce" in sealed_payload or "iv" in sealed_payload):
+            client_pk_bytes = base64.b64decode(sealed_payload["ephemeral_pubkey_x25519"])
+            salt = base64.b64decode(sealed_payload["salt"]) if sealed_payload.get("salt") else b""
+            iv = base64.b64decode(sealed_payload.get("nonce") or sealed_payload.get("iv"))
+            tag = base64.b64decode(sealed_payload["tag"]) if "tag" in sealed_payload else None
+            ciphertext = base64.b64decode(sealed_payload["ciphertext"])
+
+    if client_pk_bytes is None:
+        raw_bytes = None
+        if isinstance(sealed_payload, str):
+            try:
+                parsed = json.loads(sealed_payload)
+                if isinstance(parsed, dict):
+                    return unseal_envelope(parsed, worker_private_key, job_id)
+            except Exception:
+                pass
+            raw_bytes = base64.b64decode(sealed_payload)
+        elif isinstance(sealed_payload, bytes):
+            raw_bytes = sealed_payload
+        else:
+            raise ValueError(f"Unsupported sealed payload type: {type(sealed_payload)}")
+
+        if len(raw_bytes) < 76:
+            raise ValueError(f"Sealed envelope binary payload too short ({len(raw_bytes)} bytes < 76 bytes)")
+
+        client_pk_bytes = raw_bytes[:32]
+        salt = raw_bytes[32:48]
+        iv = raw_bytes[48:60]
+        tag = raw_bytes[60:76]
+        ciphertext = raw_bytes[76:]
+
+    client_pk = X25519PublicKey.from_public_bytes(client_pk_bytes)
+    shared_secret = worker_private_key.exchange(client_pk)
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt if salt else None,
+        info=b"nebula-sealed-envelope-v1",
+        backend=default_backend(),
+    )
+    derived_key = hkdf.derive(shared_secret)
+
+    aad = job_id.encode("utf-8")
+    aesgcm = AESGCM(derived_key)
+
+    combined_ct = ciphertext + tag if tag is not None else ciphertext
+    try:
+        plaintext = aesgcm.decrypt(iv, combined_ct, aad)
+    except Exception as exc:
+        raise ValueError(f"Sealed envelope decryption failed (tag or AAD mismatch): {exc}") from exc
+
+    mutable_buf = bytearray(plaintext)
+    secrets = json.loads(mutable_buf.decode("utf-8"))
+    return secrets, mutable_buf
+
+
+def zero_memory(*buffers) -> None:
+    """
+    Securely wipe in-memory sensitive secrets (bytearrays, dicts, lists).
+    """
+    import gc
+    for b in buffers:
+        if b is None:
+            continue
+        if isinstance(b, bytearray):
+            for i in range(len(b)):
+                b[i] = 0
+        elif isinstance(b, list):
+            for i in range(len(b)):
+                b[i] = 0
+        elif isinstance(b, dict):
+            for k in list(b.keys()):
+                val = b[k]
+                if isinstance(val, bytearray):
+                    for i in range(len(val)):
+                        val[i] = 0
+                b[k] = None
+            b.clear()
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class _WorkerGpuRuntime:
     """
     Executes REAL HuggingFace neural inference and PEFT/LoRA backpropagation directly on
@@ -391,6 +1085,36 @@ class _WorkerGpuRuntime:
         self.active_dtype_key: Optional[str] = None
         self.model: Optional[Any] = None
         self.tokenizer: Optional[Any] = None
+        self._x25519_private_key = None
+        self.tunnel_pubkey_x25519: Optional[str] = None
+        self.generate_ephemeral_keypair()
+
+    def generate_ephemeral_keypair(self) -> Optional[str]:
+        """
+        Generate ephemeral X25519 keypair in RAM for sealed envelope unsealing.
+        Returns base64-encoded raw 32-byte public key.
+        """
+        try:
+            import base64
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+
+            self._x25519_private_key = X25519PrivateKey.generate()
+            pub_bytes = self._x25519_private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.tunnel_pubkey_x25519 = base64.b64encode(pub_bytes).decode("ascii")
+            return self.tunnel_pubkey_x25519
+        except Exception as exc:
+            self._x25519_private_key = None
+            self.tunnel_pubkey_x25519 = None
+            return None
+
+    def unseal_secrets(self, sealed_payload: Any, job_id: str) -> Tuple[Dict[str, Any], bytearray]:
+        """Unseal envelope using worker's in-RAM ephemeral private key."""
+        return unseal_envelope(sealed_payload, self._x25519_private_key, job_id)
+
 
     def _get_device(self) -> str:
         import torch
@@ -415,7 +1139,7 @@ class _WorkerGpuRuntime:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def ensure_model(self, model_id: str, for_training: bool = False):
+    def ensure_model(self, model_id: str, for_training: bool = False, train_type: str = "lora", hf_token: Optional[str] = None):
         import torch
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -432,7 +1156,9 @@ class _WorkerGpuRuntime:
             dtype = torch.float16
         else:
             dtype = torch.bfloat16
-        dtype_key = f"{dev}:{dtype}"
+
+        is_qlora = (train_type or "").strip().lower() == "qlora"
+        dtype_key = f"{dev}:{dtype}:{train_type if for_training else 'infer'}"
 
         if (
             self.model is not None
@@ -443,29 +1169,69 @@ class _WorkerGpuRuntime:
             return self.model, self.tokenizer, dev
 
         self.unload()
-        hf_token = os.environ.get("HF_TOKEN")
-        print(f"[GPU_WORKER] Loading REAL weights for '{model_id}' on {dev.upper()} ({dtype})...")
-        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
+        # Direct HuggingFace CDN pull using RAM-held unsealed token (never set os.environ["HF_TOKEN"])
+        active_token = hf_token if hf_token is not None else os.environ.get("HF_TOKEN")
+        print(f"[GPU_WORKER] Loading REAL weights for '{model_id}' on {dev.upper()} ({dtype}, train_type={train_type})...")
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=active_token, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
         load_kwargs: Dict[str, Any] = {
-            "token": hf_token,
+            "token": active_token,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
             "dtype": dtype,
         }
+
+        # Multi-GPU and Device Mapping
         if dev == "cuda":
-            load_kwargs["device_map"] = "cuda"
+            dev_count = torch.cuda.device_count()
+            if dev_count > 1:
+                alloc_pct = float(os.environ.get("NEBULA_VRAM_ALLOCATION_PCT", "80")) / 100.0
+                max_memory = {}
+                for i in range(dev_count):
+                    try:
+                        total_mem_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                        avail_gb = max(1, int(total_mem_gb * alloc_pct * 0.92))
+                        max_memory[i] = f"{avail_gb}GiB"
+                    except Exception:
+                        max_memory[i] = "8GiB"
+                load_kwargs["device_map"] = "auto"
+                load_kwargs["max_memory"] = max_memory
+            else:
+                load_kwargs["device_map"] = "cuda"
         else:
             load_kwargs["device_map"] = dev
+
+        # 4-bit NF4 QLoRA Quantization
+        if is_qlora:
+            if dev == "cuda":
+                try:
+                    from transformers import BitsAndBytesConfig
+                    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=compute_dtype,
+                    )
+                    load_kwargs["quantization_config"] = bnb_config
+                except ImportError:
+                    print("[GPU_WORKER] WARNING: bitsandbytes not available, falling back to 16-bit LoRA.")
+            else:
+                print("[GPU_WORKER] WARNING: QLoRA requested on non-CUDA device, falling back to standard precision.")
 
         model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         self.model = model
         self.tokenizer = tokenizer
         self.active_model_id = model_id
         self.active_dtype_key = dtype_key
-        print(f"[GPU_WORKER] Model '{model_id}' loaded cleanly on {model.device}.")
+        device_desc = getattr(model, "device", "multi-gpu")
+        try:
+            device_desc = next(model.parameters()).device
+        except Exception:
+            pass
+        print(f"[GPU_WORKER] Model '{model_id}' loaded cleanly on {device_desc}.")
         return self.model, self.tokenizer, dev
 
     def _prepare_model_with_adapter(
@@ -630,6 +1396,7 @@ class _WorkerGpuRuntime:
         worker_id: str,
         headers: Dict[str, str],
         on_epoch=None,
+        cancel_event=None,
     ) -> Dict[str, Any]:
         import gc
         import torch
@@ -644,26 +1411,76 @@ class _WorkerGpuRuntime:
 
         job_id = job_payload["job_id"]
         base_model_id = (job_payload.get("base_model_id") or "").strip() or "Qwen/Qwen2.5-0.5B-Instruct"
+        train_type = (job_payload.get("train_type") or "lora").strip().lower()
+        storage_retention = (job_payload.get("storage_retention") or "zero_retention").strip().lower()
+
+        # Unseal ephemeral secrets in RAM if sealed envelope present (Milestone 3)
+        sealed_payload = job_payload.get("sealed_secrets") or job_payload.get("sealed_secrets_b64")
+        unsealed_secrets = {}
+        raw_secrets_buf = None
+        if sealed_payload and self._x25519_private_key:
+            try:
+                unsealed_secrets, raw_secrets_buf = self.unseal_secrets(sealed_payload, job_id)
+                print(f"[GPU_WORKER] Successfully unsealed RAM secrets for job {job_id[:8]} via ephemeral X25519 ECDH.")
+            except Exception as err:
+                print(f"[GPU_WORKER] Failed to unseal secrets for job {job_id[:8]}: {err}")
+                raise
+
+        hf_token = unsealed_secrets.get("hf_token")
+        dataset_get_url = unsealed_secrets.get("dataset_get_url") or job_payload.get("dataset_get_url")
+        checkpoint_put_url = unsealed_secrets.get("checkpoint_put_url") or job_payload.get("checkpoint_put_url")
+
         total_epochs = max(1, int(job_payload.get("total_epochs", 3)))
         lr = float(job_payload.get("lr", 1e-4))
         lora_r = int(job_payload.get("lora_r", 16))
         lora_alpha = int(job_payload.get("lora_alpha", 32))
+        max_seq_length = int(job_payload.get("max_seq_length") or job_payload.get("max_length") or 256)
         records = job_payload.get("records")
+
+        # Direct BYOS S3/R2 download flow (0 B on coordinator SSD/MinIO)
+        if not records and dataset_get_url:
+            try:
+                print(f"[GPU_WORKER] Downloading dataset directly from BYOS presigned URL: {dataset_get_url.split('?')[0]}")
+                ds_resp = requests.get(dataset_get_url, timeout=120)
+                ds_resp.raise_for_status()
+                records = parse_universal_dataset(ds_resp.content, format_hint=job_payload.get("artifact_format"))
+            except Exception as e:
+                print(f"[GPU_WORKER] Failed to download BYOS dataset ({dataset_get_url.split('?')[0]}): {e}")
 
         if not records:
             ds_url = f"{server_url}/api/v1/workers/{worker_id}/training/{job_id}/dataset"
-            ds_resp = requests.get(ds_url, headers=headers, timeout=60)
-            ds_resp.raise_for_status()
-            records = ds_resp.json().get("records") or []
+            try:
+                ds_resp = requests.get(ds_url, headers=headers, timeout=60)
+                if ds_resp.status_code == 200:
+                    records = ds_resp.json().get("records") or []
+            except Exception:
+                pass
+        if not records:
+            dataset_source = job_payload.get("dataset_path") or job_payload.get("dataset_s3_url") or job_payload.get("dataset_url")
+            if dataset_source and not str(dataset_source).startswith("tunnel_stream://"):
+                try:
+                    records = parse_universal_dataset(dataset_source)
+                except Exception as e:
+                    print(f"[GPU_WORKER] Universal parser notice: {e}")
         if not records:
             raise RuntimeError("Training dataset is empty")
 
         with self._lock:
-            base_model, tokenizer, dev = self.ensure_model(base_model_id, for_training=True)
+            base_model, tokenizer, dev = self.ensure_model(
+                base_model_id, for_training=True, train_type=train_type, hf_token=hf_token
+            )
+            if train_type == "qlora" and dev == "cuda":
+                try:
+                    from peft import prepare_model_for_kbit_training
+                    base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=True)
+                except Exception as e:
+                    print(f"[GPU_WORKER] prepare_model_for_kbit_training notice: {e}")
+
+            discovered_targets = find_all_linear_names(base_model)
             lora_cfg = peft.LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
-                target_modules=["q_proj", "v_proj"],
+                target_modules=discovered_targets,
                 lora_dropout=0.05,
                 bias="none",
                 task_type="CAUSAL_LM",
@@ -672,19 +1489,31 @@ class _WorkerGpuRuntime:
             peft_model.train()
             optimizer = torch.optim.AdamW(peft_model.parameters(), lr=lr)
 
+            first_device = next(peft_model.parameters()).device
+
             batches = []
             for r in records:
                 formatted = (
                     f"<|im_start|>user\n{r.get('instruction', '')}<|im_end|>\n"
                     f"<|im_start|>assistant\n{r.get('response', '')}<|im_end|>"
                 )
-                enc = tokenizer(formatted, truncation=True, max_length=256, return_tensors="pt")
-                ids = enc["input_ids"].to(peft_model.device)
+                enc = tokenizer(formatted, truncation=True, max_length=max_seq_length, return_tensors="pt")
+                ids = enc["input_ids"].to(first_device)
                 batches.append((ids, ids.clone()))
 
+            # Partition into train and validation sets for empirical val_loss calculation
+            if len(batches) >= 5:
+                split_idx = max(1, int(len(batches) * 0.9))
+                train_batches = batches[:split_idx]
+                val_batches = batches[split_idx:]
+            else:
+                train_batches = batches
+                val_batches = batches[:1]
+
             print(
-                f"[GPU_WORKER] Training REAL LoRA job {job_id[:8]} on {peft_model.device} | "
-                f"model={base_model_id} | samples={len(batches)} | epochs={total_epochs}"
+                f"[GPU_WORKER] Training REAL {train_type.upper()} job {job_id[:8]} on {first_device} | "
+                f"model={base_model_id} | targets={discovered_targets} | "
+                f"samples={len(train_batches)} train / {len(val_batches)} val | epochs={total_epochs}"
             )
 
             loss_history = []
@@ -693,8 +1522,26 @@ class _WorkerGpuRuntime:
 
             try:
                 for epoch in range(1, total_epochs + 1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        print(f"[GPU_WORKER] Aborting job {job_id[:8]} cleanly before epoch {epoch} (cancelled).")
+                        return {
+                            "status": "cancelled",
+                            "job_id": job_id,
+                            "total_epochs": epoch - 1,
+                            "final_adapter_url": final_adapter_url,
+                        }
                     ep_losses = []
-                    for input_ids, labels in batches:
+                    for input_ids, labels in train_batches:
+                        if cancel_event is not None and cancel_event.is_set():
+                            print(f"[GPU_WORKER] Mid-epoch abort triggered for cancelled job {job_id[:8]}.")
+                            return {
+                                "status": "cancelled",
+                                "job_id": job_id,
+                                "total_epochs": epoch - 1,
+                                "final_adapter_url": final_adapter_url,
+                            }
+                        input_ids = input_ids.to(first_device)
+                        labels = labels.to(first_device)
                         optimizer.zero_grad()
                         outputs = peft_model(input_ids=input_ids, labels=labels)
                         loss = outputs.loss
@@ -702,10 +1549,32 @@ class _WorkerGpuRuntime:
                         optimizer.step()
                         ep_losses.append(float(loss.item()))
 
+                    if cancel_event is not None and cancel_event.is_set():
+                        return {
+                            "status": "cancelled",
+                            "job_id": job_id,
+                            "total_epochs": epoch - 1,
+                            "final_adapter_url": final_adapter_url,
+                        }
+
                     if dev == "cuda":
                         torch.cuda.synchronize()
                     avg_loss = round(sum(ep_losses) / max(1, len(ep_losses)), 4)
-                    val_loss = round(avg_loss * 0.98 + 0.02, 4)
+
+                    # Real empirical validation loss on held-out split using torch.no_grad()
+                    val_loss = avg_loss
+                    if val_batches:
+                        peft_model.eval()
+                        val_losses = []
+                        with torch.no_grad():
+                            for val_ids, val_labels in val_batches:
+                                val_ids = val_ids.to(first_device)
+                                val_labels = val_labels.to(first_device)
+                                val_out = peft_model(input_ids=val_ids, labels=val_labels)
+                                val_losses.append(float(val_out.loss.item()))
+                        if val_losses:
+                            val_loss = round(sum(val_losses) / len(val_losses), 4)
+                        peft_model.train()
 
                     state_dict = peft.get_peft_model_state_dict(peft_model)
                     safetensors_bytes = safetensors.torch.save(state_dict)
@@ -713,30 +1582,45 @@ class _WorkerGpuRuntime:
                         {
                             "base_model_name_or_path": base_model_id,
                             "peft_type": "LORA",
+                            "train_type": train_type,
                             "r": lora_r,
                             "lora_alpha": lora_alpha,
                             "lora_dropout": 0.05,
-                            "target_modules": ["q_proj", "v_proj"],
+                            "target_modules": discovered_targets,
                         },
                         indent=2,
                     )
 
-                    import base64
-                    up_url = f"{server_url}/api/v1/workers/{worker_id}/training/{job_id}/checkpoint"
-                    up_resp = requests.post(
-                        up_url,
-                        headers=headers,
-                        json={
-                            "epoch": epoch,
-                            "adapter_config": adapter_cfg_json,
-                            "adapter_model_b64": base64.b64encode(safetensors_bytes).decode("ascii"),
-                        },
-                        timeout=120,
-                    )
-                    up_resp.raise_for_status()
-                    up_data = up_resp.json()
-                    ckpt_url = up_data["ckpt_url"]
-                    ckpt_size = int(up_data.get("size_bytes", len(safetensors_bytes)))
+                    if checkpoint_put_url:
+                        # Direct BYOS presigned PUT upload (0 B to coordinator MinIO/SSD)
+                        print(f"[GPU_WORKER] Direct BYOS checkpoint upload to {checkpoint_put_url.split('?')[0]}")
+                        put_resp = requests.put(
+                            checkpoint_put_url,
+                            data=safetensors_bytes,
+                            headers={"Content-Type": "application/octet-stream"},
+                            timeout=180,
+                        )
+                        put_resp.raise_for_status()
+                        ckpt_url = checkpoint_put_url.split("?")[0]
+                        ckpt_size = len(safetensors_bytes)
+                    else:
+                        import base64
+                        up_url = f"{server_url}/api/v1/workers/{worker_id}/training/{job_id}/checkpoint"
+                        up_resp = requests.post(
+                            up_url,
+                            headers=headers,
+                            json={
+                                "epoch": epoch,
+                                "adapter_config": adapter_cfg_json,
+                                "adapter_model_b64": base64.b64encode(safetensors_bytes).decode("ascii"),
+                            },
+                            timeout=120,
+                        )
+                        up_resp.raise_for_status()
+                        up_data = up_resp.json()
+                        ckpt_url = up_data["ckpt_url"]
+                        ckpt_size = int(up_data.get("size_bytes", len(safetensors_bytes)))
+
                     final_adapter_url = ckpt_url
                     loss_history.append({"epoch": epoch, "loss": avg_loss, "val_loss": val_loss})
 
@@ -752,6 +1636,8 @@ class _WorkerGpuRuntime:
                     "final_adapter_url": final_adapter_url,
                 }
             finally:
+                # Milestone 3: Securely wipe unsealed secrets and ephemeral RAM buffers
+                zero_memory(raw_secrets_buf, unsealed_secrets)
                 try:
                     if hasattr(peft_model, "unload"):
                         self.model = peft_model.unload()
@@ -759,7 +1645,10 @@ class _WorkerGpuRuntime:
                         self.model = None
                 except Exception:
                     self.model = None
-                del optimizer, peft_model
+                if 'optimizer' in locals() and optimizer is not None:
+                    del optimizer
+                if 'peft_model' in locals() and peft_model is not None:
+                    del peft_model
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -838,6 +1727,8 @@ def cmd_join(args: argparse.Namespace) -> int:
             )
 
     hw = discover_hardware()
+    dep_status = probe_compute_dependencies()
+    cap_info = classify_worker_capabilities(hw, dep_status)
     limit_info = apply_vram_limit(vram_pct)
 
     manual_reg = getattr(args, "region", None)
@@ -880,7 +1771,10 @@ def cmd_join(args: argparse.Namespace) -> int:
         "gpu_info": hw.get("gpu_model") or "Universal Compute Node",
         "cpu_cores": hw.get("cpu_logical_cores") or hw.get("cpu_cores", 8),
         "memory_gb": hw.get("memory_gb", 16.0),
-        "gpu_memory_gb": hw.get("gpu_memory_gb", 8.0),
+        "gpu_memory_gb": hw.get("collective_vram_gb") or hw.get("vram_total_gb") or hw.get("gpu_memory_gb", 8.0),
+        "gpu_count": hw.get("gpu_count", len(hw.get("gpus", [])) or 1),
+        "collective_vram_gb": hw.get("collective_vram_gb") or hw.get("vram_total_gb") or hw.get("gpu_memory_gb", 8.0),
+        "largest_single_gpu_gb": hw.get("largest_single_gpu_gb") or hw.get("vram_total_gb") or hw.get("gpu_memory_gb", 8.0),
         "vram_used_gb": hw.get("vram_used_gb", 0.0),
         "vram_allocation_pct": vram_pct,
         "gpu_utilization_pct": hw.get("gpu_utilization_pct", 0.0),
@@ -895,9 +1789,15 @@ def cmd_join(args: argparse.Namespace) -> int:
         "city": geo.get("city"),
         "public_ip": geo.get("public_ip"),
         "is_unified_memory": hw.get("is_unified_memory", False),
-        "supported_task_types": hw.get("supported_task_types", "inference"),
+        "supported_task_types": cap_info["supported_task_types"],
+        "training_ready": cap_info["training_ready"],
+        "missing_training_packages": cap_info["missing_training_packages"],
         "gpus": hw.get("gpus", []),
         "api_key": api_key,
+        "tunnel_pubkey_x25519": _gpu_runtime.tunnel_pubkey_x25519,
+        "supports_sealed_env": True,
+        "supports_zero_disk_shm": True,
+        "tee_attestation_type": "none",
     }
     if always_silent and sensor:
         tel = sensor.get_telemetry()
@@ -990,8 +1890,10 @@ def cmd_join(args: argparse.Namespace) -> int:
             if not args.json:
                 print(f"  WebSocket Tunnel   : Offline / Fallback ({e})")
 
-    dep_status = probe_compute_dependencies()
     if args.json:
+        result_summary["training_ready"] = cap_info["training_ready"]
+        result_summary["supported_task_types"] = cap_info["supported_task_types"]
+        result_summary["missing_training_packages"] = cap_info["missing_training_packages"]
         print(json.dumps(result_summary))
     else:
         print("\n" + "=" * 68)
@@ -1005,10 +1907,14 @@ def cmd_join(args: argparse.Namespace) -> int:
         print(f"  Geographic Region  : {result_summary['region']}")
         print(f"  RTT Ping Latency   : {result_summary['latency_ping_ms']} ms")
         print(f"  CUDA Cap Enforced  : {result_summary['cuda_fraction_enforced']}")
-        if dep_status["ready"]:
+        if cap_info["training_ready"]:
             print(f"  Neural Compute     : REAL PyTorch/PEFT Ready ({dep_status['device'].upper()})")
-        else:
+            print(f"  Advertised Role    : Full Training + Inference ({cap_info['supported_task_types']})")
+        elif not dep_status["ready"]:
             print(f"  Neural Compute     : WARNING missing packages {dep_status['missing']} (run: pip install transformers peft safetensors accelerate)")
+            print(f"  Advertised Role    : Inference / Monitor-Only ({cap_info['supported_task_types']})")
+        else:
+            print(f"  Advertised Role    : Inference / Monitor-Only ({cap_info['supported_task_types']})")
         if always_silent:
             print(f"  Always Silent Mode : ACTIVE (Ceiling: {getattr(args, 'target_temp', 62.0)}°C, Cooldown: {getattr(args, 'cooldown_sec', 60.0)}s)")
             print(f"  Presence State     : {result_summary.get('work_capacity_state')}")
@@ -1053,13 +1959,22 @@ def cmd_join(args: argparse.Namespace) -> int:
                                 async with send_lock:
                                     await ws.send(json.dumps(payload_obj))
 
+                            live_caps = classify_worker_capabilities(discover_hardware(), probe_compute_dependencies())
+                            active_job_cancels: Dict[str, threading.Event] = {}
+
                             await _safe_send({
                                 "type": "capabilities",
                                 "protocol_version": 2,
-                                "compute_capabilities": ["inference", "training"],
+                                "compute_capabilities": live_caps["compute_capabilities"],
+                                "supported_task_types": live_caps["supported_task_types"],
+                                "training_ready": live_caps["training_ready"],
+                                "missing_training_packages": live_caps["missing_training_packages"],
                             })
                             if not args.json:
-                                print(f"[NEBULA_WORKER] Bidirectional compute tunnel connected ({registered_id}) — ready for GPU inference & LoRA training.")
+                                if live_caps["training_ready"]:
+                                    print(f"[NEBULA_WORKER] Bidirectional compute tunnel connected ({registered_id}) — ready for GPU inference & LoRA training.")
+                                else:
+                                    print(f"[NEBULA_WORKER] Bidirectional tunnel connected ({registered_id}) — INFERENCE / MONITOR ONLY (training disabled: missing={live_caps['missing_training_packages']}, tasks={live_caps['supported_task_types']}).")
 
                             async def _handle_dispatch(msg: Dict[str, Any]):
                                 job_type = msg.get("job_type")
@@ -1152,9 +2067,14 @@ def cmd_join(args: argparse.Namespace) -> int:
                                     job_id = msg.get("job_id")
                                     task_label = f"train-{str(job_id)[:8]}"
                                     active_task["id"] = task_label
+                                    cancel_ev = threading.Event()
+                                    if job_id:
+                                        active_job_cancels[str(job_id)] = cancel_ev
                                     ev_q: asyncio.Queue = asyncio.Queue()
 
                                     def _on_epoch(ep_num: int, avg_loss: float, val_loss: float, ckpt_url: str, size_bytes: int):
+                                        if cancel_ev.is_set() or stop_event.is_set():
+                                            return
                                         hw_snap = discover_hardware()
                                         loop.call_soon_threadsafe(ev_q.put_nowait, {
                                             "type": "training_epoch",
@@ -1173,6 +2093,8 @@ def cmd_join(args: argparse.Namespace) -> int:
                                             ev = await ev_q.get()
                                             if ev is None:
                                                 break
+                                            if cancel_ev.is_set() or stop_event.is_set():
+                                                continue
                                             await _safe_send(ev)
 
                                     drain_task = asyncio.create_task(_drain_epochs())
@@ -1180,7 +2102,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         def _exec_train():
                                             try:
                                                 return _gpu_runtime.run_lora_training(
-                                                    msg, server_url, registered_id, headers, on_epoch=_on_epoch
+                                                    msg, server_url, registered_id, headers, on_epoch=_on_epoch, cancel_event=cancel_ev
                                                 )
                                             finally:
                                                 loop.call_soon_threadsafe(ev_q.put_nowait, None)
@@ -1191,6 +2113,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         await _safe_send({
                                             "type": "training_result",
                                             "job_id": job_id,
+                                            "worker_id": registered_id,
                                             "vram_used_gb": end_hw["vram_used_gb"],
                                             "gpu_utilization_pct": end_hw["gpu_utilization_pct"],
                                             **res,
@@ -1203,11 +2126,14 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         await _safe_send({
                                             "type": "training_error",
                                             "job_id": job_id,
+                                            "worker_id": registered_id,
                                             "error": str(exc),
                                             "vram_used_gb": end_hw["vram_used_gb"],
                                             "gpu_utilization_pct": end_hw["gpu_utilization_pct"],
                                         })
                                     finally:
+                                        if job_id:
+                                            active_job_cancels.pop(str(job_id), None)
                                         active_task["id"] = None
 
                             async def _heartbeat_sender():
@@ -1240,6 +2166,15 @@ def cmd_join(args: argparse.Namespace) -> int:
                                                 print(f"[NEBULA_WORKER] Updated GPU limit to {server_pct}% via live WebSocket.")
                                     elif ftype == "job_dispatch":
                                         asyncio.create_task(_handle_dispatch(frame))
+                                    elif ftype == "job_cancel":
+                                        c_job_id = str(frame.get("job_id") or "")
+                                        cancel_reason = frame.get("reason") or "cancelled"
+                                        if c_job_id and c_job_id in active_job_cancels:
+                                            active_job_cancels[c_job_id].set()
+                                        if c_job_id and active_task.get("id") == f"train-{c_job_id[:8]}":
+                                            active_task["id"] = None
+                                        if not args.json:
+                                            print(f"[NEBULA_WORKER] Received live job_cancel for {c_job_id[:8]} ({cancel_reason}).")
 
                             hb_task = asyncio.create_task(_heartbeat_sender())
                             recv_task = asyncio.create_task(_receive_loop())
@@ -1524,6 +2459,13 @@ def cmd_work(args: argparse.Namespace) -> int:
         "cuda_version": hw["cuda_version"],
         "role": "Autonomous CLI Worker",
         "api_key": api_key,
+        "tunnel_pubkey_x25519": _gpu_runtime.tunnel_pubkey_x25519,
+        "supports_sealed_env": True,
+        "supports_zero_disk_shm": True,
+        "tee_attestation_type": "none",
+        "gpu_count": hw.get("gpu_count", len(hw.get("gpus", [])) or 1),
+        "collective_vram_gb": hw.get("collective_vram_gb") or hw.get("vram_total_gb") or hw.get("gpu_memory_gb", 8.0),
+        "largest_single_gpu_gb": hw.get("largest_single_gpu_gb") or hw.get("vram_total_gb") or hw.get("gpu_memory_gb", 8.0),
     }
     if always_silent and sensor:
         tel = sensor.get_telemetry()

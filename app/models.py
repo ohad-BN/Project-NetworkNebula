@@ -150,6 +150,15 @@ class Worker(Base):
     input_idle_sec = Column(Float, default=300.0)
     gpu_temp_c = Column(Float, default=50.0)
     duty_cycle_pct = Column(Integer, default=100)
+    tunnel_pubkey_x25519 = Column(String(128), nullable=True)
+    supports_sealed_env = Column(Boolean, default=False)
+    supports_zero_disk_shm = Column(Boolean, default=False)
+    tee_attestation_type = Column(String(32), default="none")
+    gpu_count = Column(Integer, default=1)
+    collective_vram_gb = Column(Float, default=0.0)
+    largest_single_gpu_gb = Column(Float, default=0.0)
+    training_ready = Column(Boolean, default=True)
+    missing_training_packages = Column(Text, default="[]")
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -193,7 +202,13 @@ class TrainingJob(Base):
     train_type = Column(String(50), default="lora", nullable=False)
     parallelism = Column(String(50), default="data_parallel", nullable=False)
     num_gpus = Column(Integer, default=1)
-    dataset_s3_url = Column(String(500), nullable=False)
+    dataset_s3_url = Column(String(500), nullable=True)
+    privacy_mode = Column(String(32), default="encrypted_staked_mesh", nullable=False)
+    data_source_type = Column(String(32), default="tunnel_stream", nullable=False)
+    storage_retention = Column(String(32), default="zero_retention", nullable=False)
+    required_vram_gb = Column(Float, default=4.0, nullable=False)
+    private_model_id = Column(String(36), nullable=True, index=True)
+    artifact_manifest_json = Column(Text, default="{}", nullable=False)
     hyperparameters = Column(Text, default="{}", nullable=False)
     status = Column(String(50), default="queued", nullable=False)
     current_epoch = Column(Integer, default=0)
@@ -215,6 +230,8 @@ class InferenceEndpoint(Base):
     name = Column(String(255), nullable=False)
     model_id = Column(String(255), nullable=False)
     adapter_url = Column(String(500), nullable=True)
+    privacy_mode = Column(String(32), default="encrypted_staked_mesh", nullable=False)
+    private_model_id = Column(String(36), nullable=True, index=True)
     status = Column(String(50), default="ready", nullable=False)
     min_replicas = Column(Integer, default=1)
     max_replicas = Column(Integer, default=4)
@@ -266,6 +283,25 @@ class ComputeSlice(Base):
     payload_hash = Column(String(64), nullable=False)
     checkpoint_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PrivateModel(Base):
+    __tablename__ = "private_model_registry"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    source_type = Column(String(32), nullable=False)  # hf_public | hf_private | byos_s3 | adapter
+    source_uri = Column(String(512), nullable=False)  # repo_id or sanitized S3 key
+    base_model_ref = Column(String(255), nullable=True)
+    param_count_b = Column(Float, nullable=True)
+    artifact_format = Column(String(32), default="hf_repo", nullable=False)
+    encryption_alg = Column(String(32), default="none", nullable=False)
+    artifact_sha256 = Column(String(64), nullable=True)
+    metadata_json = Column(Text, default="{}", nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 
 
 

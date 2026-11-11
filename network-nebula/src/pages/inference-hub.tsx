@@ -91,10 +91,16 @@ interface ComparisonResult {
   };
 }
 
+interface ModelItem {
+  id: string;
+  owned_by?: string;
+  permission?: any[];
+}
+
 export function InferenceHubPage() {
   const [activeTab, setActiveTab] = useState<"endpoints" | "compare" | "benchmark">("endpoints");
   const [endpoints, setEndpoints] = useState<EndpointItem[]>([]);
-  const [models, setModels] = useState<Array<{ id: string }>>([]);
+  const [models, setModels] = useState<ModelItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDeployOpen, setIsDeployOpen] = useState(false);
 
@@ -106,6 +112,7 @@ export function InferenceHubPage() {
 
   // Playground State
   const [selectedModel, setSelectedModel] = useState("Qwen/Qwen2.5-0.5B-Instruct");
+  const [isCustomPlaygroundModel, setIsCustomPlaygroundModel] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState("You are a professional Enterprise AI assistant.");
   const [userPrompt, setUserPrompt] = useState("Hello, can you explain what makes decentralized GPU compute fast?");
   const [isStream, setIsStream] = useState(false);
@@ -145,14 +152,60 @@ export function InferenceHubPage() {
 
   const fetchModels = async () => {
     try {
-      const res = await apiClient.get("/v1/models");
-      if (res.data?.data) {
-        // Filter out simulated/unsupported models: only display genuine active hardware models
-        const realPrefixes = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"];
-        const realModels = res.data.data.filter((m: { id: string }) =>
-          realPrefixes.some((p) => m.id.startsWith(p)) || !m.id.includes("/")
-        );
-        setModels(realModels.length > 0 ? realModels : res.data.data);
+      const allModelItems: ModelItem[] = [];
+
+      // 1. Fetch gateway models (arbitrary custom models permitted, no hardcoded realPrefixes filter)
+      try {
+        const res = await apiClient.get("/v1/models");
+        if (res.data?.data && Array.isArray(res.data.data)) {
+          allModelItems.push(...res.data.data);
+        }
+      } catch {
+        // Ignore
+      }
+
+      // 2. Fetch user private models
+      try {
+        const privRes = await apiClient.get("/api/v1/models/private");
+        if (privRes.data && Array.isArray(privRes.data)) {
+          for (const pm of privRes.data) {
+            const privId = pm.name || pm.id;
+            if (!allModelItems.some((m) => m.id === privId)) {
+              allModelItems.push({
+                id: privId,
+                owned_by: "user_private",
+                permission: [],
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      // 3. Fetch fine-tuned adapter models from completed training jobs
+      try {
+        const jobsRes = await apiClient.get("/api/v1/training/jobs");
+        if (jobsRes.data && Array.isArray(jobsRes.data)) {
+          for (const job of jobsRes.data) {
+            if (job.status === "completed" || job.checkpoints?.length > 0 || job.final_adapter_url) {
+              const ftId = `ft:${job.name ? job.name.toLowerCase().replace(/[^a-z0-9_-]/g, "-") : job.id}`;
+              if (!allModelItems.some((m) => m.id === ftId)) {
+                allModelItems.push({
+                  id: ftId,
+                  owned_by: "fine_tuned",
+                  permission: [],
+                });
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      if (allModelItems.length > 0) {
+        setModels(allModelItems);
       }
     } catch {
       // Ignore
@@ -656,24 +709,77 @@ print(response.choices[0].message.content)`;
               </CardHeader>
               <CardContent className="space-y-4 flex-1 flex flex-col">
                 <div className="space-y-2">
-                  <Label htmlFor="playgroundModel">Active Model / Endpoint</Label>
-                  <select
-                    id="playgroundModel"
-                    className="w-full h-9 rounded-md border border-input bg-transparent px-3 text-sm shadow-xs focus-visible:ring-1 focus-visible:ring-ring"
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                  >
-                    <optgroup label="Dedicated Deployed Endpoints">
-                      {endpoints.map((ep) => (
-                        <option key={ep.id} value={ep.name}>{ep.name} ({ep.model_id})</option>
-                      ))}
-                    </optgroup>
-                    <optgroup label="Foundation Cluster Models">
-                      {models.map((m) => (
-                        <option key={m.id} value={m.id}>{m.id}</option>
-                      ))}
-                    </optgroup>
-                  </select>
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="playgroundModel">Active Model / Endpoint</Label>
+                    <button
+                      type="button"
+                      onClick={() => setIsCustomPlaygroundModel(!isCustomPlaygroundModel)}
+                      className="text-xs text-primary hover:underline font-medium"
+                    >
+                      {isCustomPlaygroundModel ? "← Choose From Available Models" : "+ Custom / ft: Adapter"}
+                    </button>
+                  </div>
+
+                  {isCustomPlaygroundModel ? (
+                    <Input
+                      id="customPlaygroundModel"
+                      placeholder="e.g. ft:my-adapter or meta-llama/Llama-3.1-8B-Instruct"
+                      value={selectedModel}
+                      onChange={(e) => setSelectedModel(e.target.value)}
+                      className="font-mono text-sm"
+                    />
+                  ) : (
+                    <select
+                      id="playgroundModel"
+                      className="w-full h-9 rounded-md border border-input bg-transparent px-3 text-sm shadow-xs focus-visible:ring-1 focus-visible:ring-ring"
+                      value={selectedModel}
+                      onChange={(e) => setSelectedModel(e.target.value)}
+                    >
+                      {models.some((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned") && (
+                        <optgroup label="Fine-Tuned Adapters (ft:*)">
+                          {models
+                            .filter((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned")
+                            .map((m) => (
+                              <option key={`ft-${m.id}`} value={m.id}>
+                                {m.id}
+                              </option>
+                            ))}
+                        </optgroup>
+                      )}
+                      {models.some((m) => m.owned_by === "user_private") && (
+                        <optgroup label="Private User Models">
+                          {models
+                            .filter((m) => m.owned_by === "user_private")
+                            .map((m) => (
+                              <option key={`priv-${m.id}`} value={m.id}>
+                                {m.id}
+                              </option>
+                            ))}
+                        </optgroup>
+                      )}
+                      <optgroup label="Dedicated Deployed Endpoints">
+                        {endpoints.map((ep) => (
+                          <option key={ep.id} value={ep.name}>
+                            {ep.name} ({ep.model_id})
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Foundation Cluster Models">
+                        {models
+                          .filter(
+                            (m) =>
+                              !m.id.startsWith("ft:") &&
+                              m.owned_by !== "fine_tuned" &&
+                              m.owned_by !== "user_private"
+                          )
+                          .map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.id}
+                            </option>
+                          ))}
+                      </optgroup>
+                    </select>
+                  )}
                 </div>
 
                 <div className="space-y-2">
@@ -762,10 +868,21 @@ print(response.choices[0].message.content)`;
                     value={compareModelA}
                     onChange={(e) => setCompareModelA(e.target.value)}
                   >
+                    {models.some((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private") && (
+                      <optgroup label="Fine-Tuned & Private Models">
+                        {models
+                          .filter((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private")
+                          .map((m) => (
+                            <option key={`a-${m.id}`} value={m.id}>{m.id}</option>
+                          ))}
+                      </optgroup>
+                    )}
                     <optgroup label="Foundation Models">
-                      {models.map((m) => (
-                        <option key={`a-${m.id}`} value={m.id}>{m.id}</option>
-                      ))}
+                      {models
+                        .filter((m) => !m.id.startsWith("ft:") && m.owned_by !== "fine_tuned" && m.owned_by !== "user_private")
+                        .map((m) => (
+                          <option key={`a-${m.id}`} value={m.id}>{m.id}</option>
+                        ))}
                     </optgroup>
                     <optgroup label="Deployed Endpoints">
                       {endpoints.map((ep) => (
@@ -791,10 +908,21 @@ print(response.choices[0].message.content)`;
                     value={compareModelB}
                     onChange={(e) => setCompareModelB(e.target.value)}
                   >
+                    {models.some((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private") && (
+                      <optgroup label="Fine-Tuned & Private Models">
+                        {models
+                          .filter((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private")
+                          .map((m) => (
+                            <option key={`b-${m.id}`} value={m.id}>{m.id}</option>
+                          ))}
+                      </optgroup>
+                    )}
                     <optgroup label="Foundation Models">
-                      {models.map((m) => (
-                        <option key={`b-${m.id}`} value={m.id}>{m.id}</option>
-                      ))}
+                      {models
+                        .filter((m) => !m.id.startsWith("ft:") && m.owned_by !== "fine_tuned" && m.owned_by !== "user_private")
+                        .map((m) => (
+                          <option key={`b-${m.id}`} value={m.id}>{m.id}</option>
+                        ))}
                     </optgroup>
                     <optgroup label="Deployed Endpoints">
                       {endpoints.map((ep) => (
@@ -938,9 +1066,22 @@ print(response.choices[0].message.content)`;
                     value={benchmarkModel}
                     onChange={(e) => setBenchmarkModel(e.target.value)}
                   >
-                    {models.map((m) => (
-                      <option key={`bm-${m.id}`} value={m.id}>{m.id}</option>
-                    ))}
+                    {models.some((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private") && (
+                      <optgroup label="Fine-Tuned & Private Models">
+                        {models
+                          .filter((m) => m.id.startsWith("ft:") || m.owned_by === "fine_tuned" || m.owned_by === "user_private")
+                          .map((m) => (
+                            <option key={`bm-${m.id}`} value={m.id}>{m.id}</option>
+                          ))}
+                      </optgroup>
+                    )}
+                    <optgroup label="Foundation Models">
+                      {models
+                        .filter((m) => !m.id.startsWith("ft:") && m.owned_by !== "fine_tuned" && m.owned_by !== "user_private")
+                        .map((m) => (
+                          <option key={`bm-${m.id}`} value={m.id}>{m.id}</option>
+                        ))}
+                    </optgroup>
                   </select>
                 </div>
                 <div className="space-y-1 md:col-span-2">

@@ -29,6 +29,7 @@ import {
 } from "@/services/api/workers";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
+import { isWorkerTrainingCapable } from "@/lib/worker-capabilities";
 
 export function ClusterStatusPage() {
   const { apiKey: storeApiKey } = useAuthStore();
@@ -400,6 +401,11 @@ export function ClusterStatusPage() {
                               <Badge variant="outline" className="text-[9px] bg-emerald-500/10 text-emerald-400 border-emerald-500/30 font-mono py-0 px-1 flex items-center gap-0.5">
                                 <Zap className="h-2.5 w-2.5 text-emerald-400" />
                                 BURST
+                              </Badge>
+                            )}
+                            {!isWorkerTrainingCapable({ ...node, status: "online", is_available: true }) && (
+                              <Badge variant="outline" className="text-[9px] bg-slate-500/15 text-slate-300 border-slate-500/30 font-mono py-0 px-1">
+                                INFERENCE / MONITOR ONLY
                               </Badge>
                             )}
                           </div>

@@ -40,6 +40,7 @@ import {
 } from "@/services/api/workers";
 import { useAuthStore } from "@/stores/auth-store";
 import { toast } from "sonner";
+import { isWorkerTrainingCapable } from "@/lib/worker-capabilities";
 
 export function WorkerDashboardPage() {
   const { apiKey: storeApiKey } = useAuthStore();
@@ -601,6 +602,11 @@ export function WorkerDashboardPage() {
                           <Badge variant="secondary" className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px] font-mono flex items-center gap-1">
                             <Zap className="h-3 w-3 text-emerald-400" />
                             Unleashed (100%)
+                          </Badge>
+                        )}
+                        {!isWorkerTrainingCapable({ ...w, status: "online", is_available: true }) && (
+                          <Badge variant="secondary" className="bg-slate-500/15 text-slate-300 border-slate-500/30 text-[10px] font-mono">
+                            Inference / Monitor Only
                           </Badge>
                         )}
 

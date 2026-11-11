@@ -14,7 +14,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from fastapi import (
     APIRouter,
@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal, engine, get_db
-from app.models import ComputeSlice, Task, TaskStatus, TrainingJob, Transaction, TransactionType, User, Worker
+from app.models import ComputeSlice, InferenceEndpoint, Task, TaskStatus, TrainingJob, Transaction, TransactionType, User, Worker
 from app.hardware_detector import inspect_universal_hardware
 from app.geo_locator import resolve_node_location
 
@@ -180,6 +180,8 @@ class WorkerTunnelManager:
         db: Session,
         model_id: Optional[str] = None,
         preferred_user_id: Optional[str] = None,
+        privacy_mode: Optional[str] = None,
+        strict_owner_user_id: Optional[str] = None,
     ) -> Optional[str]:
         """Select the highest-priority v2-capable connected GPU/hardware worker tunnel for inference."""
         connected_ids = [
@@ -199,6 +201,15 @@ class WorkerTunnelManager:
         )
         if not candidates:
             return None
+
+        # AUD-07: Enforce strict_owner_user_id when privacy_mode == "strict_owner_nodes", failing closed without third-party fallback
+        if privacy_mode == "strict_owner_nodes":
+            owner_id = strict_owner_user_id or preferred_user_id
+            if not owner_id:
+                return None
+            candidates = [w for w in candidates if w.user_id == owner_id]
+            if not candidates:
+                return None
 
         def _score(w: Worker) -> tuple:
             arch = (getattr(w, "compute_architecture", None) or "").lower()
@@ -388,15 +399,16 @@ class WorkerTunnelManager:
                 payload = json.loads(raw_msg)
                 wid = payload.get("worker_id")
                 job_id = payload.get("job_id")
+                msg_kind = payload.get("type", "job_dispatch")
                 sent = False
                 if wid and self.is_connected(wid):
                     sent = await self._safe_send_json(wid, payload)
-                if not sent and job_id:
+                if not sent and job_id and msg_kind != "job_cancel":
                     r = _get_redis_client()
                     if r is not None:
                         r.lpush(
                             f"nebula:training_result:{job_id}",
-                            json.dumps({"status": "error", "error": f"Worker '{wid}' tunnel offline"}),
+                            json.dumps({"status": "error", "worker_id": wid, "error": f"Worker '{wid}' tunnel offline"}),
                         )
                         r.expire(f"nebula:training_result:{job_id}", 600)
             except Exception as bridge_err:
@@ -629,11 +641,109 @@ def reap_stale_workers_and_tasks(db: Session) -> bool:
     return dirty
 
 
+def parse_supported_task_types(raw_tasks: Any) -> List[str]:
+    """Normalize comma-separated or list supported_task_types into lowercase tokens."""
+    if not raw_tasks:
+        return []
+    if isinstance(raw_tasks, (list, tuple, set)):
+        items = [str(t).strip().lower() for t in raw_tasks]
+    else:
+        items = [t.strip().lower() for t in str(raw_tasks).split(",")]
+    seen: List[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.append(item)
+    return seen
+
+
+def derive_worker_supported_task_types(
+    raw_tasks: Any = None,
+    compute_architecture: Optional[str] = None,
+    gpu_memory_gb: Optional[float] = None,
+    is_unified_memory: bool = False,
+    training_ready: Optional[bool] = True,
+) -> str:
+    """
+    Resolve authoritative comma-separated task types from worker capabilities and hardware.
+    Never trusts the API container's hardware when a remote node registers without `supported_task_types`.
+    """
+    tasks = parse_supported_task_types(raw_tasks)
+    if not tasks:
+        arch = (compute_architecture or "cpu_simd").strip().lower()
+        if arch == "mps":
+            arch = "apple_mps"
+        vram = float(gpu_memory_gb or 0.0)
+        tasks = ["batch_inference"]
+        if (arch in ("cuda", "apple_mps", "intel_xpu", "amd_rocm") and vram >= 3.5) or vram >= 8.0:
+            tasks.append("inference")
+        if (arch in ("cuda", "amd_rocm") and vram >= 6.0) or (arch == "apple_mps" and vram >= 12.0):
+            tasks.append("training")
+        if arch in ("cuda", "amd_rocm") and vram >= 8.0:
+            tasks.append("distributed_training")
+
+    if training_ready is False:
+        tasks = [t for t in tasks if t not in ("training", "distributed_training")]
+        if not tasks:
+            tasks = ["batch_inference"]
+
+    return ",".join(tasks)
+
+
+def is_worker_training_capable(w: Worker) -> Tuple[bool, Optional[str]]:
+    """Return (eligible, reason) checking availability, stealth state, task types, and training packages."""
+    if not getattr(w, "is_available", False) or (getattr(w, "status", "") or "").lower() not in ("online", "busy"):
+        return False, f"Worker unavailable (status={getattr(w, 'status', None)})"
+    if (getattr(w, "work_capacity_state", None) or "unleashed").lower() == "restricted_pause":
+        return False, "Worker is in restricted_pause mode"
+    if getattr(w, "training_ready", True) is False:
+        return False, "Worker missing required PyTorch/PEFT training dependencies"
+
+    supported = parse_supported_task_types(getattr(w, "supported_task_types", None))
+    if supported and not any(t in supported for t in ("training", "distributed_training")):
+        return False, f"Worker supports only '{','.join(supported)}' (no training capability)"
+    return True, None
+
+
+def dispatch_job_cancel(
+    job_id: str,
+    worker_ids: Optional[List[str]] = None,
+    reason: str = "cancelled",
+) -> int:
+    """Push non-blocking `job_cancel` frames to assigned workers via the Redis tunnel dispatch queue."""
+    if not job_id:
+        return 0
+    r = _get_redis_client()
+    if r is None:
+        return 0
+    targets: List[str] = []
+    for wid in (worker_ids or []):
+        clean = str(wid or "").strip()
+        if clean and clean not in targets:
+            targets.append(clean)
+    pushed = 0
+    for wid in targets:
+        try:
+            r.rpush(
+                "nebula:tunnel:dispatch",
+                json.dumps({
+                    "type": "job_cancel",
+                    "job_id": job_id,
+                    "worker_id": wid,
+                    "reason": reason,
+                }),
+            )
+            pushed += 1
+        except Exception as exc:
+            logger.debug(f"[WS_CANCEL] Failed queuing job_cancel for {job_id}/{wid}: {exc}")
+    return pushed
+
+
 def get_eligible_training_workers(
     db: Session,
     requested_worker_ids: Optional[List[str]] = None,
+    require_tunnel: bool = False,
 ) -> List[Worker]:
-    """Return currently online, available compute workers eligible for training."""
+    """Return currently online, available, training-capable compute workers eligible for training."""
     reap_stale_workers_and_tasks(db)
     q = db.query(Worker).filter(
         Worker.is_available == True,
@@ -642,11 +752,17 @@ def get_eligible_training_workers(
     if requested_worker_ids:
         q = q.filter(Worker.id.in_(requested_worker_ids))
     workers = q.order_by(Worker.created_at.asc()).all()
-    return [
-        w
-        for w in workers
-        if (getattr(w, "work_capacity_state", None) or "unleashed").lower() != "restricted_pause"
-    ]
+    eligible: List[Worker] = []
+    for w in workers:
+        ok, _ = is_worker_training_capable(w)
+        if not ok:
+            continue
+        if require_tunnel and not (
+            is_worker_tunnel_v2_online_anywhere(w.id) or is_worker_tunnel_online_anywhere(w.id)
+        ):
+            continue
+        eligible.append(w)
+    return eligible
 
 
 def _trigger_queued_training_dispatch(db: Session) -> None:
@@ -734,7 +850,7 @@ def sync_primary_local_worker(db: Session) -> Optional[Worker]:
     return worker
 
 
-def serialize_worker_node(w: Worker) -> Dict[str, Any]:
+def serialize_worker_node(w: Worker, sanitize: bool = False) -> Dict[str, Any]:
     """Format a Worker ORM record into the unified enterprise & contributor telemetry dictionary."""
     total_vram = round(float(w.gpu_memory_gb or 8.0), 2)
     alloc_pct = int(w.vram_allocation_pct if w.vram_allocation_pct is not None else 80)
@@ -764,11 +880,17 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
     # Derive host system name
     system_name = w.name.split(" (")[0] if " (" in w.name else w.name
 
+    raw_missing_pkgs = getattr(w, "missing_training_packages", "[]") or "[]"
+    try:
+        missing_pkgs = json.loads(raw_missing_pkgs) if isinstance(raw_missing_pkgs, str) else list(raw_missing_pkgs)
+    except Exception:
+        missing_pkgs = []
+
     return {
         "id": w.id,
         "node_id": w.id,
         "worker_id": w.id,
-        "user_id": w.user_id,
+        "user_id": None if sanitize else w.user_id,
         "name": w.name,
         "system_name": system_name,
         "gpu_model": w.gpu_info or "NVIDIA CUDA Accelerator",
@@ -787,7 +909,7 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "role": w.role or "LoRA Training & Inference",
         "status": w.status or "online",
         "is_available": bool(w.is_available),
-        "current_task_id": w.current_task_id,
+        "current_task_id": None if sanitize else w.current_task_id,
         "total_tasks_completed": int(w.total_tasks_completed or 0),
         "hourly_rate_usd": round(float(w.hourly_rate_usd or 0.45), 4),
         "total_earnings_usd": round(float(w.total_earnings_usd or 0.0), 4),
@@ -798,9 +920,11 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "device_brand": getattr(w, "device_brand", "Generic") or "Generic",
         "country": getattr(w, "country", None),
         "city": getattr(w, "city", None),
-        "public_ip": getattr(w, "public_ip", None),
+        "public_ip": None if sanitize else getattr(w, "public_ip", None),
         "is_unified_memory": bool(getattr(w, "is_unified_memory", False)),
         "supported_task_types": getattr(w, "supported_task_types", "inference,training") or "inference,training",
+        "training_ready": bool(getattr(w, "training_ready", True) is not False),
+        "missing_training_packages": missing_pkgs,
         "staked_amount_usd": round(float(getattr(w, "staked_amount_usd", 0.0) or 0.0), 2),
         "slashed_amount_usd": round(float(getattr(w, "slashed_amount_usd", 0.0) or 0.0), 2),
         "reputation_score": round(float(getattr(w, "reputation_score", 100.0) or 100.0), 1),
@@ -809,6 +933,12 @@ def serialize_worker_node(w: Worker) -> Dict[str, Any]:
         "input_idle_sec": round(float(getattr(w, "input_idle_sec", 300.0) or 300.0), 1),
         "gpu_temp_c": round(float(getattr(w, "gpu_temp_c", 50.0) or 50.0), 1),
         "duty_cycle_pct": int(getattr(w, "duty_cycle_pct", 100) or 100),
+        "tunnel_pubkey_x25519": getattr(w, "tunnel_pubkey_x25519", None),
+        "supports_sealed_env": bool(getattr(w, "supports_sealed_env", False)),
+        "supports_zero_disk_shm": bool(getattr(w, "supports_zero_disk_shm", False)),
+        "tee_attestation_type": getattr(w, "tee_attestation_type", "none") or "none",
+        "collective_vram_gb": round(float(getattr(w, "collective_vram_gb", 0.0) or total_vram), 2),
+        "largest_single_gpu_gb": round(float(getattr(w, "largest_single_gpu_gb", 0.0) or total_vram), 2),
         "tunnel_active": worker_tunnel_manager.is_connected(w.id),
         "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else datetime.utcnow().isoformat(),
     }
@@ -851,6 +981,15 @@ class WorkerRegisterPayload(BaseModel):
     wallet_address: Optional[str] = None
     gpus: Optional[List[Dict[str, Any]]] = None
     api_key: Optional[str] = None
+    tunnel_pubkey_x25519: Optional[str] = None
+    supports_sealed_env: Optional[bool] = False
+    supports_zero_disk_shm: Optional[bool] = False
+    tee_attestation_type: Optional[str] = "none"
+    gpu_count: Optional[int] = None
+    collective_vram_gb: Optional[float] = None
+    largest_single_gpu_gb: Optional[float] = None
+    training_ready: Optional[bool] = None
+    missing_training_packages: Optional[List[str]] = None
 
 
 class WorkerConfigUpdatePayload(BaseModel):
@@ -878,6 +1017,9 @@ class WorkerHeartbeatPayload(BaseModel):
     input_idle_sec: Optional[float] = None
     gpu_temp_c: Optional[float] = None
     duty_cycle_pct: Optional[int] = None
+    supported_task_types: Optional[Any] = None
+    training_ready: Optional[bool] = None
+    missing_training_packages: Optional[List[str]] = None
 
 
 def is_real_hardware_node(w: Worker) -> bool:
@@ -984,7 +1126,10 @@ def get_windows_connect_script(
     base_url = str(request.base_url).rstrip("/")
     clean_key = (key or "").strip()
     script = f'''# NetworkNebula Windows Worker Bootstrapper
-param([string]$Key = "{clean_key}")
+param(
+    [string]$Key = "{clean_key}",
+    [switch]$InstallTrainingDeps
+)
 $ErrorActionPreference = "Stop"
 $HostUrl = "{base_url}"
 
@@ -1006,7 +1151,40 @@ if (-not (Get-Command "python" -ErrorAction SilentlyContinue)) {{
 
 Write-Host "[+] Using Python: $(& $pythonCmd --version)" -ForegroundColor Green
 
-# 2. Fetch latest nebula_worker.py (refresh if possible, keep local fallback)
+# 2. Pre-flight ML Training Dependency Inspection (optional install for capable GPUs)
+$depProbe = & $pythonCmd -c "import importlib.util, json; pkgs=['torch','transformers','peft','safetensors','accelerate']; missing=[p for p in pkgs if importlib.util.find_spec(p) is None]; cuda=False;
+try:
+ import torch; cuda=torch.cuda.is_available()
+except Exception:
+ pass
+print(json.dumps({{'missing': missing, 'cuda': cuda}}))" 2>$null
+$hasCuda = $false
+$missingPkgs = @()
+if ($depProbe) {{
+    try {{
+        $probeObj = $depProbe | ConvertFrom-Json
+        $hasCuda = [bool]$probeObj.cuda
+        $missingPkgs = @($probeObj.missing)
+    }} catch {{}}
+}}
+if ($missingPkgs.Count -gt 0) {{
+    Write-Host "[!] Missing ML training packages: $($missingPkgs -join ', ')" -ForegroundColor Yellow
+    $pipTargets = $missingPkgs | Where-Object {{ $_ -ne 'torch' }}
+    if ($InstallTrainingDeps -and $pipTargets.Count -gt 0) {{
+        Write-Host "[*] Installing LoRA/QLoRA training dependencies: $($pipTargets -join ', ')..." -ForegroundColor Yellow
+        & $pythonCmd -m pip install --quiet @pipTargets
+    }} elseif ($hasCuda) {{
+        Write-Host "[!] CUDA GPU detected, but training packages are missing." -ForegroundColor Yellow
+        Write-Host "    This node will join for Inference / Telemetry Monitoring ONLY until installed:" -ForegroundColor Yellow
+        Write-Host "    pip install transformers peft safetensors accelerate" -ForegroundColor Gray
+    }} else {{
+        Write-Host "[i] No CUDA training stack found -> joining cleanly as Inference / Monitor-Only Node." -ForegroundColor Cyan
+    }}
+}} else {{
+    Write-Host "[+] Role: Full Training + Inference Node (PyTorch/PEFT ready)." -ForegroundColor Green
+}}
+
+# 3. Fetch latest nebula_worker.py (refresh if possible, keep local fallback)
 $workerScript = "nebula_worker.py"
 try {{
     Write-Host "[*] Syncing latest nebula_worker.py from $HostUrl..." -ForegroundColor Yellow
@@ -1019,7 +1197,7 @@ try {{
     }}
 }}
 
-# 3. Launch Worker Agent
+# 4. Launch Worker Agent
 $workerArgs = @($workerScript, "join", "--server", $HostUrl)
 if ($Key -and $Key.Trim() -ne "") {{
     $workerArgs += @("--api-key", $Key.Trim())
@@ -1045,9 +1223,21 @@ def get_posix_connect_script(
 set -e
 
 KEY="{clean_key}"
-if [ -n "$1" ]; then
-    KEY="$1"
-fi
+INSTALL_TRAINING_DEPS=0
+KEY_CONSUMED=0
+for arg in "$@"; do
+    case "$arg" in
+        --install-training-deps)
+            INSTALL_TRAINING_DEPS=1
+            ;;
+        *)
+            if [ "$KEY_CONSUMED" = "0" ] && [ "${{arg#-}}" = "$arg" ]; then
+                KEY="$arg"
+                KEY_CONSUMED=1
+            fi
+            ;;
+    esac
+done
 SERVER_URL="${{NEBULA_SERVER_URL:-{base_url}}}"
 
 echo "=========================================================="
@@ -1066,11 +1256,22 @@ fi
 
 echo "[+] Using Python: $($PYTHON_CMD --version)"
 
-if [ ! -f "nebula_worker.py" ]; then
-    echo "[*] Fetching latest nebula_worker.py from $SERVER_URL..."
-    curl -fsSL "$SERVER_URL/nebula_worker.py" -o nebula_worker.py
-    echo "[+] Downloaded nebula_worker.py."
+MISSING_TRAIN=$($PYTHON_CMD -c "import importlib.util; pkgs=['torch','transformers','peft','safetensors','accelerate']; print(','.join([p for p in pkgs if importlib.util.find_spec(p) is None]))" 2>/dev/null || echo "torch,transformers,peft,safetensors,accelerate")
+if [ -n "$MISSING_TRAIN" ]; then
+    echo "[!] Missing ML training packages: $MISSING_TRAIN"
+    if [ "$INSTALL_TRAINING_DEPS" = "1" ]; then
+        echo "[*] Installing LoRA/QLoRA packages (transformers peft safetensors accelerate)..."
+        $PYTHON_CMD -m pip install --quiet transformers peft safetensors accelerate || true
+    else
+        echo "[i] Node will join for Inference / Telemetry Monitoring ONLY until training packages are installed."
+    fi
+else
+    echo "[+] Role: Full Training + Inference Node (PyTorch/PEFT ready)."
 fi
+
+echo "[*] Syncing latest nebula_worker.py from $SERVER_URL..."
+curl -fsSL "$SERVER_URL/nebula_worker.py" -o nebula_worker.py || true
+echo "[+] Prepared nebula_worker.py."
 
 API_KEY_ARG=""
 if [ -n "$KEY" ]; then
@@ -1120,14 +1321,15 @@ def get_cluster_telemetry(
     user_agent = request.headers.get("user-agent", "").lower()
     is_test_runner = "python-requests" in user_agent or "pytest" in user_agent
 
-    if user and scope not in ("all", "fleet"):
+    is_public_scope = scope in ("all", "fleet", "global_all")
+    if user and not is_public_scope:
         workers = (
             db.query(Worker)
             .filter(Worker.user_id == user.id)
             .order_by(Worker.created_at.desc())
             .all()
         )
-    elif is_test_runner or scope == "global_all" or scope in ("all", "fleet"):
+    elif is_test_runner or scope == "global_all" or is_public_scope:
         workers = (
             db.query(Worker)
             .filter(Worker.is_available == True)
@@ -1146,7 +1348,11 @@ def get_cluster_telemetry(
     if not is_test_runner:
         workers = [w for w in workers if is_real_hardware_node(w)]
 
-    node_list = [serialize_worker_node(w) for w in workers]
+    # AUD-08: Sanitize public_ip and current_task_id on public telemetry
+    node_list = []
+    for w in workers:
+        should_sanitize = is_public_scope or (not user) or (w.user_id != user.id)
+        node_list.append(serialize_worker_node(w, sanitize=should_sanitize))
 
     total_vram = round(sum(n["vram_total_gb"] for n in node_list), 2)
     allocated_vram = round(sum(n["vram_allocated_gb"] for n in node_list), 2)
@@ -1273,13 +1479,35 @@ def register_worker_node(
     resolved_tier = (payload.hardware_tier if payload and payload.hardware_tier else None) or hw.get("hardware_tier", "consumer_gpu")
     resolved_brand = (payload.device_brand if payload and payload.device_brand else None) or hw.get("gpu_vendor", "Generic")
     resolved_unified = bool(payload.is_unified_memory if payload and payload.is_unified_memory is not None else hw.get("is_unified_memory", False))
-    raw_tasks = payload.supported_task_types if payload and payload.supported_task_types else hw.get("supported_task_types", "inference,training")
-    resolved_task_types = ",".join(raw_tasks) if isinstance(raw_tasks, list) else str(raw_tasks)
+    resolved_missing_pkgs = list(payload.missing_training_packages) if (payload and payload.missing_training_packages) else []
+    if payload and payload.training_ready is not None:
+        resolved_training_ready = bool(payload.training_ready)
+    elif resolved_missing_pkgs:
+        resolved_training_ready = False
+    else:
+        resolved_training_ready = True
+    raw_tasks = payload.supported_task_types if (payload and payload.supported_task_types) else None
+    resolved_task_types = derive_worker_supported_task_types(
+        raw_tasks=raw_tasks,
+        compute_architecture=resolved_arch,
+        gpu_memory_gb=resolved_vram,
+        is_unified_memory=resolved_unified,
+        training_ready=resolved_training_ready,
+    )
     resolved_always_silent = bool(payload.is_always_silent) if payload and payload.is_always_silent is not None else False
     resolved_capacity_state = (payload.work_capacity_state if payload and payload.work_capacity_state else "unleashed")
     resolved_input_idle = float(payload.input_idle_sec if payload and payload.input_idle_sec is not None else 300.0)
     resolved_gpu_temp = float(payload.gpu_temp_c if payload and payload.gpu_temp_c is not None else 50.0)
     resolved_duty_cycle = int(payload.duty_cycle_pct if payload and payload.duty_cycle_pct is not None else 100)
+    resolved_gpus = payload.gpus if payload and payload.gpus else hw.get("gpus", [])
+
+    resolved_pubkey = (payload.tunnel_pubkey_x25519 if payload and payload.tunnel_pubkey_x25519 else None) or hw.get("tunnel_pubkey_x25519")
+    resolved_sealed_env = bool(payload.supports_sealed_env if payload and payload.supports_sealed_env is not None else hw.get("supports_sealed_env", False))
+    resolved_zero_disk = bool(payload.supports_zero_disk_shm if payload and payload.supports_zero_disk_shm is not None else hw.get("supports_zero_disk_shm", False))
+    resolved_tee = (payload.tee_attestation_type if payload and payload.tee_attestation_type else None) or hw.get("tee_attestation_type", "none")
+    resolved_gpu_count = int(payload.gpu_count if payload and payload.gpu_count is not None else hw.get("gpu_count", len(resolved_gpus) or 1))
+    resolved_coll_vram = float(payload.collective_vram_gb if payload and payload.collective_vram_gb is not None else hw.get("collective_vram_gb", resolved_vram))
+    resolved_largest_gpu = float(payload.largest_single_gpu_gb if payload and payload.largest_single_gpu_gb is not None else hw.get("largest_single_gpu_gb", resolved_vram))
 
     resolved_country = (payload.country if payload and payload.country else None)
     resolved_city = (payload.city if payload and payload.city else None)
@@ -1303,6 +1531,13 @@ def register_worker_node(
 
     worker = db.query(Worker).filter(Worker.id == resolved_id).first()
     if worker:
+        # AUD-05: Prevent overwriting worker.user_id if already registered to another user
+        if worker.user_id:
+            if not user or worker.user_id != user.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Worker already registered to another account",
+                )
         worker.name = resolved_name
         worker.gpu_info = resolved_gpu
         worker.cpu_cores = int(resolved_cores)
@@ -1329,10 +1564,20 @@ def register_worker_node(
         worker.input_idle_sec = resolved_input_idle
         worker.gpu_temp_c = resolved_gpu_temp
         worker.duty_cycle_pct = resolved_duty_cycle
+        if resolved_pubkey:
+            worker.tunnel_pubkey_x25519 = resolved_pubkey
+        worker.supports_sealed_env = resolved_sealed_env
+        worker.supports_zero_disk_shm = resolved_zero_disk
+        worker.tee_attestation_type = resolved_tee
+        worker.gpu_count = resolved_gpu_count
+        worker.collective_vram_gb = resolved_coll_vram
+        worker.largest_single_gpu_gb = resolved_largest_gpu
+        worker.training_ready = resolved_training_ready
+        worker.missing_training_packages = json.dumps(resolved_missing_pkgs)
         worker.status = "online"
         worker.is_available = True
         worker.last_heartbeat = datetime.utcnow()
-        if user:
+        if user and not worker.user_id:
             worker.user_id = user.id
     else:
         worker = Worker(
@@ -1369,6 +1614,15 @@ def register_worker_node(
             input_idle_sec=resolved_input_idle,
             gpu_temp_c=resolved_gpu_temp,
             duty_cycle_pct=resolved_duty_cycle,
+            tunnel_pubkey_x25519=resolved_pubkey,
+            supports_sealed_env=resolved_sealed_env,
+            supports_zero_disk_shm=resolved_zero_disk,
+            tee_attestation_type=resolved_tee,
+            gpu_count=resolved_gpu_count,
+            collective_vram_gb=resolved_coll_vram,
+            largest_single_gpu_gb=resolved_largest_gpu,
+            training_ready=resolved_training_ready,
+            missing_training_packages=json.dumps(resolved_missing_pkgs),
             last_heartbeat=datetime.utcnow(),
         )
         db.add(worker)
@@ -1380,9 +1634,8 @@ def register_worker_node(
 
     serialized = serialize_worker_node(worker)
     serialized["cuda_fraction_enforced"] = cuda_enforced
-    serialized["supported_task_types"] = (
-        payload.supported_task_types if payload else ["inference", "training"]
-    )
+    if payload and payload.supported_task_types:
+        serialized["supported_task_types"] = resolved_task_types
     return serialized
 
 
@@ -1541,6 +1794,20 @@ def worker_node_heartbeat(
             worker.gpu_temp_c = float(payload.gpu_temp_c)
         if payload.duty_cycle_pct is not None:
             worker.duty_cycle_pct = int(payload.duty_cycle_pct)
+        if payload.training_ready is not None:
+            worker.training_ready = bool(payload.training_ready)
+        if payload.missing_training_packages is not None:
+            worker.missing_training_packages = json.dumps(list(payload.missing_training_packages))
+            if payload.missing_training_packages and payload.training_ready is None:
+                worker.training_ready = False
+        if payload.supported_task_types is not None or payload.training_ready is not None:
+            worker.supported_task_types = derive_worker_supported_task_types(
+                raw_tasks=payload.supported_task_types if payload.supported_task_types is not None else worker.supported_task_types,
+                compute_architecture=worker.compute_architecture,
+                gpu_memory_gb=worker.gpu_memory_gb,
+                is_unified_memory=bool(getattr(worker, "is_unified_memory", False)),
+                training_ready=getattr(worker, "training_ready", True),
+            )
         if not worker.is_available:
             worker.status = "offline"
         elif active_train_running or (task_id and str(task_id).startswith("train-")):
@@ -1573,6 +1840,8 @@ def worker_node_heartbeat(
         "input_idle_sec": round(float(getattr(worker, "input_idle_sec", 300.0) or 300.0), 1),
         "gpu_temp_c": round(float(getattr(worker, "gpu_temp_c", 50.0) or 50.0), 1),
         "duty_cycle_pct": int(getattr(worker, "duty_cycle_pct", 100) or 100),
+        "supported_task_types": getattr(worker, "supported_task_types", "inference,training") or "inference,training",
+        "training_ready": bool(getattr(worker, "training_ready", True) is not False),
         "timestamp": worker.last_heartbeat.isoformat(),
     }
 
@@ -1664,43 +1933,52 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
     Uses short-lived DB transactions per frame so idle WebSocket connections never hit
     PostgreSQL idle-in-transaction timeouts.
     """
+    # AUD-05: Authenticate API key and verify worker.user_id == user.id BEFORE calling worker_tunnel_manager.connect(...)
+    raw_key = api_key or websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
+    raw_auth = websocket.headers.get("authorization")
+    if not raw_key and raw_auth and raw_auth.startswith("Bearer "):
+        raw_key = raw_auth[7:].strip()
+
+    authenticated = False
+    vram_pct = 80
+    owner_id = None
+
+    db_auth = SessionLocal()
+    try:
+        user = None
+        if raw_key:
+            user = db_auth.query(User).filter(User.api_key == raw_key.strip()).first()
+
+        worker = db_auth.query(Worker).filter(Worker.id == worker_id).first()
+        if user and worker and worker.user_id == user.id:
+            authenticated = True
+            vram_pct = int(worker.vram_allocation_pct or 80)
+            owner_id = worker.user_id
+            worker.last_heartbeat = datetime.utcnow()
+            if worker.is_available and (worker.status or "").lower() != "busy":
+                worker.status = "online"
+            db_auth.commit()
+            if worker.is_available and (worker.status or "").lower() == "online":
+                _trigger_queued_training_dispatch(db_auth)
+    finally:
+        db_auth.close()
+
+    if not authenticated:
+        logger.warning(f"[WS_TUNNEL] Unauthorized worker tunnel attempt for '{worker_id}'")
+        await websocket.close(code=4403, reason="Worker ownership verification failed")
+        return
+
     await worker_tunnel_manager.connect(worker_id, websocket)
     logger.info(f"[WS_TUNNEL] Worker '{worker_id}' tunnel connected.")
 
     try:
-        vram_pct = 80
-        owner_id = None
-        db_init = SessionLocal()
-        try:
-            raw_key = api_key or websocket.query_params.get("api_key") or websocket.headers.get("x-api-key")
-            user = None
-            if raw_key:
-                user = db_init.query(User).filter(User.api_key == raw_key.strip()).first()
-
-            worker = db_init.query(Worker).filter(Worker.id == worker_id).first()
-            if worker:
-                if user and worker.user_id != user.id:
-                    worker.user_id = user.id
-                worker.last_heartbeat = datetime.utcnow()
-                if worker.is_available and (worker.status or "").lower() != "busy":
-                    worker.status = "online"
-                db_init.commit()
-                db_init.refresh(worker)
-                if worker.is_available and (worker.status or "").lower() == "online":
-                    _trigger_queued_training_dispatch(db_init)
-
-            vram_pct = int(worker.vram_allocation_pct or 80) if worker else 80
-            owner_id = worker.user_id if worker else (user.id if user else None)
-        finally:
-            db_init.close()
-
         await worker_tunnel_manager._safe_send_json(
             worker_id,
             {
                 "type": "init",
                 "worker_id": worker_id,
                 "user_id": owner_id,
-                "authenticated": bool(owner_id),
+                "authenticated": True,
                 "vram_allocation_pct": vram_pct,
                 "status": "connected",
                 "message": "WebSocket tunnel established with NetworkNebula orchestrator",
@@ -1714,11 +1992,32 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             if msg_type == "capabilities":
                 if int(data.get("protocol_version", 1)) >= 2:
                     worker_tunnel_manager.mark_v2_capable(worker_id)
-                    db_cap = SessionLocal()
-                    try:
+                db_cap = SessionLocal()
+                try:
+                    w_cap = db_cap.query(Worker).filter(Worker.id == worker_id).first()
+                    if w_cap:
+                        caps = parse_supported_task_types(data.get("compute_capabilities"))
+                        raw_missing = data.get("missing_training_packages")
+                        cap_ready = data.get("training_ready")
+                        if cap_ready is False or (caps and "training" not in caps and "distributed_training" not in caps):
+                            w_cap.training_ready = False
+                        elif cap_ready is True:
+                            w_cap.training_ready = True
+                        if raw_missing is not None:
+                            w_cap.missing_training_packages = json.dumps(list(raw_missing))
+                        if data.get("supported_task_types") or data.get("training_ready") is not None or caps:
+                            w_cap.supported_task_types = derive_worker_supported_task_types(
+                                raw_tasks=data.get("supported_task_types") or w_cap.supported_task_types,
+                                compute_architecture=w_cap.compute_architecture,
+                                gpu_memory_gb=w_cap.gpu_memory_gb,
+                                is_unified_memory=bool(getattr(w_cap, "is_unified_memory", False)),
+                                training_ready=getattr(w_cap, "training_ready", True),
+                            )
+                        db_cap.commit()
+                    if int(data.get("protocol_version", 1)) >= 2:
                         _trigger_queued_training_dispatch(db_cap)
-                    finally:
-                        db_cap.close()
+                finally:
+                    db_cap.close()
 
             elif msg_type in ("heartbeat", "telemetry"):
                 is_v2 = bool(data.get("tunnel_protocol_v2")) or bool(worker_tunnel_manager.worker_v2.get(worker_id))
@@ -1810,11 +2109,20 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 val_loss = float(data.get("val_loss", round(avg_loss * 0.98 + 0.02, 4)))
                 ckpt_url = data.get("ckpt_url")
                 ckpt_size = int(data.get("size_bytes", 0))
+                job_is_terminal = False
+                terminal_status = None
                 db_tr = SessionLocal()
                 try:
                     if t_job_id:
                         tj = db_tr.query(TrainingJob).filter(TrainingJob.id == t_job_id).first()
-                        if tj:
+                        if tj and tj.status in ("failed", "cancelled", "completed"):
+                            job_is_terminal = True
+                            terminal_status = tj.status
+                            logger.warning(
+                                f"[WS_TUNNEL] Ignoring stale training_epoch {ep_num} from '{worker_id}' "
+                                f"for terminal job {t_job_id} (status={tj.status})."
+                            )
+                        elif tj:
                             try:
                                 lh = json.loads(tj.loss_history) if tj.loss_history else []
                             except Exception:
@@ -1851,8 +2159,13 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                     w_rec = db_tr.query(Worker).filter(Worker.id == worker_id).first()
                     if w_rec:
                         w_rec.last_heartbeat = datetime.utcnow()
-                        w_rec.status = "busy"
-                        w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
+                        if job_is_terminal:
+                            w_rec.current_task_id = None
+                            if w_rec.is_available:
+                                w_rec.status = "online"
+                        else:
+                            w_rec.status = "busy"
+                            w_rec.current_task_id = f"train-{str(t_job_id)[:8]}"
                         if "vram_used_gb" in data:
                             w_rec.vram_used_gb = float(data["vram_used_gb"])
                         if "gpu_utilization_pct" in data:
@@ -1860,16 +2173,35 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                     db_tr.commit()
                 finally:
                     db_tr.close()
+                if job_is_terminal and terminal_status in ("failed", "cancelled") and t_job_id:
+                    await worker_tunnel_manager._safe_send_json(
+                        worker_id,
+                        {"type": "job_cancel", "job_id": t_job_id, "reason": f"job_{terminal_status}"},
+                    )
 
             elif msg_type in ("training_result", "training_error"):
                 worker_tunnel_manager.mark_v2_capable(worker_id)
                 t_job_id = data.get("job_id")
+                err_text = str(data.get("error") or "")
+                missing_pkg_err = (
+                    msg_type == "training_error"
+                    and ("missing required training package" in err_text or "No module named" in err_text)
+                )
                 db_done = SessionLocal()
                 try:
                     w_rec = db_done.query(Worker).filter(Worker.id == worker_id).first()
                     if w_rec:
                         w_rec.current_task_id = None
                         w_rec.status = "online"
+                        if missing_pkg_err:
+                            w_rec.training_ready = False
+                            w_rec.supported_task_types = derive_worker_supported_task_types(
+                                raw_tasks=w_rec.supported_task_types,
+                                compute_architecture=w_rec.compute_architecture,
+                                gpu_memory_gb=w_rec.gpu_memory_gb,
+                                is_unified_memory=bool(getattr(w_rec, "is_unified_memory", False)),
+                                training_ready=False,
+                            )
                         if "vram_used_gb" in data:
                             w_rec.vram_used_gb = float(data["vram_used_gb"])
                         if "gpu_utilization_pct" in data:
@@ -1882,6 +2214,7 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                     if r is not None:
                         try:
                             payload_out = dict(data)
+                            payload_out.setdefault("worker_id", worker_id)
                             if msg_type == "training_error":
                                 payload_out["status"] = "error"
                             r.lpush(f"nebula:training_result:{t_job_id}", json.dumps(payload_out))
@@ -2074,7 +2407,7 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
                 .order_by(Worker.created_at.asc())
                 .all()
             )
-            nodes = [serialize_worker_node(w) for w in workers]
+            nodes = [serialize_worker_node(w, sanitize=True) for w in workers]
         finally:
             db_init.close()
         await websocket.send_json(
@@ -2094,7 +2427,7 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
                 db_ref = SessionLocal()
                 try:
                     workers = db_ref.query(Worker).filter(Worker.is_available == True).all()
-                    nodes = [serialize_worker_node(w) for w in workers]
+                    nodes = [serialize_worker_node(w, sanitize=True) for w in workers]
                 finally:
                     db_ref.close()
                 await websocket.send_json(
@@ -2110,6 +2443,243 @@ async def websocket_cluster_telemetry(websocket: WebSocket):
         logger.debug(f"[WS_CLUSTER] Subscriber disconnected: {e}")
     finally:
         cluster_broadcast_manager.disconnect(websocket)
+
+
+# ==============================================================================
+# In-Memory WebSocket Streaming Relay (Phase 3: Zero-Storage Data Plane)
+# ==============================================================================
+
+
+class InMemoryStreamRelayManager:
+    """
+    Duplex in-memory WebSocket streaming relay for zero-storage data plane.
+    Routes encrypted dataset chunks (<= 50MB) and adapter safetensors (<= 150MB)
+    directly between client and worker with 0 bytes written to disk or MinIO.
+    """
+
+    def __init__(self):
+        self.channels: Dict[str, List[WebSocket]] = {}
+        self.roles: Dict[str, Dict[WebSocket, str]] = {}
+        self.ram_buffers: Dict[str, List[Union[str, bytes]]] = {}
+        self.locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, job_id: str) -> asyncio.Lock:
+        if job_id not in self.locks:
+            self.locks[job_id] = asyncio.Lock()
+        return self.locks[job_id]
+
+    async def connect(self, job_id: str, websocket: WebSocket, role: str = "client"):
+        await websocket.accept()
+        async with self._get_lock(job_id):
+            if job_id not in self.channels:
+                self.channels[job_id] = []
+                self.roles[job_id] = {}
+            self.channels[job_id].append(websocket)
+            self.roles[job_id][websocket] = (role or "client").lower()
+
+    async def disconnect(self, job_id: str, websocket: WebSocket):
+        async with self._get_lock(job_id):
+            if job_id in self.roles:
+                self.roles[job_id].pop(websocket, None)
+                if not self.roles[job_id]:
+                    self.roles.pop(job_id, None)
+            if job_id in self.channels and websocket in self.channels[job_id]:
+                self.channels[job_id].remove(websocket)
+                if not self.channels[job_id]:
+                    del self.channels[job_id]
+                    self.locks.pop(job_id, None)
+
+    def buffer_client_message(self, job_id: str, message: Union[str, bytes]) -> None:
+        """Hold volatile RAM chunks (TTL 300s, 0 B disk/MinIO) until the assigned worker pulls them."""
+        if isinstance(message, bytes):
+            encoded = json.dumps({"_b64": base64.b64encode(message).decode("ascii")})
+        else:
+            encoded = str(message)
+        r = _get_redis_client()
+        if r is not None:
+            try:
+                key = f"nebula:client_stream:{job_id}"
+                r.rpush(key, encoded)
+                r.expire(key, 300)
+                return
+            except Exception:
+                pass
+        self.ram_buffers.setdefault(job_id, []).append(message)
+
+    def drain_buffered_messages(self, job_id: str) -> List[Union[str, bytes]]:
+        """Atomically pop and wipe any buffered RAM stream messages for job_id."""
+        drained: List[Union[str, bytes]] = []
+        r = _get_redis_client()
+        if r is not None:
+            try:
+                key = f"nebula:client_stream:{job_id}"
+                raw_items = r.lrange(key, 0, -1)
+                if raw_items:
+                    r.delete(key)
+                    for item in raw_items:
+                        try:
+                            parsed = json.loads(item)
+                            if isinstance(parsed, dict) and "_b64" in parsed:
+                                drained.append(base64.b64decode(parsed["_b64"].encode("ascii")))
+                                continue
+                        except Exception:
+                            pass
+                        drained.append(item)
+            except Exception:
+                pass
+        local_items = self.ram_buffers.pop(job_id, None) or []
+        drained.extend(local_items)
+        return drained
+
+    async def flush_to_worker(self, job_id: str, worker_ws: WebSocket) -> None:
+        for item in self.drain_buffered_messages(job_id):
+            try:
+                if isinstance(item, bytes):
+                    await worker_ws.send_bytes(item)
+                else:
+                    await worker_ws.send_text(str(item))
+            except Exception:
+                break
+
+    async def relay_message(
+        self,
+        job_id: str,
+        sender: WebSocket,
+        message: Union[str, bytes],
+        sender_role: str = "client",
+    ):
+        recipients = []
+        has_worker_peer = False
+        async with self._get_lock(job_id):
+            if job_id in self.channels:
+                role_map = self.roles.get(job_id, {})
+                for ws in self.channels[job_id]:
+                    if ws != sender:
+                        recipients.append(ws)
+                        if role_map.get(ws) == "worker":
+                            has_worker_peer = True
+
+        if sender_role == "client" and not has_worker_peer:
+            self.buffer_client_message(job_id, message)
+
+        for ws in recipients:
+            try:
+                if isinstance(message, bytes):
+                    await ws.send_bytes(message)
+                else:
+                    await ws.send_text(message)
+            except Exception:
+                pass
+
+
+in_memory_stream_manager = InMemoryStreamRelayManager()
+
+
+def pop_buffered_client_stream_records(job_id: str) -> List[Dict[str, str]]:
+    """Consume and wipe ephemeral client-RAM dataset frames buffered for job_id."""
+    raw_msgs = in_memory_stream_manager.drain_buffered_messages(job_id)
+    records: List[Dict[str, str]] = []
+    for msg in raw_msgs:
+        text_msg = msg.decode("utf-8", errors="ignore") if isinstance(msg, (bytes, bytearray)) else str(msg)
+        stripped = text_msg.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict) and isinstance(obj.get("records"), list):
+                for rec in obj["records"]:
+                    if isinstance(rec, dict) and (rec.get("instruction") or rec.get("response")):
+                        records.append({
+                            "instruction": str(rec.get("instruction", "")),
+                            "response": str(rec.get("response", "")),
+                        })
+                continue
+            if isinstance(obj, list):
+                for rec in obj:
+                    if isinstance(rec, dict) and (rec.get("instruction") or rec.get("response")):
+                        records.append({
+                            "instruction": str(rec.get("instruction", "")),
+                            "response": str(rec.get("response", "")),
+                        })
+                continue
+        except Exception:
+            pass
+        for line in stripped.splitlines():
+            line_s = line.strip()
+            if not line_s:
+                continue
+            try:
+                rec = json.loads(line_s)
+                if isinstance(rec, dict) and (rec.get("instruction") or rec.get("response")):
+                    records.append({
+                        "instruction": str(rec.get("instruction", "")),
+                        "response": str(rec.get("response", "")),
+                    })
+            except Exception:
+                pass
+    return records
+
+
+@router.websocket("/ws/client/stream/{job_id}")
+async def websocket_client_stream_relay(
+    websocket: WebSocket,
+    job_id: str,
+    api_key: Optional[str] = Query(default=None),
+    role: Optional[str] = Query(default="client"),
+):
+    """
+    Duplex in-memory streaming relay between client browser and worker for job_id.
+    Operates strictly in RAM buffers with 0 B written to disk or MinIO.
+    """
+    db = SessionLocal()
+    try:
+        from app.models import TrainingJob
+        job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+        if api_key and job:
+            user = db.query(User).filter(User.api_key == api_key).first()
+            if user and job.user_id != user.id:
+                await websocket.close(code=4403, reason="Job ownership verification failed")
+                return
+    finally:
+        db.close()
+
+    norm_role = (role or "client").strip().lower()
+    await in_memory_stream_manager.connect(job_id, websocket, role=norm_role)
+    try:
+        await websocket.send_json({
+            "type": "stream_ready",
+            "job_id": job_id,
+            "role": norm_role,
+            "storage_mode": "zero_retention_in_memory",
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        if norm_role == "worker":
+            await in_memory_stream_manager.flush_to_worker(job_id, websocket)
+
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            if "bytes" in message and message["bytes"] is not None:
+                await in_memory_stream_manager.relay_message(
+                    job_id, websocket, message["bytes"], sender_role=norm_role
+                )
+            elif "text" in message and message["text"] is not None:
+                text_data = message["text"]
+                if text_data == "ping":
+                    await websocket.send_text("pong")
+                else:
+                    await in_memory_stream_manager.relay_message(
+                        job_id, websocket, text_data, sender_role=norm_role
+                    )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug(f"[WS_STREAM] Streaming relay disconnected for {job_id}: {e}")
+    finally:
+        await in_memory_stream_manager.disconnect(job_id, websocket)
+
 
 
 # ==============================================================================
@@ -2831,12 +3401,15 @@ def _verify_worker_artifact_access(
     if raw_key and raw_key.lower().startswith("bearer "):
         raw_key = raw_key[7:].strip()
 
-    if worker.user_id:
-        if not raw_key:
-            raise HTTPException(status_code=401, detail="Worker API key required")
-        user = db.query(User).filter(User.api_key == raw_key.strip()).first()
-        if not user or user.id != worker.user_id:
-            raise HTTPException(status_code=403, detail="Invalid worker API key")
+    # AUD-06: Require non-null worker.user_id in _verify_worker_artifact_access
+    if not worker.user_id:
+        raise HTTPException(status_code=403, detail="Worker is not registered to an account")
+
+    if not raw_key:
+        raise HTTPException(status_code=401, detail="Worker API key required")
+    user = db.query(User).filter(User.api_key == raw_key.strip()).first()
+    if not user or user.id != worker.user_id:
+        raise HTTPException(status_code=403, detail="Invalid worker API key")
 
     if job_id:
         job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
@@ -2860,11 +3433,15 @@ def get_worker_training_dataset(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Download training dataset JSONL records for real GPU worker execution."""
+    """Download training dataset JSONL records (or consume zero-storage client RAM stream) for GPU execution."""
     _verify_worker_artifact_access(request, worker_id, db, job_id=job_id)
     job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    if job and str(job.dataset_s3_url or "").startswith("tunnel_stream://"):
+        streamed = pop_buffered_client_stream_records(job_id)
+        if streamed:
+            return {"job_id": job_id, "records": streamed, "source": "client_ram_stream"}
     from app.training_engine import training_engine
-    records = training_engine.load_dataset_records(job.dataset_s3_url)
+    records = training_engine.load_dataset_records(job.dataset_s3_url if job else None)
     return {"job_id": job_id, "records": records}
 
 
@@ -2919,7 +3496,73 @@ def get_worker_adapter_bundle(
     db: Session = Depends(get_db),
 ):
     """Fetch PEFT adapter safetensors + adapter_config.json bytes for mounting on remote GPU worker."""
-    _verify_worker_artifact_access(request, worker_id, db)
+    worker = _verify_worker_artifact_access(request, worker_id, db)
+
+    # AUD-06: Verify worker holds active dispatch lease or ownership before serving adapter weights
+    has_access = False
+
+    # 1. Check ownership: does worker's owner own the job / endpoint / adapter?
+    job = db.query(TrainingJob).filter(
+        (TrainingJob.final_adapter_url == adapter_url) | (TrainingJob.checkpoints.contains(adapter_url))
+    ).first()
+    if not job and ("/" in adapter_url):
+        for segment in adapter_url.replace("s3://", "").replace("http://", "").replace("https://", "").split("/"):
+            if segment:
+                potential_job = db.query(TrainingJob).filter(TrainingJob.id == segment).first()
+                if potential_job:
+                    job = potential_job
+                    break
+
+    if job and job.user_id == worker.user_id:
+        has_access = True
+
+    if not has_access:
+        ep = db.query(InferenceEndpoint).filter(
+            InferenceEndpoint.adapter_url == adapter_url,
+            InferenceEndpoint.user_id == worker.user_id,
+        ).first()
+        if ep:
+            has_access = True
+
+    # 2. Check active dispatch lease (DB task assignment or Redis lease)
+    if not has_access and job:
+        if worker.current_task_id in (f"train-{job.id[:8]}", job.id):
+            has_access = True
+        else:
+            try:
+                hp = json.loads(job.hyperparameters) if job.hyperparameters else {}
+                if worker_id in (hp.get("worker_ids") or []):
+                    has_access = True
+            except Exception:
+                pass
+
+    if not has_access and job:
+        redis_client = _get_redis_client()
+        if redis_client:
+            try:
+                if redis_client.get(f"nebula:worker_lease:{worker_id}:{job.id}"):
+                    has_access = True
+            except Exception:
+                pass
+    elif not has_access:
+        redis_client = _get_redis_client()
+        if redis_client:
+            try:
+                leases = redis_client.keys(f"nebula:worker_lease:{worker_id}:*")
+                for lk in leases:
+                    val = redis_client.get(lk)
+                    if val and (val == adapter_url or adapter_url in val):
+                        has_access = True
+                        break
+            except Exception:
+                pass
+
+    if not has_access:
+        raise HTTPException(
+            status_code=403,
+            detail="Worker does not hold an active lease or ownership for this adapter",
+        )
+
     from app.storage import get_storage
     import requests as req_lib
 

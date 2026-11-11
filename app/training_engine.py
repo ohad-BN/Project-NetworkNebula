@@ -51,6 +51,377 @@ DEFAULT_TRAINING_RECORDS = [
 ]
 
 
+def extract_instruction_response(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Helper to convert any single dict structure into {instruction, response}."""
+    if not isinstance(item, dict):
+        return None
+
+    # Alpaca format
+    if "instruction" in item and "output" in item:
+        inst = str(item["instruction"]).strip()
+        inp = str(item.get("input", "") or "").strip()
+        if inp:
+            inst = f"{inst}\n{inp}"
+        out = str(item["output"]).strip()
+        if inst or out:
+            return {"instruction": inst, "response": out}
+
+    # Standard instruction/response
+    if "instruction" in item and "response" in item:
+        return {"instruction": str(item["instruction"]).strip(), "response": str(item["response"]).strip()}
+
+    # Prompt / completion
+    if "prompt" in item and "completion" in item:
+        return {"instruction": str(item["prompt"]).strip(), "response": str(item["completion"]).strip()}
+
+    # Input / output
+    if "input" in item and "output" in item:
+        return {"instruction": str(item["input"]).strip(), "response": str(item["output"]).strip()}
+
+    # Question / answer
+    if "question" in item and "answer" in item:
+        return {"instruction": str(item["question"]).strip(), "response": str(item["answer"]).strip()}
+
+    # DPO format: prompt, chosen, rejected
+    if "prompt" in item and "chosen" in item:
+        return {"instruction": str(item["prompt"]).strip(), "response": str(item["chosen"]).strip()}
+
+    # OpenAI Chat / Messages: messages: [{role, content}]
+    if "messages" in item and isinstance(item["messages"], list):
+        user_msgs = [str(m.get("content", "")) for m in item["messages"] if m.get("role") in ("user", "human")]
+        asst_msgs = [str(m.get("content", "")) for m in item["messages"] if m.get("role") in ("assistant", "gpt", "bot")]
+        if user_msgs and asst_msgs:
+            return {"instruction": "\n".join(user_msgs).strip(), "response": "\n".join(asst_msgs).strip()}
+
+    # ShareGPT format: conversations: [{from, value}]
+    if "conversations" in item and isinstance(item["conversations"], list):
+        human_vals = [str(c.get("value", "")) for c in item["conversations"] if c.get("from") in ("human", "user")]
+        gpt_vals = [str(c.get("value", "")) for c in item["conversations"] if c.get("from") in ("gpt", "assistant", "bot")]
+        if human_vals and gpt_vals:
+            return {"instruction": "\n".join(human_vals).strip(), "response": "\n".join(gpt_vals).strip()}
+
+    # Single text field
+    if "text" in item and str(item["text"]).strip():
+        txt = str(item["text"]).strip()
+        mid = max(1, len(txt) // 2)
+        return {"instruction": txt[:mid].strip(), "response": txt[mid:].strip()}
+
+    return None
+
+
+def chunk_text_sliding_window(
+    text: str,
+    window_tokens: int = 256,
+    overlap_tokens: int = 32
+) -> List[Dict[str, str]]:
+    """Split unstructured text into instruction-response chunks with sliding window."""
+    words = text.split()
+    if not words:
+        return []
+    records = []
+    step = max(1, window_tokens - overlap_tokens)
+    for i in range(0, len(words), step):
+        chunk_words = words[i : i + window_tokens]
+        if len(chunk_words) < 8 and records:
+            break
+        mid = max(1, len(chunk_words) // 2)
+        inst_text = " ".join(chunk_words[:mid])
+        resp_text = " ".join(chunk_words[mid:])
+        if inst_text and resp_text:
+            records.append({
+                "instruction": f"Continue the following text:\n{inst_text}",
+                "response": resp_text
+            })
+    if not records and words:
+        mid = max(1, len(words) // 2)
+        records.append({
+            "instruction": " ".join(words[:mid]),
+            "response": " ".join(words[mid:])
+        })
+    return records
+
+
+def _parse_csv_text(raw_text: str) -> List[Dict[str, str]]:
+    import csv
+    import io
+    records = []
+    reader = csv.reader(io.StringIO(raw_text))
+    rows = [r for r in reader if r]
+    if not rows:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    has_header = any(k in header for k in (
+        "instruction", "response", "prompt", "completion", "input", "output", "question", "answer", "text"
+    ))
+    if has_header and len(rows) > 1:
+        dict_reader = csv.DictReader(io.StringIO(raw_text))
+        for row in dict_reader:
+            rec = extract_instruction_response(row)
+            if rec:
+                records.append(rec)
+    else:
+        start_row = 1 if has_header else 0
+        for row in rows[start_row:]:
+            if len(row) >= 2 and (row[0].strip() or row[1].strip()):
+                records.append({"instruction": row[0].strip(), "response": row[1].strip()})
+            elif len(row) == 1 and row[0].strip():
+                txt = row[0].strip()
+                mid = max(1, len(txt) // 2)
+                records.append({"instruction": txt[:mid].strip(), "response": txt[mid:].strip()})
+    return records
+
+
+def parse_universal_dataset(
+    source: Any,
+    format_hint: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """
+    Universal dataset parser supporting 8 formats:
+      1. .jsonl (Alpaca, ChatML/Messages, ShareGPT, DPO, prompt/completion)
+      2. .json (list of records or dict container)
+      3. .csv (auto-detect columns or header mapping)
+      4. .parquet (pyarrow or fastparquet)
+      5. .txt (sliding-window chunking)
+      6. .md (markdown sections / sliding-window chunking)
+      7. .pdf (pypdf text extraction + sliding window)
+      8. .docx (zipfile XML / python-docx extraction + sliding window)
+      9. hf_dataset:// (HuggingFace datasets streaming)
+    """
+    import io
+    import csv
+
+    # Case 0: Already a list of dicts
+    if isinstance(source, list):
+        records = []
+        for item in source:
+            extracted = extract_instruction_response(item)
+            if extracted:
+                records.append(extracted)
+        if not records and source:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Case 1: HuggingFace dataset URI (hf_dataset://...)
+    if isinstance(source, str) and source.startswith("hf_dataset://"):
+        try:
+            from datasets import load_dataset
+            clean_repo = source.replace("hf_dataset://", "").strip()
+            ds = load_dataset(clean_repo, split="train", streaming=True)
+            records = []
+            for item in ds:
+                ext = extract_instruction_response(item)
+                if ext:
+                    records.append(ext)
+                if len(records) >= 500:
+                    break
+            if not records:
+                raise ValueError("Training dataset contains 0 valid samples")
+            return records
+        except Exception as e:
+            raise ValueError(f"Failed to load HuggingFace dataset '{source}': {e}") from e
+
+    # Acquire raw bytes or text from source (file path, S3, URL, or raw data)
+    raw_bytes: Optional[bytes] = None
+    raw_text: Optional[str] = None
+    ext = (format_hint or "").lower().strip()
+
+    if isinstance(source, bytes):
+        raw_bytes = source
+    elif isinstance(source, str):
+        if os.path.exists(source) and os.path.isfile(source):
+            if not ext:
+                ext = os.path.splitext(source)[1].lower()
+            with open(source, "rb") as f:
+                raw_bytes = f.read()
+        elif source.startswith("s3://"):
+            from app.storage import get_storage
+            parts = source[5:].split("/", 1)
+            bucket = parts[0]
+            key = parts[1] if len(parts) > 1 else ""
+            if not ext and "." in key:
+                ext = "." + key.rsplit(".", 1)[1].lower()
+            raw_bytes = get_storage().download_bytes(bucket, key)
+        elif source.startswith("http://") or source.startswith("https://"):
+            resp = requests.get(source, timeout=30)
+            resp.raise_for_status()
+            raw_bytes = resp.content
+            if not ext and "." in source.split("?")[0]:
+                ext = "." + source.split("?")[0].rsplit(".", 1)[1].lower()
+        else:
+            raw_text = source
+
+    if raw_bytes is not None and raw_text is None:
+        if not ext:
+            if raw_bytes.startswith(b"PAR1"):
+                ext = ".parquet"
+            elif raw_bytes.startswith(b"%PDF"):
+                ext = ".pdf"
+            elif raw_bytes.startswith(b"PK\x03\x04"):
+                ext = ".docx"
+
+    records: List[Dict[str, str]] = []
+
+    # Format: .parquet
+    if ext == ".parquet" or (raw_bytes and raw_bytes.startswith(b"PAR1")):
+        try:
+            import pyarrow.parquet as pq
+            table = pq.read_table(io.BytesIO(raw_bytes))
+            for row in table.to_pylist():
+                parsed = extract_instruction_response(row)
+                if parsed:
+                    records.append(parsed)
+        except Exception:
+            try:
+                import pandas as pd
+                df = pd.read_parquet(io.BytesIO(raw_bytes), engine="fastparquet")
+                for row in df.to_dict(orient="records"):
+                    parsed = extract_instruction_response(row)
+                    if parsed:
+                        records.append(parsed)
+            except Exception as e:
+                raise ValueError(f"Failed to parse Parquet dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .pdf
+    if ext == ".pdf" or (raw_bytes and raw_bytes.startswith(b"%PDF")):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+            extracted_pages = []
+            for page in reader.pages:
+                txt = page.extract_text()
+                if txt:
+                    extracted_pages.append(txt)
+            full_text = "\n\n".join(extracted_pages).strip()
+            if not full_text:
+                raise ValueError("Training dataset contains 0 valid samples")
+            records = chunk_text_sliding_window(full_text)
+        except Exception as e:
+            if "0 valid samples" in str(e):
+                raise
+            raise ValueError(f"Failed to parse PDF dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .docx
+    if ext == ".docx" or (raw_bytes and raw_bytes.startswith(b"PK\x03\x04")):
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            paragraphs = []
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                if "word/document.xml" in zf.namelist():
+                    tree = ET.fromstring(zf.read("word/document.xml"))
+                    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                    for p in tree.findall(".//w:p", ns):
+                        t_vals = [elem.text for elem in p.findall(".//w:t", ns) if elem.text]
+                        if t_vals:
+                            paragraphs.append("".join(t_vals))
+            full_text = "\n\n".join(paragraphs).strip()
+            if not full_text:
+                raise ValueError("Training dataset contains 0 valid samples")
+            records = chunk_text_sliding_window(full_text)
+        except Exception as e:
+            if "0 valid samples" in str(e):
+                raise
+            raise ValueError(f"Failed to parse DOCX dataset: {e}") from e
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    if raw_text is None and raw_bytes is not None:
+        try:
+            raw_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw_text = raw_bytes.decode("latin-1")
+            except Exception as e:
+                raise ValueError(f"Could not decode text file: {e}") from e
+
+    if not raw_text or not raw_text.strip():
+        raise ValueError("Training dataset contains 0 valid samples")
+
+    clean_text = raw_text.strip()
+
+    # Format: .csv
+    if ext == ".csv":
+        records = _parse_csv_text(clean_text)
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .txt / .md
+    if ext in (".txt", ".md"):
+        records = chunk_text_sliding_window(clean_text)
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Format: .json / .jsonl or auto-detection
+    is_json_format = ext in (".json", ".jsonl") or clean_text.startswith("[") or clean_text.startswith("{")
+    if is_json_format:
+        try:
+            parsed_json = json.loads(clean_text)
+            if isinstance(parsed_json, list):
+                for item in parsed_json:
+                    rec = extract_instruction_response(item)
+                    if rec:
+                        records.append(rec)
+            elif isinstance(parsed_json, dict):
+                for key in ("data", "records", "samples", "conversations", "items", "dataset"):
+                    if key in parsed_json and isinstance(parsed_json[key], list):
+                        for item in parsed_json[key]:
+                            rec = extract_instruction_response(item)
+                            if rec:
+                                records.append(rec)
+                        break
+                if not records:
+                    single = extract_instruction_response(parsed_json)
+                    if single:
+                        records.append(single)
+        except json.JSONDecodeError:
+            pass
+
+        # Try line-by-line JSONL
+        if not records:
+            for line in clean_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                    rec = extract_instruction_response(item)
+                    if rec:
+                        records.append(rec)
+                except json.JSONDecodeError:
+                    continue
+
+        if not records:
+            raise ValueError("Training dataset contains 0 valid samples")
+        return records
+
+    # Try CSV fallback
+    if not records and "," in clean_text and "\n" in clean_text:
+        try:
+            csv_recs = _parse_csv_text(clean_text)
+            if csv_recs:
+                records = csv_recs
+        except Exception:
+            pass
+
+    # Unstructured text fallback
+    if not records:
+        records = chunk_text_sliding_window(clean_text)
+
+    if not records:
+        raise ValueError("Training dataset contains 0 valid samples")
+
+    return records
+
+
 class PeftTrainingEngine:
     """
     Singleton PEFT / LoRA Training Engine orchestrating model preparation,
@@ -71,53 +442,13 @@ class PeftTrainingEngine:
     def load_dataset_records(self, dataset_s3_url: Optional[str] = None) -> List[Dict[str, str]]:
         """
         Ingest instruction-tuning dataset from local file path, MinIO S3 (s3://),
-        or presigned HTTP URL. Supports Alpaca, Prompt-Completion, and OpenAI Chat formats.
+        or presigned HTTP URL using the universal dataset parser.
+        Supports .jsonl, .json, .csv, .parquet, .txt, .md, .pdf, .docx, and hf_dataset://.
         """
         records: List[Dict[str, str]] = []
         if dataset_s3_url:
             try:
-                raw_text: Optional[str] = None
-                # Case 1: Local file path
-                if os.path.exists(dataset_s3_url):
-                    with open(dataset_s3_url, "r", encoding="utf-8") as f:
-                        raw_text = f.read()
-                # Case 2: S3 URI (s3://bucket/object_key)
-                elif dataset_s3_url.startswith("s3://"):
-                    parts = dataset_s3_url[5:].split("/", 1)
-                    bucket = parts[0]
-                    key = parts[1] if len(parts) > 1 else ""
-                    storage = get_storage()
-                    raw_bytes = storage.download_bytes(bucket, key)
-                    raw_text = raw_bytes.decode("utf-8")
-                # Case 3: HTTP/HTTPS presigned or public URL
-                elif dataset_s3_url.startswith("http://") or dataset_s3_url.startswith("https://"):
-                    resp = requests.get(dataset_s3_url, timeout=10)
-                    if resp.status_code == 200:
-                        raw_text = resp.text
-
-                if raw_text:
-                    for line in raw_text.splitlines():
-                        line = line.strip()
-                        if line:
-                            try:
-                                data = json.loads(line)
-                                if "instruction" in data and "response" in data:
-                                    records.append({
-                                        "instruction": str(data["instruction"]),
-                                        "response": str(data["response"])
-                                    })
-                                elif "prompt" in data and "completion" in data:
-                                    records.append({
-                                        "instruction": str(data["prompt"]),
-                                        "response": str(data["completion"])
-                                    })
-                                elif "messages" in data and isinstance(data["messages"], list):
-                                    user_msg = next((m.get("content", "") for m in data["messages"] if m.get("role") == "user"), "")
-                                    asst_msg = next((m.get("content", "") for m in data["messages"] if m.get("role") == "assistant"), "")
-                                    if user_msg and asst_msg:
-                                        records.append({"instruction": user_msg, "response": asst_msg})
-                            except json.JSONDecodeError:
-                                continue
+                records = parse_universal_dataset(dataset_s3_url)
             except Exception as e:
                 logger.warning(f"Could not load dataset from {dataset_s3_url}: {e}")
 
@@ -130,12 +461,23 @@ class PeftTrainingEngine:
         self,
         dataset_s3_url: Optional[str] = None,
         min_records: int = 64,
+        job_id: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
         Load dataset records for remote GPU execution and ensure default/small datasets
         contain at least `min_records` optimization steps per epoch for sustained CUDA training.
+        Consumes volatile client RAM streams first when `dataset_s3_url` uses `tunnel_stream://`.
         """
-        base_records = self.load_dataset_records(dataset_s3_url)
+        base_records: List[Dict[str, str]] = []
+        if job_id and str(dataset_s3_url or "").startswith("tunnel_stream://"):
+            try:
+                from app.cluster_worker_router import pop_buffered_client_stream_records
+                base_records = pop_buffered_client_stream_records(job_id)
+            except Exception as exc:
+                logger.warning(f"Failed consuming tunnel_stream RAM buffer for {job_id}: {exc}")
+
+        if not base_records:
+            base_records = self.load_dataset_records(dataset_s3_url)
         if not base_records:
             base_records = list(DEFAULT_TRAINING_RECORDS)
         if len(base_records) >= min_records:
@@ -150,6 +492,49 @@ class PeftTrainingEngine:
             })
             idx += 1
         return expanded
+
+
+def build_training_dispatch_payload(
+    *,
+    job_id: str,
+    worker_id: str,
+    base_model_id: str,
+    dataset_s3_url: Optional[str],
+    total_epochs: int,
+    train_type: str = "lora",
+    lr: float = 1e-4,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    records: Optional[List[Dict[str, str]]] = None,
+    storage_retention: str = "zero_retention",
+    sealed_secrets: Optional[Any] = None,
+    sealed_secrets_b64: Optional[str] = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
+) -> Dict[str, Any]:
+    """Construct canonical WebSocket training dispatch payload shared across single and distributed runners."""
+    payload: Dict[str, Any] = {
+        "type": "job_dispatch",
+        "job_type": "training",
+        "job_id": job_id,
+        "worker_id": worker_id,
+        "base_model_id": base_model_id,
+        "train_type": (train_type or "lora").strip().lower(),
+        "dataset_s3_url": dataset_s3_url,
+        "storage_retention": (storage_retention or "zero_retention").strip().lower(),
+        "total_epochs": int(total_epochs),
+        "lr": float(lr),
+        "lora_r": int(lora_r),
+        "lora_alpha": int(lora_alpha),
+        "shard_index": int(shard_index),
+        "shard_count": max(1, int(shard_count)),
+        "records": records if (records is not None and len(records) <= 500) else None,
+    }
+    if sealed_secrets:
+        payload["sealed_secrets"] = sealed_secrets
+    if sealed_secrets_b64:
+        payload["sealed_secrets_b64"] = sealed_secrets_b64
+    return payload
 
     def tokenize_records(
         self,

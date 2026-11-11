@@ -70,7 +70,7 @@ class ClusterScheduler:
         Enforces geographic data sovereignty and low-latency (<15ms RTT) constraints.
         """
         excluded = set(exclude_worker_ids or [])
-        total_vram_gb = round(float(worker.gpu_memory_gb or 8.0), 2)
+        total_vram_gb = round(float(getattr(worker, "collective_vram_gb", None) or worker.gpu_memory_gb or 8.0), 2)
         alloc_pct = int(worker.vram_allocation_pct if worker.vram_allocation_pct is not None else 80)
         allocated_vram_gb = round(total_vram_gb * (alloc_pct / 100.0), 2)
         used_vram_gb = round(float(worker.vram_used_gb or 0.0), 2)
@@ -91,9 +91,11 @@ class ClusterScheduler:
 
         # Task compatibility check
         task_norm = (task_type or "").lower().strip()
+        is_training_task = task_norm in ("training", "distributed_training")
+        training_ready = getattr(worker, "training_ready", True) is not False
         task_supported = True
         if supported_tasks and task_norm:
-            if task_norm in ("training", "distributed_training"):
+            if is_training_task:
                 task_supported = any(t in supported_tasks for t in ("training", "distributed_training"))
             elif task_norm in ("inference", "batch_inference", "single_inference", "dataset_validation"):
                 task_supported = any(t in supported_tasks for t in ("inference", "batch_inference", "single_inference", "dataset_validation"))
@@ -113,12 +115,15 @@ class ClusterScheduler:
         elif work_capacity_state == "restricted_pause":
             eligible = False
             disqualification_reason = "Worker is in restricted pause mode (gaming/fullscreen 3D activity active)"
-        elif task_type and task_type.lower() in ("training", "distributed_training") and work_capacity_state == "stealth_regulated":
+        elif is_training_task and work_capacity_state == "stealth_regulated":
             eligible = False
             disqualification_reason = (
                 "Stealth regulated worker excluded from synchronous distributed training "
                 "to prevent Ring All-Reduce straggler delays"
             )
+        elif is_training_task and not training_ready:
+            eligible = False
+            disqualification_reason = "Worker missing required PyTorch/PEFT training dependencies"
         elif not task_supported:
             eligible = False
             disqualification_reason = f"Architecture '{arch}' does not support task type '{task_type}'"
@@ -126,6 +131,12 @@ class ClusterScheduler:
             eligible = False
             disqualification_reason = (
                 f"Allocated VRAM ceiling ({allocated_vram_gb} GB at {alloc_pct}% limit) "
+                f"is below task requirement ({required_vram_gb} GB)"
+            )
+        elif available_headroom_gb < required_vram_gb:
+            eligible = False
+            disqualification_reason = (
+                f"Available VRAM headroom ({available_headroom_gb} GB) "
                 f"is below task requirement ({required_vram_gb} GB)"
             )
         elif enforce_region and worker_region.lower() != enforce_region.strip().lower():
@@ -220,7 +231,7 @@ class ClusterScheduler:
     def select_optimal_workers(
         self,
         db: Session,
-        required_vram_gb: float = 2.0,
+        required_vram_gb: Optional[float] = 2.0,
         num_gpus: int = 1,
         task_type: str = "training",
         exclude_worker_ids: Optional[List[str]] = None,
@@ -229,13 +240,45 @@ class ClusterScheduler:
         max_latency_ms: Optional[float] = None,
         topology_aware: bool = False,
         record_dispatch: bool = True,
+        model_id: Optional[str] = None,
+        train_type: str = "lora",
+        batch_size: int = 4,
+        max_seq_length: int = 512,
+        lora_r: int = 16,
+        metadata_json: Optional[str] = None,
+        require_active_tunnel: bool = False,
     ) -> Dict[str, Any]:
         """
         Rank all registered worker nodes and select the top `num_gpus` eligible candidates,
-        taking into account geographic region constraints and low-latency sub-networks.
+        taking into account geographic region constraints, dynamic VRAM requirement formulas,
+        and low-latency sub-networks.
         """
+        if model_id:
+            try:
+                from app.vram_estimator import estimate_required_vram_gb
+                est_vram = estimate_required_vram_gb(
+                    model_id=model_id,
+                    train_type=train_type,
+                    batch_size=batch_size,
+                    max_seq_length=max_seq_length,
+                    lora_r=lora_r,
+                    metadata_json=metadata_json,
+                )
+                if required_vram_gb is None or required_vram_gb == 2.0:
+                    required_vram_gb = est_vram
+                else:
+                    required_vram_gb = max(required_vram_gb, est_vram)
+            except Exception as e:
+                logger.warning(f"Failed to calculate dynamic VRAM estimation: {e}")
+
+        if required_vram_gb is None:
+            required_vram_gb = 2.0
+
         try:
-            from app.cluster_worker_router import sync_primary_local_worker
+            from sqlalchemy.orm import Session as _SqlaSession
+            from app.cluster_worker_router import reap_stale_workers_and_tasks, sync_primary_local_worker
+            if isinstance(db, _SqlaSession):
+                reap_stale_workers_and_tasks(db)
             sync_primary_local_worker(db)
         except Exception:
             pass
@@ -257,6 +300,22 @@ class ClusterScheduler:
             )
             for w in all_workers
         ]
+
+        if require_active_tunnel:
+            try:
+                from app.cluster_worker_router import (
+                    is_worker_tunnel_v2_online_anywhere,
+                    is_worker_tunnel_online_anywhere,
+                )
+                for cand in evaluated:
+                    if cand["eligible"]:
+                        wid = cand["worker_id"]
+                        if not (is_worker_tunnel_v2_online_anywhere(wid) or is_worker_tunnel_online_anywhere(wid)):
+                            cand["eligible"] = False
+                            cand["score"] = 0.0
+                            cand["disqualification_reason"] = "Worker WebSocket compute tunnel is not active"
+            except Exception:
+                pass
 
         eligible_candidates = sorted(
             [c for c in evaluated if c["eligible"]],
@@ -395,6 +454,7 @@ class ClusterScheduler:
             "total_slices": int(task_obj.total_slices or 1) if task_obj else 1,
             "resume_slice_index": (int(task_obj.completed_slices or 0) + 1) if task_obj else 1,
             "last_checkpoint_url": getattr(task_obj, "last_checkpoint_url", None) if task_obj else None,
+            "has_real_standby": bool(standby_workers),
             "status": "rerouted",
             "timestamp": datetime.utcnow().isoformat(),
         }

@@ -745,63 +745,81 @@ def execute_training_job(*args, **kwargs):
 
         allow_server_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
         participating_workers: List[str] = []
+        from app.cluster_worker_router import (
+            get_eligible_training_workers,
+            is_worker_tunnel_v2_online_anywhere,
+            is_worker_tunnel_online_anywhere,
+            dispatch_job_cancel,
+            _get_redis_client,
+        )
+        from app.vram_estimator import estimate_required_vram_gb
+        from app.training_engine import training_engine, build_training_dispatch_payload
+
+        batch_size = int(hyperparams.get("batch_size", 4) or 4)
+        lora_r = int(hyperparams.get("lora_r", 16) or 16)
+        est_vram = estimate_required_vram_gb(
+            model_id=job.base_model,
+            train_type=job.train_type,
+            batch_size=batch_size,
+            lora_r=lora_r,
+            metadata_json=job.hyperparameters,
+        )
 
         if hyperparams.get("worker_ids"):
             requested_ids = list(hyperparams.get("worker_ids"))
-            active_requested = [
-                w.id
-                for w in db.query(Worker).filter(
-                    Worker.id.in_(requested_ids),
-                    Worker.status.in_(["online", "busy"]),
-                    Worker.is_available == True,
-                ).all()
-            ]
-            participating_workers = active_requested
+            eligible_requested = get_eligible_training_workers(
+                db, requested_worker_ids=requested_ids, require_tunnel=False
+            )
+            participating_workers = [w.id for w in eligible_requested]
             if not participating_workers and not allow_server_fallback:
-                # Re-check whether any other active worker came online
-                from app.cluster_worker_router import get_eligible_training_workers
                 eligible_any = get_eligible_training_workers(db)
                 participating_workers = [w.id for w in eligible_any[:max(1, num_gpus)]]
         elif num_gpus >= 2:
             from app.distributed_training_engine import distributed_training_engine
-            target_workers = distributed_training_engine.resolve_worker_fleet(db, num_gpus=max(2, num_gpus))
+            target_workers = distributed_training_engine.resolve_worker_fleet(
+                db,
+                num_gpus=max(2, num_gpus),
+                required_vram_gb=est_vram,
+                base_model_id=job.base_model,
+                train_type=job.train_type,
+                batch_size=batch_size,
+                lora_r=lora_r,
+                require_active_tunnel=not allow_server_fallback,
+            )
             participating_workers = list(target_workers)
         else:
             from app.scheduler import cluster_scheduler
             sched_res = cluster_scheduler.select_optimal_workers(
                 db=db,
-                required_vram_gb=2.0,
+                required_vram_gb=est_vram,
                 num_gpus=1,
                 task_type="training",
                 record_dispatch=False,
+                model_id=job.base_model,
+                train_type=job.train_type,
+                batch_size=batch_size,
+                lora_r=lora_r,
+                metadata_json=job.hyperparameters,
+                require_active_tunnel=not allow_server_fallback,
             )
             selected_ids = sched_res.get("selected_worker_ids", [])
             if selected_ids:
                 participating_workers = [selected_ids[0]]
             else:
-                active_w = db.query(Worker).filter(
-                    Worker.status.in_(["online", "busy"]),
-                    Worker.is_available == True,
-                ).first()
-                if active_w:
-                    participating_workers = [active_w.id]
+                eligible_any = get_eligible_training_workers(
+                    db, require_tunnel=not allow_server_fallback
+                )
+                if eligible_any:
+                    participating_workers = [eligible_any[0].id]
 
         if not allow_server_fallback and participating_workers:
-            from app.cluster_worker_router import (
-                is_worker_tunnel_v2_online_anywhere,
-                is_worker_tunnel_online_anywhere,
-                get_eligible_training_workers,
-            )
             tunnel_workers = [
                 wid for wid in participating_workers
                 if is_worker_tunnel_v2_online_anywhere(wid) or is_worker_tunnel_online_anywhere(wid)
             ]
             if not tunnel_workers:
-                all_elig = get_eligible_training_workers(db)
-                tunnel_workers = [
-                    w.id for w in all_elig
-                    if is_worker_tunnel_v2_online_anywhere(w.id) or is_worker_tunnel_online_anywhere(w.id)
-                ]
+                all_elig = get_eligible_training_workers(db, require_tunnel=True)
+                tunnel_workers = [w.id for w in all_elig]
             participating_workers = tunnel_workers[:max(1, num_gpus)]
 
         if not participating_workers:
@@ -859,8 +877,24 @@ def execute_training_job(*args, **kwargs):
 
         # Save required job properties before releasing session
         target_base_model = job.base_model
+        target_train_type = (job.train_type or "lora").strip().lower()
+        target_storage_retention = (getattr(job, "storage_retention", None) or "zero_retention").strip().lower()
         target_dataset_s3_url = job.dataset_s3_url
         target_parallelism = job.parallelism
+
+        job_sealed_secrets = hyperparams.get("sealed_secrets")
+        job_sealed_secrets_b64 = hyperparams.get("sealed_secrets_b64")
+        r_sec = _get_redis_client()
+        if r_sec is not None:
+            try:
+                sec_raw = r_sec.get(f"nebula:sealed_secrets:{job_id}")
+                if sec_raw:
+                    r_sec.delete(f"nebula:sealed_secrets:{job_id}")
+                    sec_obj = json.loads(sec_raw)
+                    job_sealed_secrets = sec_obj.get("sealed_secrets") or job_sealed_secrets
+                    job_sealed_secrets_b64 = sec_obj.get("sealed_secrets_b64") or job_sealed_secrets_b64
+            except Exception:
+                pass
 
         # Release main session before long-running PyTorch training to prevent idle-in-transaction timeout
         db.close()
@@ -912,7 +946,7 @@ def execute_training_job(*args, **kwargs):
             db_ep = SessionLocal()
             try:
                 ep_job = db_ep.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-                if ep_job:
+                if ep_job and ep_job.status not in ("failed", "cancelled", "completed"):
                     ep_job.current_epoch = epoch
                     ep_job.loss_history = json.dumps(loss_history)
                     ep_job.checkpoints = json.dumps(checkpoints_list)
@@ -924,29 +958,25 @@ def execute_training_job(*args, **kwargs):
                 db_ep.close()
 
         try:
-            if num_gpus >= 2 or hyperparams.get("distributed_mode"):
+            if (num_gpus >= 2 or hyperparams.get("distributed_mode")) and len(participating_workers) >= 2:
                 from app.distributed_training_engine import distributed_training_engine
-                db_d = SessionLocal()
-                try:
-                    target_workers = hyperparams.get("worker_ids") or distributed_training_engine.resolve_worker_fleet(
-                        db_d, num_gpus=max(2, num_gpus)
-                    )
-                    participating_workers = list(target_workers)
-                finally:
-                    db_d.close()
-
+                target_workers = list(participating_workers)
                 train_res = distributed_training_engine.train_distributed_job(
                     job_id=job_id,
                     base_model_id=target_base_model,
-                    worker_ids=participating_workers,
+                    worker_ids=target_workers,
                     dataset_s3_url=target_dataset_s3_url,
                     total_epochs=total_epochs,
                     lr=float(hyperparams.get("learning_rate", 1e-4)),
-                    lora_r=int(hyperparams.get("lora_r", 16)),
+                    lora_r=lora_r,
                     lora_alpha=int(hyperparams.get("lora_alpha", 32)),
                     parallelism=target_parallelism or "data_parallel",
                     check_cancelled_fn=is_cancelled,
                     on_epoch_complete=on_epoch,
+                    train_type=target_train_type,
+                    sealed_secrets=job_sealed_secrets,
+                    sealed_secrets_b64=job_sealed_secrets_b64,
+                    storage_retention=target_storage_retention,
                 )
                 if train_res.get("status") == "cancelled":
                     return {"status": "cancelled", "job_id": job_id}
@@ -967,42 +997,43 @@ def execute_training_job(*args, **kwargs):
                         db_dt.close()
             else:
                 target_wid = participating_workers[0] if participating_workers else None
-                from app.cluster_worker_router import (
-                    is_worker_tunnel_v2_online_anywhere,
-                    is_worker_tunnel_online_anywhere,
-                    _get_redis_client,
-                )
-                r_client = _get_redis_client()
                 if (
                     target_wid
                     and (is_worker_tunnel_v2_online_anywhere(target_wid) or is_worker_tunnel_online_anywhere(target_wid))
-                    and r_client is not None
+                    and r_sec is not None
                 ):
-                    from app.training_engine import training_engine
-                    records = training_engine.prepare_gpu_training_records(target_dataset_s3_url, min_records=64)
-                    dispatch_payload = {
-                        "type": "job_dispatch",
-                        "job_type": "training",
-                        "job_id": job_id,
-                        "worker_id": target_wid,
-                        "base_model_id": target_base_model,
-                        "dataset_s3_url": target_dataset_s3_url,
-                        "total_epochs": total_epochs,
-                        "lr": float(hyperparams.get("learning_rate", 1e-4)),
-                        "lora_r": int(hyperparams.get("lora_r", 16)),
-                        "lora_alpha": int(hyperparams.get("lora_alpha", 32)),
-                        "records": records if len(records) <= 500 else None,
-                    }
+                    r_client = r_sec
+                    records = training_engine.prepare_gpu_training_records(
+                        target_dataset_s3_url, min_records=64, job_id=job_id
+                    )
+                    dispatch_payload = build_training_dispatch_payload(
+                        job_id=job_id,
+                        worker_id=target_wid,
+                        base_model_id=target_base_model,
+                        dataset_s3_url=target_dataset_s3_url,
+                        total_epochs=total_epochs,
+                        train_type=target_train_type,
+                        lr=float(hyperparams.get("learning_rate", 1e-4)),
+                        lora_r=lora_r,
+                        lora_alpha=int(hyperparams.get("lora_alpha", 32)),
+                        records=records,
+                        storage_retention=target_storage_retention,
+                        sealed_secrets=job_sealed_secrets,
+                        sealed_secrets_b64=job_sealed_secrets_b64,
+                        shard_index=0,
+                        shard_count=1,
+                    )
                     result_key = f"nebula:training_result:{job_id}"
                     r_client.delete(result_key)
                     r_client.rpush("nebula:tunnel:dispatch", json.dumps(dispatch_payload))
-                    print(f"[WORKER] Dispatched REAL LoRA training {job_id} to remote GPU worker '{target_wid}' via tunnel.")
+                    print(f"[WORKER] Dispatched REAL {target_train_type.upper()} training {job_id} to remote GPU worker '{target_wid}' via tunnel.")
 
                     train_res = None
                     wait_start = time.time()
                     last_online_seen = wait_start
                     while time.time() - wait_start < 3600:
                         if is_cancelled():
+                            dispatch_job_cancel(job_id, [target_wid], reason="user_cancelled")
                             return {"status": "cancelled", "job_id": job_id}
                         popped = r_client.blpop(result_key, timeout=2)
                         if popped:
@@ -1011,6 +1042,7 @@ def execute_training_job(*args, **kwargs):
                         if is_worker_tunnel_v2_online_anywhere(target_wid) or is_worker_tunnel_online_anywhere(target_wid):
                             last_online_seen = time.time()
                         elif time.time() - last_online_seen > 25.0:
+                            dispatch_job_cancel(job_id, [target_wid], reason="tunnel_timeout")
                             raise RuntimeError(f"Remote GPU worker '{target_wid}' tunnel disconnected during training.")
 
                     if train_res is None:
@@ -1057,10 +1089,11 @@ def execute_training_job(*args, **kwargs):
                     final_adapter_url = train_res.get("final_adapter_url")
         except Exception as e:
             print(f"[WORKER] Real PyTorch training engine failed: {e}")
+            dispatch_job_cancel(job_id, participating_workers, reason="job_failed")
             db_fail = SessionLocal()
             try:
                 fail_job = db_fail.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-                if fail_job:
+                if fail_job and fail_job.status != "cancelled":
                     fail_job.status = "failed"
                     fail_job.loss_history = json.dumps([{
                         "epoch": 0,
@@ -1074,11 +1107,13 @@ def execute_training_job(*args, **kwargs):
                 db_fail.close()
             return {"status": "failed", "job_id": job_id, "error": str(e)}
 
-        # Mark job complete
+        # Mark job complete (guard against post-cancel/fail overwrite)
         db_fin = SessionLocal()
         try:
             fin_job = db_fin.query(TrainingJob).filter(TrainingJob.id == job_id).first()
             if fin_job:
+                if fin_job.status in ("cancelled", "failed"):
+                    return {"status": fin_job.status, "job_id": job_id}
                 fin_job.status = "completed"
                 fin_job.final_adapter_url = final_adapter_url
                 fin_job.cost = round(total_epochs * 0.125 * max(1, len(participating_workers)), 4)

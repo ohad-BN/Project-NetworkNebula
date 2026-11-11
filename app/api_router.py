@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.auth import get_user_by_email, verify_api_auth
+from app.auth import get_user_by_email, verify_api_auth, verify_enterprise_auth
 from app.database import get_db
 from app.models import (
     PayoutRequest,
@@ -127,11 +127,16 @@ def submit_task(
 @api_router.get("/tasks/{task_id}")
 def get_task_status_compat(
     task_id: str,
+    current_user: User = Depends(verify_enterprise_auth),
     db: Session = Depends(get_db),
 ):
     """Retrieve task status with lowercase statuses for React frontend"""
     task = db.query(Task).filter(Task.task_id == task_id).first()
     if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # AUD-08: Enforce authentication and verify task.user_id == current_user.id
+    if not getattr(current_user, "is_admin", False) and task.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
     status_map = {

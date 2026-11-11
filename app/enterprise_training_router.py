@@ -87,7 +87,10 @@ def dispatch_queued_training_jobs(db: Session) -> int:
 
         target_count = max(1, int(q_job.num_gpus or 1)) if eligible_for_job else 0
         if eligible_for_job:
-            hp["worker_ids"] = [w.id for w in eligible_for_job[:target_count]]
+            selected_ids = [w.id for w in eligible_for_job[:target_count]]
+            hp["worker_ids"] = selected_ids
+            hp["distributed_mode"] = len(selected_ids) >= 2
+            q_job.num_gpus = len(selected_ids)
         hp.pop("waiting_for_worker", None)
         q_job.hyperparameters = json.dumps(hp)
         db.commit()
@@ -101,6 +104,61 @@ router = APIRouter(prefix="/api/v1/training", tags=["Enterprise Training"])
 # ==============================================================================
 # Request & Response Schemas
 # ==============================================================================
+
+def _stash_sealed_secrets(
+    job_id: str,
+    sealed_secrets: Optional[Any],
+    sealed_secrets_b64: Optional[str],
+    hyperparams: Dict[str, Any],
+) -> None:
+    """
+    Hold opaque X25519-sealed ciphertext ephemerally in Redis RAM (TTL 3600s, never plaintext secrets in DB),
+    falling back to ciphertext field in hyperparameters only if Redis is unavailable.
+    """
+    if not sealed_secrets and not sealed_secrets_b64:
+        return
+    hyperparams["has_sealed_secrets"] = True
+    try:
+        from app.cluster_worker_router import _get_redis_client
+        r = _get_redis_client()
+        if r is not None:
+            r.set(
+                f"nebula:sealed_secrets:{job_id}",
+                json.dumps({
+                    "sealed_secrets": sealed_secrets,
+                    "sealed_secrets_b64": sealed_secrets_b64,
+                }),
+                ex=3600,
+            )
+            return
+    except Exception:
+        pass
+    if sealed_secrets is not None:
+        hyperparams["sealed_secrets"] = sealed_secrets
+    if sealed_secrets_b64 is not None:
+        hyperparams["sealed_secrets_b64"] = sealed_secrets_b64
+
+
+def _resolve_client_job_id(client_job_id: Optional[str]) -> str:
+    """Use validated client-supplied UUID when present (for X25519 AAD & RAM stream binding), else allocate UUID4."""
+    if client_job_id:
+        try:
+            return str(uuid.UUID(str(client_job_id).strip()))
+        except Exception:
+            pass
+    return str(uuid.uuid4())
+
+
+def _infer_data_source_type(dataset_url: Optional[str], explicit_source: Optional[str] = None) -> str:
+    if explicit_source:
+        return explicit_source.strip().lower()
+    url = str(dataset_url or "").strip().lower()
+    if url.startswith("tunnel_stream://"):
+        return "tunnel_stream"
+    if url.startswith("r2://") or "r2.cloudflarestorage" in url:
+        return "byos_s3"
+    return "s3_url"
+
 
 class HyperparametersSchema(BaseModel):
     learning_rate: float = Field(default=2e-4, description="Optimizer learning rate")
@@ -120,9 +178,16 @@ class CreateTrainingJobRequest(BaseModel):
     parallelism: str = Field(default="data_parallel", description="Parallelism strategy: data_parallel, fsdp, tensor_parallel")
     num_gpus: int = Field(default=1, ge=1, le=128, description="Target GPU count")
     worker_ids: Optional[List[str]] = Field(default=None, description="Optional worker node IDs override (auto-routed if omitted)")
-    dataset_s3_url: str = Field(..., description="MinIO/S3 URI to training dataset (jsonl)")
+    dataset_s3_url: str = Field(..., description="MinIO/S3 URI or tunnel_stream:// RAM reference")
     hyperparameters: Optional[Dict[str, Any]] = Field(default=None, description="Custom hyperparameter overrides")
     total_epochs: Optional[int] = Field(default=3, ge=1, le=100, description="Total training epochs")
+    storage_retention: Optional[str] = Field(default="zero_retention", description="zero_retention or byos")
+    privacy_mode: Optional[str] = Field(default="encrypted_staked_mesh", description="Confidential training mesh mode")
+    data_source_type: Optional[str] = Field(default=None, description="tunnel_stream, byos_s3, or s3_url")
+    sealed_secrets: Optional[Any] = Field(default=None, description="X25519-sealed secret envelope ciphertext")
+    sealed_secrets_b64: Optional[str] = Field(default=None, description="Base64-encoded X25519-sealed secret envelope")
+    strict_worker_count: bool = Field(default=False, description="Require exact num_gpus instead of scaling down to available GPUs")
+    client_job_id: Optional[str] = Field(default=None, description="Optional client-preallocated UUID to align X25519 AAD and WS RAM stream")
 
 
 class CreateDistributedTrainingJobRequest(BaseModel):
@@ -138,6 +203,13 @@ class CreateDistributedTrainingJobRequest(BaseModel):
     sync_execution: bool = Field(default=False, description="Execute distributed training synchronously in-request if true")
     enforce_region: Optional[str] = Field(default=None, description="Strict geographic data sovereignty boundary, e.g. eu-central or us-east")
     max_rtt_ms: Optional[float] = Field(default=None, description="Maximum inter-node latency RTT threshold for all-reduce group")
+    storage_retention: Optional[str] = Field(default="zero_retention", description="zero_retention or byos")
+    privacy_mode: Optional[str] = Field(default="encrypted_staked_mesh", description="Confidential training mesh mode")
+    data_source_type: Optional[str] = Field(default=None, description="tunnel_stream, byos_s3, or s3_url")
+    sealed_secrets: Optional[Any] = Field(default=None, description="X25519-sealed secret envelope ciphertext")
+    sealed_secrets_b64: Optional[str] = Field(default=None, description="Base64-encoded X25519-sealed secret envelope")
+    strict_worker_count: bool = Field(default=False, description="Require exact num_gpus instead of scaling down to available GPUs")
+    client_job_id: Optional[str] = Field(default=None, description="Optional client-preallocated UUID to align X25519 AAD and WS RAM stream")
 
 
 class DatasetUploadUrlRequest(BaseModel):
@@ -224,6 +296,9 @@ def format_job_response(job: TrainingJob) -> Dict[str, Any]:
         "worker_ids": parsed_hyperparams.get("worker_ids", []),
         "distributed_telemetry": parsed_hyperparams.get("distributed_telemetry"),
         "dataset_s3_url": job.dataset_s3_url,
+        "privacy_mode": getattr(job, "privacy_mode", "encrypted_staked_mesh"),
+        "data_source_type": getattr(job, "data_source_type", "tunnel_stream"),
+        "storage_retention": getattr(job, "storage_retention", "zero_retention"),
         "hyperparameters": parsed_hyperparams,
         "status": job.status,
         "current_epoch": job.current_epoch,
@@ -282,32 +357,70 @@ def submit_training_job(
     Submit a new distributed model training / PEFT fine-tuning run.
     Validates dataset URI, registers database record, and enqueues task on Celery cluster.
     """
-    job_id = str(uuid.uuid4())
+    job_id = _resolve_client_job_id(payload.client_job_id)
+    if db.query(TrainingJob).filter(TrainingJob.id == job_id).first():
+        job_id = str(uuid.uuid4())
     job_name = payload.name or f"{payload.base_model.split('/')[-1]}-{payload.train_type.upper()}-{job_id[:6]}"
 
     # Extract or format hyperparameters
-    from app.cluster_worker_router import get_eligible_training_workers
+    from app.cluster_worker_router import get_eligible_training_workers, is_worker_training_capable
+    from app.models import Worker
+    from app.vram_estimator import estimate_required_vram_gb
 
-    hyperparams = payload.hyperparameters or {}
+    hyperparams = dict(payload.hyperparameters or {})
     epochs = payload.total_epochs or hyperparams.get("epochs", 3)
     allow_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
+    batch_size = int(hyperparams.get("batch_size", 4) or 4)
+    lora_r = int(hyperparams.get("lora_r", 16) or 16)
+    meta_json = json.dumps(hyperparams)
+    est_vram = estimate_required_vram_gb(
+        model_id=payload.base_model,
+        train_type=payload.train_type,
+        batch_size=batch_size,
+        lora_r=lora_r,
+        metadata_json=meta_json,
+    )
+
     eligible_workers = get_eligible_training_workers(db, requested_worker_ids=payload.worker_ids)
+    effective_num_gpus = payload.num_gpus
 
     if payload.worker_ids:
-        hyperparams["worker_ids"] = payload.worker_ids
+        explicit_rows = db.query(Worker).filter(Worker.id.in_(payload.worker_ids)).all()
+        if explicit_rows and not eligible_workers:
+            _, bad_reason = is_worker_training_capable(explicit_rows[0])
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Requested worker(s) {payload.worker_ids} cannot run training: {bad_reason}",
+            )
+        hyperparams["worker_ids"] = [w.id for w in eligible_workers] if eligible_workers else payload.worker_ids
     elif payload.num_gpus >= 2:
         from app.distributed_training_engine import distributed_training_engine
-        worker_ids = distributed_training_engine.resolve_worker_fleet(db, num_gpus=payload.num_gpus)
-        hyperparams["distributed_mode"] = True
+        worker_ids = distributed_training_engine.resolve_worker_fleet(
+            db,
+            num_gpus=payload.num_gpus,
+            required_vram_gb=est_vram,
+            base_model_id=payload.base_model,
+            train_type=payload.train_type,
+            batch_size=batch_size,
+            lora_r=lora_r,
+            strict_worker_count=payload.strict_worker_count,
+        )
+        effective_num_gpus = max(1, len(worker_ids)) if (worker_ids and not payload.strict_worker_count) else payload.num_gpus
+        hyperparams["distributed_mode"] = len(worker_ids) >= 2
         hyperparams["worker_ids"] = worker_ids
     else:
         from app.scheduler import cluster_scheduler
         sched_res = cluster_scheduler.select_optimal_workers(
             db=db,
-            required_vram_gb=2.0,
+            required_vram_gb=est_vram,
             num_gpus=1,
             task_type="training",
             record_dispatch=True,
+            model_id=payload.base_model,
+            train_type=payload.train_type,
+            batch_size=batch_size,
+            lora_r=lora_r,
+            metadata_json=meta_json,
         )
         selected_ids = sched_res.get("selected_worker_ids", [])
         if selected_ids:
@@ -319,6 +432,8 @@ def submit_training_job(
     if not should_dispatch:
         hyperparams["waiting_for_worker"] = True
 
+    _stash_sealed_secrets(job_id, payload.sealed_secrets, payload.sealed_secrets_b64, hyperparams)
+
     new_job = TrainingJob(
         id=job_id,
         user_id=current_user.id,
@@ -326,8 +441,12 @@ def submit_training_job(
         base_model=payload.base_model,
         train_type=payload.train_type,
         parallelism=payload.parallelism,
-        num_gpus=payload.num_gpus,
+        num_gpus=effective_num_gpus,
         dataset_s3_url=payload.dataset_s3_url,
+        privacy_mode=payload.privacy_mode or "encrypted_staked_mesh",
+        data_source_type=_infer_data_source_type(payload.dataset_s3_url, payload.data_source_type),
+        storage_retention=payload.storage_retention or "zero_retention",
+        required_vram_gb=est_vram,
         hyperparameters=json.dumps(hyperparams),
         status="queued",
         current_epoch=0,
@@ -359,12 +478,26 @@ def submit_distributed_training_job(
     gradient aggregation and dataset batch sharding across registered GPU workers.
     """
     from app.distributed_training_engine import distributed_training_engine
-    from app.cluster_worker_router import get_eligible_training_workers
+    from app.cluster_worker_router import get_eligible_training_workers, is_worker_training_capable
+    from app.vram_estimator import estimate_required_vram_gb
 
-    job_id = str(uuid.uuid4())
+    job_id = _resolve_client_job_id(payload.client_job_id)
+    if db.query(TrainingJob).filter(TrainingJob.id == job_id).first():
+        job_id = str(uuid.uuid4())
     job_name = payload.name or f"Dist-{payload.base_model.split('/')[-1]}-{payload.num_gpus}GPU-{job_id[:6]}"
 
-    worker_ids = payload.worker_ids
+    hyperparams = dict(payload.hyperparameters or {})
+    batch_size = int(hyperparams.get("batch_size", 4) or 4)
+    lora_r = int(hyperparams.get("lora_r", 16) or 16)
+    est_vram = estimate_required_vram_gb(
+        model_id=payload.base_model,
+        train_type=payload.train_type,
+        batch_size=batch_size,
+        lora_r=lora_r,
+        metadata_json=json.dumps(hyperparams),
+    )
+
+    worker_ids = list(payload.worker_ids) if payload.worker_ids else None
     if payload.enforce_region and worker_ids:
         from app.models import Worker
         non_compliant = (
@@ -386,14 +519,31 @@ def submit_distributed_training_job(
             )
 
     eligible_workers = get_eligible_training_workers(db, requested_worker_ids=worker_ids)
+    if worker_ids:
+        from app.models import Worker
+        explicit_rows = db.query(Worker).filter(Worker.id.in_(worker_ids)).all()
+        if explicit_rows and not eligible_workers:
+            _, bad_reason = is_worker_training_capable(explicit_rows[0])
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Requested worker(s) {worker_ids} cannot run training: {bad_reason}",
+            )
+        worker_ids = [w.id for w in eligible_workers] if eligible_workers else worker_ids
+
     allow_fallback = os.getenv("ALLOW_SERVER_CPU_TRAINING_FALLBACK", "false").lower() in ("1", "true", "yes")
 
     if not worker_ids or len(worker_ids) < payload.num_gpus:
         resolved = distributed_training_engine.resolve_worker_fleet(
             db,
             num_gpus=payload.num_gpus,
+            required_vram_gb=est_vram,
             enforce_region=payload.enforce_region,
             max_latency_ms=payload.max_rtt_ms,
+            base_model_id=payload.base_model,
+            train_type=payload.train_type,
+            batch_size=batch_size,
+            lora_r=lora_r,
+            strict_worker_count=payload.strict_worker_count,
         )
         if worker_ids:
             for r_id in resolved:
@@ -403,11 +553,10 @@ def submit_distributed_training_job(
             worker_ids = resolved
 
     worker_ids = worker_ids[:payload.num_gpus] if worker_ids else []
-    should_dispatch = bool(eligible_workers) or allow_fallback
+    should_dispatch = bool(eligible_workers and (worker_ids or allow_fallback)) or allow_fallback
 
-    hyperparams = dict(payload.hyperparameters or {})
     epochs = payload.total_epochs or hyperparams.get("epochs", 2)
-    hyperparams["distributed_mode"] = True
+    hyperparams["distributed_mode"] = len(worker_ids) >= 2
     hyperparams["worker_ids"] = worker_ids
     hyperparams["allreduce_protocol"] = "ring_allreduce_float32"
     if not should_dispatch:
@@ -417,6 +566,10 @@ def submit_distributed_training_job(
     if payload.max_rtt_ms is not None:
         hyperparams["max_rtt_ms"] = payload.max_rtt_ms
 
+    _stash_sealed_secrets(job_id, payload.sealed_secrets, payload.sealed_secrets_b64, hyperparams)
+
+    effective_num_gpus = max(1, len(worker_ids)) if (worker_ids and not payload.strict_worker_count) else payload.num_gpus
+    effective_ds_url = payload.dataset_s3_url or "s3://nebula-datasets/default_distributed.jsonl"
     new_job = TrainingJob(
         id=job_id,
         user_id=current_user.id,
@@ -424,8 +577,12 @@ def submit_distributed_training_job(
         base_model=payload.base_model,
         train_type=payload.train_type,
         parallelism=payload.parallelism,
-        num_gpus=max(len(worker_ids), payload.num_gpus),
-        dataset_s3_url=payload.dataset_s3_url or "s3://nebula-datasets/default_distributed.jsonl",
+        num_gpus=effective_num_gpus,
+        dataset_s3_url=effective_ds_url,
+        privacy_mode=payload.privacy_mode or "encrypted_staked_mesh",
+        data_source_type=_infer_data_source_type(effective_ds_url, payload.data_source_type),
+        storage_retention=payload.storage_retention or "zero_retention",
+        required_vram_gb=est_vram,
         hyperparameters=json.dumps(hyperparams),
         status="queued",
         current_epoch=0,
@@ -462,7 +619,10 @@ def get_distributed_job_shards(
     """
     from app.distributed_training_engine import distributed_training_engine
 
-    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.user_id == current_user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail=f"Distributed training job {job_id} not found")
 
@@ -526,7 +686,10 @@ def get_training_job(
     db: Session = Depends(get_db),
 ):
     """Retrieve full status, loss descent history, and epoch progress for a training job."""
-    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.user_id == current_user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
     return format_job_response(job)
@@ -539,7 +702,10 @@ def get_training_checkpoints(
     db: Session = Depends(get_db),
 ):
     """Retrieve download links and metadata for all checkpoints saved during training."""
-    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.user_id == current_user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
 
@@ -558,7 +724,10 @@ def cancel_training_job(
     db: Session = Depends(get_db),
 ):
     """Cancel a queued or currently executing training run."""
-    job = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    job = db.query(TrainingJob).filter(
+        TrainingJob.id == job_id,
+        TrainingJob.user_id == current_user.id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
 
@@ -571,17 +740,28 @@ def cancel_training_job(
     job.status = "cancelled"
     job.completed_at = datetime.now(timezone.utc)
 
-    # Release any worker nodes bound to this cancelled job
+    # Release any worker nodes bound to this cancelled job & notify via WS tunnel
     from app.models import Worker
+    from app.cluster_worker_router import dispatch_job_cancel
+    cancel_targets: List[str] = []
+    try:
+        hp = json.loads(job.hyperparameters) if job.hyperparameters else {}
+        if isinstance(hp.get("worker_ids"), list):
+            cancel_targets.extend([str(wid) for wid in hp["worker_ids"] if wid])
+    except Exception:
+        pass
+
     bound_workers = db.query(Worker).filter(
         (Worker.current_task_id == f"train-{job_id[:8]}") | (Worker.current_task_id == job_id)
     ).all()
     for w in bound_workers:
+        cancel_targets.append(w.id)
         w.current_task_id = None
         if w.is_available:
             w.status = "online"
             w.gpu_utilization_pct = 10.0
 
     db.commit()
+    dispatch_job_cancel(job_id, cancel_targets, reason="user_cancelled")
     return {"status": "cancelled", "job_id": job_id}
 

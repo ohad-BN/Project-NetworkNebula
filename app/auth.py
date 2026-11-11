@@ -1,3 +1,4 @@
+import os
 import secrets
 from typing import Optional
 from fastapi import Depends, HTTPException, Security, Request
@@ -117,9 +118,12 @@ def verify_enterprise_auth(
             return user
 
     # 4. Fallback only for automated test runners (requests / pytest / curl test suite)
+    # AUD-01: Only allow UA fallback if ALLOW_UNAUTHENTICATED_TEST_UA == "true" AND APP_ENV != "production"
+    allow_test_ua = os.getenv("ALLOW_UNAUTHENTICATED_TEST_UA", "false").lower() in ("1", "true", "yes")
+    app_env = os.getenv("APP_ENV", "development").lower()
     user_agent = request.headers.get("user-agent", "").lower()
     is_test_client = "python-requests" in user_agent or "pytest" in user_agent or "curl" in user_agent
-    if is_test_client:
+    if is_test_client and allow_test_ua and app_env != "production":
         user = db.query(User).filter(User.is_active == True).order_by(User.created_at.asc()).first()
         if user:
             return user

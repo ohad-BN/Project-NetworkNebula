@@ -57,6 +57,9 @@ export interface ClusterNodeTelemetry {
   input_idle_sec?: number;
   gpu_temp_c?: number;
   duty_cycle_pct?: number;
+  supported_task_types?: string;
+  training_ready?: boolean;
+  missing_training_packages?: string[];
 }
 
 export interface ClusterTelemetryResponse {
