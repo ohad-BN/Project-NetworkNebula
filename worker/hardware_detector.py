@@ -159,6 +159,57 @@ def probe_cpu_info() -> Dict[str, Any]:
     }
 
 
+def probe_macos_gpu_live_telemetry(total_ram_gb: float = 16.0, mps_available: bool = False) -> Tuple[float, float]:
+    """
+    Query macOS IOAccelerator PerformanceStatistics (no sudo required) and PyTorch MPS
+    allocator for real-time Apple Silicon GPU utilization (%) and Unified Memory in use (GB).
+    """
+    util_pct: Optional[float] = None
+    ioreg_used_gb = 0.0
+
+    if platform.system() == "Darwin":
+        try:
+            raw_io = _run_cmd_clean(["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"], timeout=1.2)
+            if raw_io:
+                util_candidates = []
+                for key in ("Device Utilization %", "Renderer Utilization %", "Tiler Utilization %"):
+                    for m in re.finditer(rf'"{re.escape(key)}"\s*=\s*(\d+)', raw_io):
+                        util_candidates.append(float(m.group(1)))
+                if util_candidates:
+                    util_pct = round(min(100.0, max(util_candidates)), 1)
+
+                mem_matches = re.findall(r'"In use system memory"\s*=\s*(\d+)', raw_io)
+                if mem_matches:
+                    max_bytes = max(int(v) for v in mem_matches)
+                    ioreg_used_gb = round(max_bytes / (1024**3), 2)
+        except Exception:
+            pass
+
+    torch_mps_gb = 0.0
+    if mps_available:
+        try:
+            import torch
+            if hasattr(torch, "mps"):
+                drv_bytes = int(torch.mps.driver_allocated_memory()) if hasattr(torch.mps, "driver_allocated_memory") else 0
+                cur_bytes = int(torch.mps.current_allocated_memory()) if hasattr(torch.mps, "current_allocated_memory") else 0
+                torch_mps_gb = round(max(drv_bytes, cur_bytes) / (1024**3), 2)
+        except Exception:
+            pass
+
+    vram_used = round(max(ioreg_used_gb, torch_mps_gb), 2)
+    if vram_used <= 0.0:
+        vram_used = round(total_ram_gb * 0.15, 2)
+
+    if util_pct is None:
+        if torch_mps_gb > 0.1:
+            usable = max(0.1, total_ram_gb * 0.75)
+            util_pct = round(min(100.0, (torch_mps_gb / usable) * 100.0), 1)
+        else:
+            util_pct = 0.0
+
+    return util_pct, vram_used
+
+
 def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
     """Inspect Apple Silicon (M1, M2, M3, M4 series) GPU and Unified Memory on macOS."""
     if platform.system() != "Darwin":
@@ -189,7 +240,6 @@ def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
 
     # Usable Unified Memory for Compute (75% of total system RAM)
     usable_unified_vram = round(total_ram_gb * 0.75, 2)
-    vram_used = round(total_ram_gb * 0.15, 2)
 
     # Check PyTorch MPS support
     mps_available = False
@@ -201,6 +251,8 @@ def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
             runtime_ver = f"Apple Metal MPS / PyTorch {torch.__version__.split('+')[0]}"
     except Exception:
         pass
+
+    util_pct, vram_used = probe_macos_gpu_live_telemetry(total_ram_gb, mps_available=mps_available)
 
     return {
         "gpu_model": gpu_name,
@@ -215,7 +267,7 @@ def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
         "vram_total_gb": usable_unified_vram,
         "vram_used_gb": vram_used,
         "vram_allocation_pct": 80,
-        "gpu_utilization_pct": 12.0,
+        "gpu_utilization_pct": util_pct,
         "runtime_version": runtime_ver,
         "tensor_device_str": "mps" if mps_available else "cpu",
         "gpus": [{
@@ -225,7 +277,7 @@ def probe_macos_apple_silicon() -> Optional[Dict[str, Any]]:
             "vram_allocated_gb": round(usable_unified_vram * 0.8, 2),
             "vram_used_gb": vram_used,
             "vram_allocation_pct": 80,
-            "gpu_utilization_pct": 12.0,
+            "gpu_utilization_pct": util_pct,
             "status": "online",
             "is_available": True,
         }],

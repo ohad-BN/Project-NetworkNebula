@@ -828,6 +828,9 @@ def execute_training_job(*args, **kwargs):
         from app.training_engine import training_engine, build_training_dispatch_payload
 
         batch_size = int(hyperparams.get("batch_size", 4) or 4)
+        max_seq_length = int(hyperparams.get("max_seq_length") or hyperparams.get("max_length") or 512)
+        grad_accum_steps = int(hyperparams.get("gradient_accumulation_steps", 1) or 1)
+        packing = bool(hyperparams.get("packing", False))
         lora_r = int(hyperparams.get("lora_r", 16) or 16)
         est_vram = estimate_required_vram_gb(
             model_id=job.base_model,
@@ -1058,6 +1061,10 @@ def execute_training_job(*args, **kwargs):
                     sealed_secrets=job_sealed_secrets,
                     sealed_secrets_b64=job_sealed_secrets_b64,
                     storage_retention=target_storage_retention,
+                    batch_size=batch_size,
+                    max_seq_length=max_seq_length,
+                    gradient_accumulation_steps=grad_accum_steps,
+                    packing=packing,
                 )
                 if train_res.get("status") == "cancelled":
                     return {"status": "cancelled", "job_id": job_id}
@@ -1099,6 +1106,10 @@ def execute_training_job(*args, **kwargs):
                         lr=float(hyperparams.get("learning_rate", 1e-4)),
                         lora_r=lora_r,
                         lora_alpha=int(hyperparams.get("lora_alpha", 32)),
+                        batch_size=batch_size,
+                        max_seq_length=max_seq_length,
+                        gradient_accumulation_steps=grad_accum_steps,
+                        packing=packing,
                         records=records,
                         storage_retention=target_storage_retention,
                         sealed_secrets=job_sealed_secrets,

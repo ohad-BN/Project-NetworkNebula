@@ -325,6 +325,10 @@ class DistributedTrainingEngine:
         sealed_secrets: Optional[Any] = None,
         sealed_secrets_b64: Optional[str] = None,
         storage_retention: str = "zero_retention",
+        batch_size: int = 4,
+        max_seq_length: int = 512,
+        gradient_accumulation_steps: int = 1,
+        packing: bool = False,
     ) -> Dict[str, Any]:
         """
         Execute multi-node distributed PyTorch LoRA training across `worker_ids`:
@@ -400,6 +404,10 @@ class DistributedTrainingEngine:
                     lr=lr,
                     lora_r=lora_r,
                     lora_alpha=lora_alpha,
+                    batch_size=batch_size,
+                    max_seq_length=max_seq_length,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    packing=packing,
                     records=shard_records,
                     storage_retention=storage_retention,
                     sealed_secrets=sealed_secrets,
@@ -472,6 +480,10 @@ class DistributedTrainingEngine:
                             lr=lr,
                             lora_r=lora_r,
                             lora_alpha=lora_alpha,
+                            batch_size=batch_size,
+                            max_seq_length=max_seq_length,
+                            gradient_accumulation_steps=gradient_accumulation_steps,
+                            packing=packing,
                             records=shard_recs,
                             storage_retention=storage_retention,
                             sealed_secrets=sealed_secrets,

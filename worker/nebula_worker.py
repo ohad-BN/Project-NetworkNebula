@@ -112,6 +112,206 @@ def measure_server_latency(server_url: str) -> float:
             return 15.0
 
 
+import threading
+
+_ACTIVE_COMPUTE_LOCK = threading.Lock()
+_ACTIVE_COMPUTE_TELEMETRY: Dict[str, float] = {
+    "ts": 0.0,
+    "util_pct": 0.0,
+    "vram_used_gb": 0.0,
+}
+_NVML_STATE: Dict[str, Any] = {"initialized": False, "lib": None}
+
+
+def record_active_gpu_telemetry(util_pct: float, vram_used_gb: Optional[float] = None) -> None:
+    """Record live measured GPU compute utilization and VRAM usage during active execution."""
+    now = time.monotonic()
+    clamped_util = round(min(100.0, max(0.0, float(util_pct or 0.0))), 1)
+    with _ACTIVE_COMPUTE_LOCK:
+        prev_age = now - _ACTIVE_COMPUTE_TELEMETRY["ts"]
+        if prev_age <= 12.0 and _ACTIVE_COMPUTE_TELEMETRY["util_pct"] > 0.0:
+            # Smooth rolling window across active steps so brief inter-step gaps do not drop to 0%
+            _ACTIVE_COMPUTE_TELEMETRY["util_pct"] = round(
+                max(clamped_util, _ACTIVE_COMPUTE_TELEMETRY["util_pct"] * 0.85), 1
+            )
+        else:
+            _ACTIVE_COMPUTE_TELEMETRY["util_pct"] = clamped_util
+        if vram_used_gb is not None and float(vram_used_gb) > 0.0:
+            v_gb = round(float(vram_used_gb), 2)
+            if prev_age <= 12.0:
+                _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"] = max(v_gb, _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"])
+            else:
+                _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"] = v_gb
+        _ACTIVE_COMPUTE_TELEMETRY["ts"] = now
+
+
+def clear_active_gpu_telemetry() -> None:
+    """Clear active compute telemetry immediately when a job completes or is cancelled."""
+    with _ACTIVE_COMPUTE_LOCK:
+        _ACTIVE_COMPUTE_TELEMETRY["ts"] = 0.0
+        _ACTIVE_COMPUTE_TELEMETRY["util_pct"] = 0.0
+        _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"] = 0.0
+
+
+def get_active_gpu_telemetry(max_age_sec: float = 20.0) -> Tuple[Optional[float], Optional[float]]:
+    """Return (util_pct, vram_used_gb) if recorded within max_age_sec of an active compute step."""
+    with _ACTIVE_COMPUTE_LOCK:
+        ts = _ACTIVE_COMPUTE_TELEMETRY["ts"]
+        if ts > 0.0 and (time.monotonic() - ts) <= max_age_sec:
+            return _ACTIVE_COMPUTE_TELEMETRY["util_pct"], _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"]
+    return None, None
+
+
+def _probe_nvml_fast(dev_idx: int = 0) -> Optional[Tuple[float, float]]:
+    """Query NVML directly in-process via ctypes (<1ms) for (util_pct, vram_used_gb)."""
+    try:
+        import ctypes
+        if not _NVML_STATE["initialized"]:
+            _NVML_STATE["initialized"] = True
+            for lib_name in ("nvml.dll", "libnvidia-ml.so.1", "libnvidia-ml.so"):
+                try:
+                    lib = ctypes.CDLL(lib_name)
+                    if lib.nvmlInit_v2() == 0:
+                        _NVML_STATE["lib"] = lib
+                        break
+                except Exception:
+                    continue
+        lib = _NVML_STATE["lib"]
+        if lib is None:
+            return None
+        handle = ctypes.c_void_p()
+        if lib.nvmlDeviceGetHandleByIndex_v2(int(dev_idx), ctypes.byref(handle)) != 0:
+            return None
+
+        class _NvmlUtil(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        class _NvmlMem(ctypes.Structure):
+            _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+        u = _NvmlUtil()
+        m = _NvmlMem()
+        u_rc = lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(u))
+        m_rc = lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(m))
+        if u_rc == 0 and m_rc == 0:
+            return round(float(u.gpu), 1), round(float(m.used) / (1024**3), 2)
+    except Exception:
+        pass
+    return None
+
+
+def _probe_macos_gpu_live_standalone(total_ram_gb: float = 16.0, mps_available: bool = False) -> Tuple[float, float]:
+    """
+    Query macOS IOAccelerator PerformanceStatistics (no sudo required) and PyTorch MPS
+    allocator for real-time Apple Silicon GPU utilization (%) and Unified Memory in use (GB).
+    """
+    util_pct: Optional[float] = None
+    ioreg_used_gb = 0.0
+
+    if platform.system() == "Darwin":
+        try:
+            import re
+            import subprocess
+            raw_io = subprocess.check_output(
+                ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+                timeout=1.2,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="ignore")
+            if raw_io:
+                util_candidates = []
+                for key in ("Device Utilization %", "Renderer Utilization %", "Tiler Utilization %"):
+                    for m in re.finditer(rf'"{re.escape(key)}"\s*=\s*(\d+)', raw_io):
+                        util_candidates.append(float(m.group(1)))
+                if util_candidates:
+                    util_pct = round(min(100.0, max(util_candidates)), 1)
+
+                mem_matches = re.findall(r'"In use system memory"\s*=\s*(\d+)', raw_io)
+                if mem_matches:
+                    max_bytes = max(int(v) for v in mem_matches)
+                    ioreg_used_gb = round(max_bytes / (1024**3), 2)
+        except Exception:
+            pass
+
+    torch_mps_gb = 0.0
+    if mps_available:
+        try:
+            import torch
+            if hasattr(torch, "mps"):
+                drv_bytes = int(torch.mps.driver_allocated_memory()) if hasattr(torch.mps, "driver_allocated_memory") else 0
+                cur_bytes = int(torch.mps.current_allocated_memory()) if hasattr(torch.mps, "current_allocated_memory") else 0
+                torch_mps_gb = round(max(drv_bytes, cur_bytes) / (1024**3), 2)
+        except Exception:
+            pass
+
+    vram_used = round(max(ioreg_used_gb, torch_mps_gb), 2)
+    if vram_used <= 0.0:
+        vram_used = round(total_ram_gb * 0.15, 2)
+
+    if util_pct is None:
+        if torch_mps_gb > 0.1:
+            usable = max(0.1, total_ram_gb * 0.75)
+            util_pct = round(min(100.0, (torch_mps_gb / usable) * 100.0), 1)
+        else:
+            util_pct = 0.0
+
+    return util_pct, vram_used
+
+
+def _sample_live_device_telemetry(dev: str, fallback_total_gb: float = 12.0) -> Tuple[float, float]:
+    """Fast live sample of (gpu_utilization_pct, vram_used_gb) on the active compute device."""
+    dev_norm = str(dev or "").lower()
+    if "cuda" in dev_norm:
+        util_pct = 0.0
+        used_gb = 0.0
+        nvml_res = _probe_nvml_fast(0)
+        if nvml_res is not None:
+            util_pct, used_gb = nvml_res
+        else:
+            try:
+                import subprocess
+                nv_out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                    timeout=1.2,
+                    stderr=subprocess.DEVNULL,
+                ).decode("utf-8", errors="ignore").strip().splitlines()
+                if nv_out:
+                    parts = [p.strip() for p in nv_out[0].split(",")]
+                    if len(parts) >= 2:
+                        util_pct = round(float(parts[0]), 1)
+                        used_gb = round(float(parts[1]) / 1024.0, 2)
+            except Exception:
+                pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                alloc_gb = torch.cuda.memory_allocated(0) / (1024**3)
+                res_gb = torch.cuda.memory_reserved(0) / (1024**3)
+                peak_gb = torch.cuda.max_memory_allocated(0) / (1024**3)
+                used_gb = round(max(used_gb, alloc_gb, res_gb, peak_gb), 2)
+        except Exception:
+            pass
+        return util_pct, used_gb
+
+    if "mps" in dev_norm or platform.system() == "Darwin":
+        return _probe_macos_gpu_live_standalone(fallback_total_gb, mps_available=True)
+
+    return 0.0, 0.5
+
+
+def _apply_active_telemetry_overlay(hw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay active compute rolling window onto hardware dict while a task is actively executing."""
+    act_util, act_vram = get_active_gpu_telemetry()
+    if act_util is not None:
+        hw_dict["gpu_utilization_pct"] = round(max(float(hw_dict.get("gpu_utilization_pct") or 0.0), act_util), 1)
+        if isinstance(hw_dict.get("gpus"), list) and hw_dict["gpus"]:
+            hw_dict["gpus"][0]["gpu_utilization_pct"] = hw_dict["gpu_utilization_pct"]
+    if act_vram is not None and act_vram > 0.0:
+        hw_dict["vram_used_gb"] = round(max(float(hw_dict.get("vram_used_gb") or 0.0), act_vram), 2)
+        if isinstance(hw_dict.get("gpus"), list) and hw_dict["gpus"]:
+            hw_dict["gpus"][0]["vram_used_gb"] = hw_dict["vram_used_gb"]
+    return hw_dict
+
+
 def discover_hardware() -> Dict[str, Any]:
     """Auto-detect physical GPU, VRAM, CUDA runtime, CPU cores, and system memory across all architectures."""
     if inspect_universal_hardware is not None:
@@ -121,28 +321,45 @@ def discover_hardware() -> Dict[str, Any]:
             detected["cuda_available"] = detected.get("compute_architecture") == "cuda"
             detected["gpu_memory_gb"] = detected.get("vram_total_gb", 8.0)
             if detected["cuda_available"]:
-                try:
-                    import subprocess
-                    nv_out = subprocess.check_output(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=utilization.gpu,memory.used",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        timeout=1.5,
-                        stderr=subprocess.DEVNULL,
-                    ).decode("utf-8", errors="ignore").strip().splitlines()
-                    if nv_out:
-                        parts = [p.strip() for p in nv_out[0].split(",")]
-                        if len(parts) >= 2:
-                            detected["gpu_utilization_pct"] = round(float(parts[0]), 1)
-                            detected["vram_used_gb"] = round(float(parts[1]) / 1024.0, 2)
-                            if isinstance(detected.get("gpus"), list) and detected["gpus"]:
-                                detected["gpus"][0]["gpu_utilization_pct"] = detected["gpu_utilization_pct"]
-                                detected["gpus"][0]["vram_used_gb"] = detected["vram_used_gb"]
-                except Exception:
-                    pass
-            return detected
+                nvml_res = _probe_nvml_fast(0)
+                if nvml_res is not None:
+                    detected["gpu_utilization_pct"], detected["vram_used_gb"] = nvml_res
+                    if isinstance(detected.get("gpus"), list) and detected["gpus"]:
+                        detected["gpus"][0]["gpu_utilization_pct"] = detected["gpu_utilization_pct"]
+                        detected["gpus"][0]["vram_used_gb"] = detected["vram_used_gb"]
+                else:
+                    try:
+                        import subprocess
+                        nv_out = subprocess.check_output(
+                            [
+                                "nvidia-smi",
+                                "--query-gpu=utilization.gpu,memory.used",
+                                "--format=csv,noheader,nounits",
+                            ],
+                            timeout=1.5,
+                            stderr=subprocess.DEVNULL,
+                        ).decode("utf-8", errors="ignore").strip().splitlines()
+                        if nv_out:
+                            parts = [p.strip() for p in nv_out[0].split(",")]
+                            if len(parts) >= 2:
+                                detected["gpu_utilization_pct"] = round(float(parts[0]), 1)
+                                detected["vram_used_gb"] = round(float(parts[1]) / 1024.0, 2)
+                                if isinstance(detected.get("gpus"), list) and detected["gpus"]:
+                                    detected["gpus"][0]["gpu_utilization_pct"] = detected["gpu_utilization_pct"]
+                                    detected["gpus"][0]["vram_used_gb"] = detected["vram_used_gb"]
+                    except Exception:
+                        pass
+            elif detected.get("compute_architecture") == "apple_mps":
+                mps_util, mps_vram = _probe_macos_gpu_live_standalone(
+                    float(detected.get("memory_gb") or detected.get("vram_total_gb") or 16.0),
+                    mps_available=True,
+                )
+                detected["gpu_utilization_pct"] = mps_util
+                detected["vram_used_gb"] = mps_vram
+                if isinstance(detected.get("gpus"), list) and detected["gpus"]:
+                    detected["gpus"][0]["gpu_utilization_pct"] = mps_util
+                    detected["gpus"][0]["vram_used_gb"] = mps_vram
+            return _apply_active_telemetry_overlay(detected)
         except Exception:
             pass
 
@@ -183,30 +400,34 @@ def discover_hardware() -> Dict[str, Any]:
             cuda_ver = f"{torch.version.cuda or '12.8'} / PyTorch {pt_ver}"
 
             nv_stats: Dict[int, Dict[str, float]] = {}
-            try:
-                import subprocess
-                nv_out = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=index,utilization.gpu,memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    timeout=1.5,
-                    stderr=subprocess.DEVNULL,
-                ).decode("utf-8", errors="ignore")
-                for line in nv_out.splitlines():
-                    parts = [p.strip() for p in line.split(",")]
-                    if len(parts) >= 3:
-                        try:
-                            nv_idx = int(parts[0])
-                            nv_stats[nv_idx] = {
-                                "util_pct": float(parts[1]),
-                                "used_gb": round(float(parts[2]) / 1024.0, 2),
-                            }
-                        except ValueError:
-                            pass
-            except Exception:
-                pass
+            nvml_0 = _probe_nvml_fast(0)
+            if nvml_0 is not None and dev_count == 1:
+                nv_stats[0] = {"util_pct": nvml_0[0], "used_gb": nvml_0[1]}
+            else:
+                try:
+                    import subprocess
+                    nv_out = subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,utilization.gpu,memory.used",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        timeout=1.5,
+                        stderr=subprocess.DEVNULL,
+                    ).decode("utf-8", errors="ignore")
+                    for line in nv_out.splitlines():
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 3:
+                            try:
+                                nv_idx = int(parts[0])
+                                nv_stats[nv_idx] = {
+                                    "util_pct": float(parts[1]),
+                                    "used_gb": round(float(parts[2]) / 1024.0, 2),
+                                }
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
 
             for i in range(dev_count):
                 props = torch.cuda.get_device_properties(i)
@@ -215,7 +436,7 @@ def discover_hardware() -> Dict[str, Any]:
                 res_gb = torch.cuda.memory_reserved(i) / (1024**3)
                 torch_used_gb = round(max(alloc_gb, res_gb), 2)
                 nv = nv_stats.get(i, {})
-                used_gb = nv.get("used_gb") if nv.get("used_gb") is not None else torch_used_gb
+                used_gb = max(nv.get("used_gb", 0.0), torch_used_gb) if nv.get("used_gb") is not None else torch_used_gb
                 if nv.get("util_pct") is not None:
                     util_pct = round(nv["util_pct"], 1)
                 else:
@@ -259,8 +480,8 @@ def discover_hardware() -> Dict[str, Any]:
                 except Exception:
                     pass
             pt_ver = torch.__version__.split("+")[0]
-            unified_vram = hw["memory_gb"]
-            used_vram = round(unified_vram * 0.15, 2)
+            unified_vram = round(hw["memory_gb"] * 0.75, 2) if hw["memory_gb"] > 8.0 else hw["memory_gb"]
+            mps_util_pct, used_vram = _probe_macos_gpu_live_standalone(hw["memory_gb"], mps_available=True)
             gpus_list.append({
                 "index": 0,
                 "name": f"{chip_name} (MPS Metal)",
@@ -268,7 +489,7 @@ def discover_hardware() -> Dict[str, Any]:
                 "vram_allocated_gb": round(unified_vram * 0.8, 2),
                 "vram_used_gb": used_vram,
                 "vram_allocation_pct": 80,
-                "gpu_utilization_pct": 12.0,
+                "gpu_utilization_pct": mps_util_pct,
                 "status": "online",
                 "is_available": True,
             })
@@ -277,9 +498,11 @@ def discover_hardware() -> Dict[str, Any]:
                     "gpu_model": f"{chip_name} (MPS Metal)",
                     "gpu_memory_gb": unified_vram,
                     "vram_used_gb": used_vram,
-                    "gpu_utilization_pct": 12.0,
+                    "gpu_utilization_pct": mps_util_pct,
                     "cuda_version": f"Apple Metal MPS / PyTorch {pt_ver}",
                     "cuda_available": True,
+                    "compute_architecture": "apple_mps",
+                    "is_unified_memory": True,
                     "gpus": gpus_list,
                 }
             )
@@ -340,12 +563,13 @@ def discover_hardware() -> Dict[str, Any]:
             import subprocess
             brand = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], timeout=2).decode().strip()
             if brand and "Apple" in brand:
+                mac_util, mac_used = _probe_macos_gpu_live_standalone(hw["memory_gb"], mps_available=False)
                 hw.update(
                     {
                         "gpu_model": f"{brand} (Unified Memory)",
                         "gpu_memory_gb": hw["memory_gb"],
-                        "vram_used_gb": round(hw["memory_gb"] * 0.10, 2),
-                        "gpu_utilization_pct": 8.0,
+                        "vram_used_gb": mac_used,
+                        "gpu_utilization_pct": mac_util,
                         "cuda_version": "Apple Metal / macOS",
                         "cuda_available": True,
                         "gpus": [{
@@ -353,9 +577,9 @@ def discover_hardware() -> Dict[str, Any]:
                             "name": f"{brand} (Unified Memory)",
                             "vram_total_gb": hw["memory_gb"],
                             "vram_allocated_gb": round(hw["memory_gb"] * 0.8, 2),
-                            "vram_used_gb": round(hw["memory_gb"] * 0.10, 2),
+                            "vram_used_gb": mac_used,
                             "vram_allocation_pct": 80,
-                            "gpu_utilization_pct": 8.0,
+                            "gpu_utilization_pct": mac_util,
                             "status": "online",
                             "is_available": True,
                         }],
@@ -385,7 +609,7 @@ def discover_hardware() -> Dict[str, Any]:
             if hw.get("gpu_model") == "CPU Fallback Compute Node":
                 hw["gpu_memory_gb"] = 0.0
 
-    return hw
+    return _apply_active_telemetry_overlay(hw)
 
 
 def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
@@ -1300,6 +1524,10 @@ class _WorkerGpuRuntime:
 
         # Multi-GPU and Device Mapping
         if dev == "cuda":
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
             dev_count = torch.cuda.device_count()
             if dev_count > 1:
                 alloc_pct = float(os.environ.get("NEBULA_VRAM_ALLOCATION_PCT", "80")) / 100.0
@@ -1317,6 +1545,10 @@ class _WorkerGpuRuntime:
                 load_kwargs["device_map"] = "cuda"
         else:
             load_kwargs["device_map"] = dev
+
+        # Request SDPA (Flash / Memory-Efficient Scaled Dot-Product Attention) when supported
+        if dev in ("cuda", "mps", "xpu"):
+            load_kwargs["attn_implementation"] = "sdpa"
 
         # 4-bit NF4 QLoRA Quantization
         if is_qlora:
@@ -1336,7 +1568,14 @@ class _WorkerGpuRuntime:
             else:
                 print("[GPU_WORKER] WARNING: QLoRA requested on non-CUDA device, falling back to standard precision.")
 
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        except (TypeError, ValueError) as exc:
+            if "attn_implementation" in load_kwargs and ("attn_implementation" in str(exc) or "sdpa" in str(exc).lower()):
+                load_kwargs.pop("attn_implementation", None)
+                model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+            else:
+                raise
         self.model = model
         self.tokenizer = tokenizer
         self.active_model_id = model_id
@@ -1504,6 +1743,184 @@ class _WorkerGpuRuntime:
                     except Exception:
                         self.unload()
 
+    @staticmethod
+    def _collate_micro_batches(
+        sequences: List[Any],
+        micro_batch_size: int,
+        pad_token_id: int,
+        pin_memory: bool = False,
+        sort_by_length: bool = True,
+    ) -> List[Tuple[Any, Any, Optional[Any]]]:
+        """Group variable-length 1D token tensors into length-sorted, minimally padded micro-batches."""
+        import torch
+
+        if not sequences:
+            return []
+
+        batch_sz = max(1, int(micro_batch_size or 1))
+        ordered = (
+            sorted(sequences, key=lambda seq: int(seq.numel()))
+            if (batch_sz > 1 and sort_by_length and len(sequences) > 1)
+            else list(sequences)
+        )
+
+        collated: List[Tuple[Any, Any, Optional[Any]]] = []
+        for idx in range(0, len(ordered), batch_sz):
+            chunk = ordered[idx : idx + batch_sz]
+            lengths = [int(s.numel()) for s in chunk]
+            max_len = max(lengths)
+            if len(chunk) == 1:
+                ids = chunk[0].unsqueeze(0).contiguous()
+                labels = ids.clone()
+                attn_mask = None
+            elif min(lengths) == max_len:
+                ids = torch.stack(chunk, dim=0).contiguous()
+                labels = ids.clone()
+                attn_mask = None
+            else:
+                bsz = len(chunk)
+                ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long)
+                attn_mask = torch.zeros((bsz, max_len), dtype=torch.long)
+                labels = torch.full((bsz, max_len), -100, dtype=torch.long)
+                for row_i, seq in enumerate(chunk):
+                    seq_len = int(seq.numel())
+                    ids[row_i, :seq_len] = seq
+                    attn_mask[row_i, :seq_len] = 1
+                    labels[row_i, :seq_len] = seq
+
+            if pin_memory:
+                try:
+                    ids = ids.pin_memory()
+                    labels = labels.pin_memory()
+                    if attn_mask is not None:
+                        attn_mask = attn_mask.pin_memory()
+                except Exception:
+                    pass
+            collated.append((ids, labels, attn_mask))
+        return collated
+
+    def _build_collated_training_batches(
+        self,
+        records: List[Dict[str, str]],
+        tokenizer: Any,
+        first_device: Any,
+        max_seq_length: int,
+        micro_batch_size: int,
+        dev: str,
+    ) -> Tuple[List[Tuple[Any, Any, Optional[Any]]], List[Tuple[Any, Any, Optional[Any]]]]:
+        """Tokenize training records cleanly on host RAM and build length-bucketed train/val micro-batches."""
+        sequences = []
+        for r in records:
+            formatted = (
+                f"<|im_start|>user\n{r.get('instruction', '')}<|im_end|>\n"
+                f"<|im_start|>assistant\n{r.get('response', '')}<|im_end|>"
+            )
+            enc = tokenizer(formatted, truncation=True, max_length=max_seq_length, return_tensors="pt")
+            seq = enc["input_ids"].squeeze(0).detach().cpu()
+            if seq.numel() > 0:
+                sequences.append(seq)
+
+        if len(sequences) >= 5:
+            split_idx = max(1, int(len(sequences) * 0.9))
+            train_seqs = sequences[:split_idx]
+            val_seqs = sequences[split_idx:]
+        else:
+            train_seqs = sequences
+            val_seqs = sequences[:1]
+
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+
+        pin_mem = dev == "cuda" and getattr(first_device, "type", "") == "cuda"
+        train_batches = self._collate_micro_batches(
+            train_seqs, micro_batch_size=micro_batch_size, pad_token_id=int(pad_id), pin_memory=pin_mem, sort_by_length=True
+        )
+        val_batches = self._collate_micro_batches(
+            val_seqs, micro_batch_size=micro_batch_size, pad_token_id=int(pad_id), pin_memory=pin_mem, sort_by_length=True
+        )
+        return train_batches, val_batches
+
+    @staticmethod
+    def _create_lora_optimizer(peft_model: Any, lr: float, dev: str) -> Tuple[Any, List[Any]]:
+        """Instantiate fused/foreach AdamW over trainable parameters only."""
+        import torch
+
+        all_params = list(peft_model.parameters())
+        trainable_params = [p for p in all_params if getattr(p, "requires_grad", False)]
+        if not trainable_params:
+            trainable_params = all_params
+
+        all_cuda_float = (
+            dev == "cuda"
+            and bool(trainable_params)
+            and all(getattr(p, "is_cuda", False) and p.is_floating_point() for p in trainable_params)
+        )
+        if all_cuda_float:
+            try:
+                return torch.optim.AdamW(trainable_params, lr=lr, fused=True), trainable_params
+            except Exception:
+                pass
+        try:
+            return torch.optim.AdamW(trainable_params, lr=lr, foreach=True), trainable_params
+        except Exception:
+            return torch.optim.AdamW(trainable_params, lr=lr), trainable_params
+
+    @staticmethod
+    def _upload_epoch_checkpoint(
+        *,
+        epoch: int,
+        avg_loss: float,
+        val_loss: float,
+        state_dict_cpu: Dict[str, Any],
+        adapter_cfg_json: str,
+        checkpoint_put_url: Optional[str],
+        server_url: str,
+        worker_id: str,
+        job_id: str,
+        headers: Dict[str, str],
+        on_epoch: Optional[Any],
+    ) -> Tuple[str, int]:
+        """Serialize CPU LoRA state snapshot and upload checkpoint off the GPU compute thread."""
+        import base64
+        import safetensors.torch
+
+        safetensors_bytes = safetensors.torch.save(state_dict_cpu)
+        if checkpoint_put_url:
+            print(f"[GPU_WORKER] Direct BYOS checkpoint upload to {checkpoint_put_url.split('?')[0]}")
+            put_resp = requests.put(
+                checkpoint_put_url,
+                data=safetensors_bytes,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=180,
+            )
+            put_resp.raise_for_status()
+            ckpt_url = checkpoint_put_url.split("?")[0]
+            ckpt_size = len(safetensors_bytes)
+        else:
+            up_url = f"{server_url}/api/v1/workers/{worker_id}/training/{job_id}/checkpoint"
+            up_resp = requests.post(
+                up_url,
+                headers=headers,
+                json={
+                    "epoch": epoch,
+                    "adapter_config": adapter_cfg_json,
+                    "adapter_model_b64": base64.b64encode(safetensors_bytes).decode("ascii"),
+                },
+                timeout=120,
+            )
+            up_resp.raise_for_status()
+            up_data = up_resp.json()
+            ckpt_url = up_data["ckpt_url"]
+            ckpt_size = int(up_data.get("size_bytes", len(safetensors_bytes)))
+
+        print(f"[GPU_WORKER] Epoch {epoch} checkpoint persisted | loss={avg_loss} | ckpt={ckpt_url}")
+        if on_epoch is not None:
+            on_epoch(epoch, avg_loss, val_loss, ckpt_url, ckpt_size)
+        return ckpt_url, ckpt_size
+
     def run_lora_training(
         self,
         job_payload: Dict[str, Any],
@@ -1561,7 +1978,9 @@ class _WorkerGpuRuntime:
         lr = float(job_payload.get("lr", 1e-4))
         lora_r = int(job_payload.get("lora_r", 16))
         lora_alpha = int(job_payload.get("lora_alpha", 32))
-        max_seq_length = int(job_payload.get("max_seq_length") or job_payload.get("max_length") or 256)
+        micro_batch_size = max(1, int(job_payload.get("batch_size") or 4))
+        grad_accum_steps = max(1, int(job_payload.get("gradient_accumulation_steps") or 1))
+        max_seq_length = int(job_payload.get("max_seq_length") or job_payload.get("max_length") or 512)
         records = job_payload.get("records")
 
         # Direct BYOS S3/R2 download flow (0 B on coordinator SSD/MinIO)
@@ -1645,38 +2064,62 @@ class _WorkerGpuRuntime:
             )
             peft_model = peft.get_peft_model(base_model, lora_cfg)
             peft_model.train()
-            optimizer = torch.optim.AdamW(peft_model.parameters(), lr=lr)
+            optimizer, trainable_params = self._create_lora_optimizer(peft_model, lr=lr, dev=dev)
 
             first_device = next(peft_model.parameters()).device
+            non_blocking_xfer = getattr(first_device, "type", "") == "cuda"
 
-            batches = []
-            for r in records:
-                formatted = (
-                    f"<|im_start|>user\n{r.get('instruction', '')}<|im_end|>\n"
-                    f"<|im_start|>assistant\n{r.get('response', '')}<|im_end|>"
-                )
-                enc = tokenizer(formatted, truncation=True, max_length=max_seq_length, return_tensors="pt")
-                ids = enc["input_ids"].to(first_device)
-                batches.append((ids, ids.clone()))
-
-            # Partition into train and validation sets for empirical val_loss calculation
-            if len(batches) >= 5:
-                split_idx = max(1, int(len(batches) * 0.9))
-                train_batches = batches[:split_idx]
-                val_batches = batches[split_idx:]
-            else:
-                train_batches = batches
-                val_batches = batches[:1]
+            train_batches, val_batches = self._build_collated_training_batches(
+                records=records,
+                tokenizer=tokenizer,
+                first_device=first_device,
+                max_seq_length=max_seq_length,
+                micro_batch_size=micro_batch_size,
+                dev=dev,
+            )
 
             print(
                 f"[GPU_WORKER] Training REAL {train_type.upper()} job {job_id[:8]} on {first_device} | "
                 f"model={base_model_id} | targets={discovered_targets} | "
-                f"samples={len(train_batches)} train / {len(val_batches)} val | epochs={total_epochs}"
+                f"micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | "
+                f"batches={len(train_batches)} train / {len(val_batches)} val | epochs={total_epochs}"
             )
+
+            import contextlib
+            from concurrent.futures import ThreadPoolExecutor
+
+            use_cuda_amp = dev == "cuda" and getattr(first_device, "type", "") == "cuda"
+            amp_dtype = None
+            scaler = None
+            if use_cuda_amp:
+                amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                if amp_dtype == torch.float16 and all(p.dtype == torch.float32 for p in trainable_params):
+                    try:
+                        scaler = torch.amp.GradScaler("cuda")
+                    except Exception:
+                        scaler = None
 
             loss_history = []
             final_adapter_url = None
-            upload_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            adapter_cfg_json = json.dumps(
+                {
+                    "base_model_name_or_path": base_model_id,
+                    "peft_type": "LORA",
+                    "train_type": train_type,
+                    "r": lora_r,
+                    "lora_alpha": lora_alpha,
+                    "lora_dropout": 0.05,
+                    "target_modules": discovered_targets,
+                },
+                indent=2,
+            )
+
+            init_util, init_vram = _sample_live_device_telemetry(dev)
+            if init_vram > 0.0:
+                record_active_gpu_telemetry(init_util, init_vram)
+
+            ckpt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nebula-ckpt-up")
+            pending_upload_future = None
 
             try:
                 for epoch in range(1, total_epochs + 1):
@@ -1696,8 +2139,16 @@ class _WorkerGpuRuntime:
                             None,
                             None,
                         )
-                    ep_losses = []
-                    for input_ids, labels in train_batches:
+
+                    ep_loss_sum = torch.zeros((), device=first_device, dtype=torch.float32)
+                    ep_loss_count = 0
+                    ep_peak_util = init_util
+                    ep_peak_vram = init_vram
+                    last_status_emit = time.monotonic()
+                    num_train_batches = len(train_batches)
+                    optimizer.zero_grad(set_to_none=True)
+
+                    for step_idx, (input_ids, labels, attn_mask) in enumerate(train_batches):
                         if cancel_event is not None and cancel_event.is_set():
                             print(f"[GPU_WORKER] Mid-epoch abort triggered for cancelled job {job_id[:8]}.")
                             return {
@@ -1706,14 +2157,63 @@ class _WorkerGpuRuntime:
                                 "total_epochs": epoch - 1,
                                 "final_adapter_url": final_adapter_url,
                             }
-                        input_ids = input_ids.to(first_device)
-                        labels = labels.to(first_device)
-                        optimizer.zero_grad()
-                        outputs = peft_model(input_ids=input_ids, labels=labels)
-                        loss = outputs.loss
-                        loss.backward()
-                        optimizer.step()
-                        ep_losses.append(float(loss.item()))
+
+                        input_ids = input_ids.to(first_device, non_blocking=non_blocking_xfer)
+                        labels = labels.to(first_device, non_blocking=non_blocking_xfer)
+                        forward_kwargs: Dict[str, Any] = {"input_ids": input_ids, "labels": labels}
+                        if attn_mask is not None:
+                            forward_kwargs["attention_mask"] = attn_mask.to(first_device, non_blocking=non_blocking_xfer)
+
+                        # Keep per-step command queue completely asynchronous (no per-step synchronize/.item)
+                        amp_ctx = (
+                            torch.amp.autocast("cuda", dtype=amp_dtype)
+                            if (use_cuda_amp and amp_dtype is not None)
+                            else contextlib.nullcontext()
+                        )
+                        with amp_ctx:
+                            outputs = peft_model(**forward_kwargs)
+                            loss = outputs.loss
+
+                        ep_loss_sum = ep_loss_sum + loss.detach().float()
+                        ep_loss_count += 1
+
+                        win_start = (step_idx // grad_accum_steps) * grad_accum_steps
+                        actual_accum = min(grad_accum_steps, num_train_batches - win_start)
+                        scaled_loss = loss / float(max(1, actual_accum))
+
+                        if scaler is not None:
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+
+                        is_step_boundary = ((step_idx + 1) % grad_accum_steps == 0) or (step_idx == num_train_batches - 1)
+                        if is_step_boundary:
+                            if scaler is not None:
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+
+                        now_mono = time.monotonic()
+                        if step_idx == 0 or step_idx == num_train_batches - 1 or (now_mono - last_status_emit) >= 1.5:
+                            hw_u, hw_v = _sample_live_device_telemetry(dev)
+                            ep_peak_util = max(ep_peak_util, hw_u)
+                            ep_peak_vram = max(ep_peak_vram, hw_v)
+                            record_active_gpu_telemetry(ep_peak_util, ep_peak_vram)
+                            if on_status is not None and (step_idx == 0 or (now_mono - last_status_emit) >= 1.5):
+                                last_status_emit = now_mono
+                                step_prog = round(
+                                    ((epoch - 1 + ((step_idx + 1) / max(1, num_train_batches))) / max(1, total_epochs)) * 100.0,
+                                    1,
+                                )
+                                on_status(
+                                    "training",
+                                    f"{dev.upper()} active — running epoch {epoch} / {total_epochs}",
+                                    step_prog,
+                                    None,
+                                    None,
+                                )
 
                     if cancel_event is not None and cancel_event.is_set():
                         return {
@@ -1723,76 +2223,74 @@ class _WorkerGpuRuntime:
                             "final_adapter_url": final_adapter_url,
                         }
 
+                    # Single clean device barrier at epoch boundary before validation & CPU weight snapshot
                     if dev == "cuda":
                         torch.cuda.synchronize()
-                    avg_loss = round(sum(ep_losses) / max(1, len(ep_losses)), 4)
+                    elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                        try:
+                            torch.mps.synchronize()
+                        except Exception:
+                            pass
 
-                    # Real empirical validation loss on held-out split using torch.no_grad()
+                    avg_loss = round(float(ep_loss_sum.item()) / max(1, ep_loss_count), 4)
+
+                    # Batched validation pass under inference_mode
                     val_loss = avg_loss
                     if val_batches:
                         peft_model.eval()
-                        val_losses = []
-                        with torch.no_grad():
-                            for val_ids, val_labels in val_batches:
-                                val_ids = val_ids.to(first_device)
-                                val_labels = val_labels.to(first_device)
-                                val_out = peft_model(input_ids=val_ids, labels=val_labels)
-                                val_losses.append(float(val_out.loss.item()))
-                        if val_losses:
-                            val_loss = round(sum(val_losses) / len(val_losses), 4)
+                        val_loss_sum = torch.zeros((), device=first_device, dtype=torch.float32)
+                        val_count = 0
+                        with torch.inference_mode():
+                            for val_ids, val_labels, val_mask in val_batches:
+                                val_kwargs: Dict[str, Any] = {
+                                    "input_ids": val_ids.to(first_device, non_blocking=non_blocking_xfer),
+                                    "labels": val_labels.to(first_device, non_blocking=non_blocking_xfer),
+                                }
+                                if val_mask is not None:
+                                    val_kwargs["attention_mask"] = val_mask.to(first_device, non_blocking=non_blocking_xfer)
+                                amp_ctx = (
+                                    torch.amp.autocast("cuda", dtype=amp_dtype)
+                                    if (use_cuda_amp and amp_dtype is not None)
+                                    else contextlib.nullcontext()
+                                )
+                                with amp_ctx:
+                                    val_out = peft_model(**val_kwargs)
+                                val_loss_sum = val_loss_sum + val_out.loss.detach().float()
+                                val_count += 1
+                        if val_count > 0:
+                            val_loss = round(float(val_loss_sum.item()) / val_count, 4)
                         peft_model.train()
 
-                    state_dict = peft.get_peft_model_state_dict(peft_model)
-                    safetensors_bytes = safetensors.torch.save(state_dict)
-                    adapter_cfg_json = json.dumps(
-                        {
-                            "base_model_name_or_path": base_model_id,
-                            "peft_type": "LORA",
-                            "train_type": train_type,
-                            "r": lora_r,
-                            "lora_alpha": lora_alpha,
-                            "lora_dropout": 0.05,
-                            "target_modules": discovered_targets,
-                        },
-                        indent=2,
-                    )
+                    # Refresh active epoch telemetry before offloading checkpoint upload
+                    if ep_peak_util > 0.0 or ep_peak_vram > 0.0:
+                        record_active_gpu_telemetry(ep_peak_util, ep_peak_vram)
 
-                    if checkpoint_put_url:
-                        # Direct BYOS presigned PUT upload (0 B to coordinator MinIO/SSD)
-                        print(f"[GPU_WORKER] Direct BYOS checkpoint upload to {checkpoint_put_url.split('?')[0]}")
-                        put_resp = requests.put(
-                            checkpoint_put_url,
-                            data=safetensors_bytes,
-                            headers={"Content-Type": "application/octet-stream"},
-                            timeout=180,
-                        )
-                        put_resp.raise_for_status()
-                        ckpt_url = checkpoint_put_url.split("?")[0]
-                        ckpt_size = len(safetensors_bytes)
-                    else:
-                        import base64
-                        up_url = f"{server_url}/api/v1/workers/{worker_id}/training/{job_id}/checkpoint"
-                        up_resp = requests.post(
-                            up_url,
-                            headers=headers,
-                            json={
-                                "epoch": epoch,
-                                "adapter_config": adapter_cfg_json,
-                                "adapter_model_b64": base64.b64encode(safetensors_bytes).decode("ascii"),
-                            },
-                            timeout=120,
-                        )
-                        up_resp.raise_for_status()
-                        up_data = up_resp.json()
-                        ckpt_url = up_data["ckpt_url"]
-                        ckpt_size = int(up_data.get("size_bytes", len(safetensors_bytes)))
+                    # Wait for any previous epoch's upload to preserve epoch order & surface upload failures early
+                    if pending_upload_future is not None:
+                        final_adapter_url, _ = pending_upload_future.result()
 
-                    final_adapter_url = ckpt_url
+                    # Snapshot small LoRA adapter tensors to CPU RAM so GPU can immediately start next epoch
+                    raw_sd = peft.get_peft_model_state_dict(peft_model)
+                    cpu_state_dict = {k: v.detach().cpu().contiguous() for k, v in raw_sd.items()}
                     loss_history.append({"epoch": epoch, "loss": avg_loss, "val_loss": val_loss})
 
-                    print(f"[GPU_WORKER] Epoch {epoch}/{total_epochs} complete | loss={avg_loss} | ckpt={ckpt_url}")
-                    if on_epoch is not None:
-                        on_epoch(epoch, avg_loss, val_loss, ckpt_url, ckpt_size)
+                    pending_upload_future = ckpt_executor.submit(
+                        self._upload_epoch_checkpoint,
+                        epoch=epoch,
+                        avg_loss=avg_loss,
+                        val_loss=val_loss,
+                        state_dict_cpu=cpu_state_dict,
+                        adapter_cfg_json=adapter_cfg_json,
+                        checkpoint_put_url=checkpoint_put_url,
+                        server_url=server_url,
+                        worker_id=worker_id,
+                        job_id=job_id,
+                        headers=headers,
+                        on_epoch=on_epoch,
+                    )
+
+                if pending_upload_future is not None:
+                    final_adapter_url, _ = pending_upload_future.result()
 
                 return {
                     "status": "completed",
@@ -1802,6 +2300,7 @@ class _WorkerGpuRuntime:
                     "final_adapter_url": final_adapter_url,
                 }
             finally:
+                ckpt_executor.shutdown(wait=True)
                 # Milestone 3: Securely wipe unsealed secrets and ephemeral RAM buffers
                 zero_memory(raw_secrets_buf, unsealed_secrets)
                 try:
@@ -2222,6 +2721,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         })
                                     finally:
                                         active_task["id"] = None
+                                        clear_active_gpu_telemetry()
                                         end_hw = discover_hardware()
                                         try:
                                             await _safe_send({
@@ -2312,6 +2812,7 @@ def cmd_join(args: argparse.Namespace) -> int:
 
                                         res = await asyncio.to_thread(_exec_train)
                                         await drain_task
+                                        clear_active_gpu_telemetry()
                                         end_hw = discover_hardware()
                                         await _safe_send({
                                             "type": "training_result",
@@ -2323,6 +2824,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                         })
                                     except Exception as exc:
                                         await drain_task
+                                        clear_active_gpu_telemetry()
                                         if not args.json:
                                             print(f"[GPU_WORKER] LoRA training error ({job_id}): {exc}")
                                         end_hw = discover_hardware()
@@ -2335,6 +2837,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                             "gpu_utilization_pct": end_hw["gpu_utilization_pct"],
                                         })
                                     finally:
+                                        clear_active_gpu_telemetry()
                                         if job_id:
                                             active_job_cancels.pop(str(job_id), None)
                                         active_task["id"] = None
