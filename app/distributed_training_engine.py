@@ -328,7 +328,7 @@ class DistributedTrainingEngine:
         batch_size: int = 4,
         max_seq_length: int = 512,
         gradient_accumulation_steps: int = 1,
-        packing: bool = False,
+        packing: bool = True,
     ) -> Dict[str, Any]:
         """
         Execute multi-node distributed PyTorch LoRA training across `worker_ids`:

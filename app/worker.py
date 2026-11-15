@@ -830,7 +830,7 @@ def execute_training_job(*args, **kwargs):
         batch_size = int(hyperparams.get("batch_size", 4) or 4)
         max_seq_length = int(hyperparams.get("max_seq_length") or hyperparams.get("max_length") or 512)
         grad_accum_steps = int(hyperparams.get("gradient_accumulation_steps", 1) or 1)
-        packing = bool(hyperparams.get("packing", False))
+        packing = bool(hyperparams.get("packing", True))
         lora_r = int(hyperparams.get("lora_r", 16) or 16)
         est_vram = estimate_required_vram_gb(
             model_id=job.base_model,

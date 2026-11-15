@@ -612,12 +612,26 @@ def discover_hardware() -> Dict[str, Any]:
     return _apply_active_telemetry_overlay(hw)
 
 
+_CURRENT_VRAM_ALLOCATION_PCT = max(
+    10,
+    min(100, int(os.environ.get("NEBULA_VRAM_ALLOCATION_PCT", "80") or "80")),
+)
+
+
+def get_current_vram_allocation_pct() -> int:
+    """Return the worker's currently active VRAM contribution percentage (10-100)."""
+    return _CURRENT_VRAM_ALLOCATION_PCT
+
+
 def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
     """
     Enforce the contributor's chosen GPU VRAM percentage limit (10% - 100%)
     directly on the local CUDA device via torch.cuda.set_per_process_memory_fraction.
     """
+    global _CURRENT_VRAM_ALLOCATION_PCT
     clamped_pct = max(10, min(100, int(vram_pct)))
+    _CURRENT_VRAM_ALLOCATION_PCT = clamped_pct
+    os.environ["NEBULA_VRAM_ALLOCATION_PCT"] = str(clamped_pct)
     fraction = round(clamped_pct / 100.0, 2)
     enforced = False
     try:
@@ -1744,6 +1758,312 @@ class _WorkerGpuRuntime:
                         self.unload()
 
     @staticmethod
+    def _resolve_dataloader_config(
+        dev: str,
+        arch_type: Optional[str] = None,
+        platform_name: Optional[str] = None,
+    ) -> Tuple[bool, int]:
+        """Resolve architecture-safe pin_memory and DataLoader worker count."""
+        arch = (arch_type or dev or "cpu").strip().lower()
+        plat = (platform_name or sys.platform).strip().lower()
+        is_discrete_gpu = arch in {"cuda", "nvidia_cuda", "amd_rocm", "rocm", "intel_xpu", "xpu"}
+        pin_memory = bool(is_discrete_gpu)
+        # Keep num_workers=0 on Windows, macOS, and UMA/CPU to avoid multiprocessing fork/spawn deadlocks
+        if is_discrete_gpu and plat.startswith("linux"):
+            num_workers = 2
+        else:
+            num_workers = 0
+        return pin_memory, num_workers
+
+    @staticmethod
+    def _estimate_model_param_bytes(model: Any) -> int:
+        """Compute total byte footprint of loaded model parameters."""
+        total_bytes = 0
+        try:
+            for p in model.parameters():
+                total_bytes += int(p.numel()) * int(p.element_size())
+        except Exception:
+            pass
+        return total_bytes
+
+    def _resolve_execution_batch_plan(
+        self,
+        *,
+        dev: str,
+        model: Any,
+        requested_batch_size: int,
+        requested_grad_accum: int,
+        effective_seq_len: int,
+        train_type: str = "lora",
+        vram_allocation_pct: Optional[int] = None,
+        auto_batch: bool = True,
+        total_vram_gb: Optional[float] = None,
+        allocated_vram_gb: Optional[float] = None,
+        arch_type: Optional[str] = None,
+        platform_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute VRAM-aware micro_batch_size, gradient_accumulation_steps, and transfer settings
+        bounded by the contributor's active --vram-pct budget.
+        """
+        req_bs = max(1, int(requested_batch_size or 1))
+        req_accum = max(1, int(requested_grad_accum or 1))
+        pin_memory, num_workers = self._resolve_dataloader_config(
+            dev, arch_type=arch_type, platform_name=platform_name
+        )
+        vram_pct = max(
+            10,
+            min(
+                100,
+                int(vram_allocation_pct if vram_allocation_pct is not None else get_current_vram_allocation_pct()),
+            ),
+        )
+        target_effective_batch = req_bs * req_accum
+
+        if dev not in {"cuda", "mps", "rocm", "xpu"} or not auto_batch:
+            return {
+                "micro_batch_size": req_bs,
+                "grad_accum_steps": req_accum,
+                "pin_memory": pin_memory,
+                "num_workers": num_workers,
+                "vram_pct": vram_pct,
+                "headroom_gb": 0.0,
+                "auto_scaled": False,
+            }
+
+        cfg = getattr(model, "config", None)
+        # Skip speculative scaling on minimal dummy/test models lacking Transformer dimensions
+        if cfg is not None and not any(hasattr(cfg, attr) for attr in ("hidden_size", "n_embd", "d_model")):
+            return {
+                "micro_batch_size": req_bs,
+                "grad_accum_steps": req_accum,
+                "pin_memory": pin_memory,
+                "num_workers": num_workers,
+                "vram_pct": vram_pct,
+                "headroom_gb": 0.0,
+                "auto_scaled": False,
+            }
+
+        try:
+            import torch
+
+            if total_vram_gb is None:
+                if dev == "cuda" and torch.cuda.is_available():
+                    total_vram_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024.0 ** 3)
+                else:
+                    hw = discover_hardware()
+                    total_vram_gb = float(hw.get("vram_total_gb", 0.0) or 0.0)
+            if allocated_vram_gb is None:
+                if dev == "cuda" and torch.cuda.is_available():
+                    allocated_vram_gb = float(torch.cuda.memory_allocated(0)) / (1024.0 ** 3)
+                elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+                    allocated_vram_gb = float(torch.mps.current_allocated_memory()) / (1024.0 ** 3)
+                else:
+                    allocated_vram_gb = float(self._estimate_model_param_bytes(model)) / (1024.0 ** 3)
+        except Exception:
+            total_vram_gb = float(total_vram_gb or 0.0)
+            allocated_vram_gb = float(allocated_vram_gb or 0.0)
+
+        if total_vram_gb <= 0.0:
+            return {
+                "micro_batch_size": req_bs,
+                "grad_accum_steps": req_accum,
+                "pin_memory": pin_memory,
+                "num_workers": num_workers,
+                "vram_pct": vram_pct,
+                "headroom_gb": 0.0,
+                "auto_scaled": False,
+            }
+
+        plat = (platform_name or sys.platform).strip().lower()
+        safety_factor = 0.85 if (dev == "mps" or plat.startswith("win")) else 0.90
+        target_budget_gb = float(total_vram_gb) * (vram_pct / 100.0) * safety_factor
+        # Reserve ~0.25 GB for LoRA optimizer states & temporary cuBLAS/MPS workspace buffers
+        free_budget_gb = max(0.0, target_budget_gb - float(allocated_vram_gb) - 0.25)
+
+        hidden_size = int(getattr(cfg, "hidden_size", getattr(cfg, "n_embd", getattr(cfg, "d_model", 1024))) or 1024)
+        num_layers = int(getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", 24)) or 24)
+        vocab_size = int(getattr(cfg, "vocab_size", 32000) or 32000)
+        seq_len = max(64, int(effective_seq_len or 512))
+
+        # Per-sample activation + output-logits footprint estimate (GB, conservative for mixed precision)
+        act_bytes = 8.0 * seq_len * hidden_size * num_layers * 2.0
+        logits_bytes = 1.0 * seq_len * vocab_size * 4.0
+        est_per_sample_gb = max(0.06, (act_bytes + logits_bytes) / (1024.0 ** 3))
+        if (train_type or "").lower() == "qlora":
+            est_per_sample_gb *= 0.85
+
+        raw_max_bs = max(1, int(free_budget_gb // est_per_sample_gb))
+        # Clamp to Tensor Core / SIMD friendly range [1, 16] (power-of-2 when scaling above requested)
+        if raw_max_bs >= req_bs:
+            candidates = [1, 2, 4, 8, 16]
+            tuned_bs = max([c for c in candidates if c <= min(16, raw_max_bs)] or [req_bs])
+            tuned_bs = max(req_bs, tuned_bs)
+        else:
+            tuned_bs = max(1, raw_max_bs)
+
+        tuned_accum = max(1, (target_effective_batch + tuned_bs - 1) // tuned_bs)
+        return {
+            "micro_batch_size": tuned_bs,
+            "grad_accum_steps": tuned_accum,
+            "pin_memory": pin_memory,
+            "num_workers": num_workers,
+            "vram_pct": vram_pct,
+            "headroom_gb": round(free_budget_gb, 3),
+            "per_sample_gb": round(est_per_sample_gb, 3),
+            "auto_scaled": tuned_bs != req_bs,
+        }
+
+    @staticmethod
+    def _build_packed_block_causal_mask(doc_ids: Any) -> Any:
+        """
+        Build a float32 4D additive block-diagonal causal mask (bsz, 1, seq, seq):
+        0.0 where attending within the same document causally (or self-pad),
+        -65504.0 (fp16-safe -inf) across documents or future tokens.
+        """
+        import torch
+
+        bsz, seq_len = doc_ids.shape
+        col_idx = torch.arange(seq_len, device=doc_ids.device)
+        causal = col_idx.unsqueeze(0) <= col_idx.unsqueeze(1)  # (S, S)
+        same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
+        non_pad = (doc_ids > 0).unsqueeze(2) & (doc_ids > 0).unsqueeze(1)
+        pad_self = (doc_ids == 0).unsqueeze(2) & torch.eye(seq_len, dtype=torch.bool, device=doc_ids.device).unsqueeze(0)
+        allowed = (same_doc & causal.unsqueeze(0) & non_pad) | pad_self
+        mask = torch.full((bsz, 1, seq_len, seq_len), -65504.0, dtype=torch.float32)
+        mask.masked_fill_(allowed.unsqueeze(1), 0.0)
+        return mask
+
+    @classmethod
+    def _pack_sequences_ffd(
+        cls,
+        sequences: List[Any],
+        max_seq_length: int,
+        micro_batch_size: int,
+        pad_token_id: int,
+        pin_memory: bool = False,
+        eos_token_id: Optional[int] = None,
+    ) -> List[Tuple[Any, Any, Optional[Any], Optional[Any]]]:
+        """
+        First-Fit-Decreasing 1D sequence packing with per-document position_ids resets,
+        doc-boundary label masking (-100), and block-diagonal causal attention masks.
+        """
+        import torch
+
+        if not sequences:
+            return []
+
+        cap = max(1, int(max_seq_length or 512))
+        ordered = sorted(sequences, key=lambda seq: int(seq.numel()), reverse=True)
+
+        # Each bin stores list of 1D slices already truncated to <= cap
+        bins: List[List[Any]] = []
+        bin_lengths: List[int] = []
+
+        for raw_seq in ordered:
+            seq = raw_seq[:cap].detach().cpu().contiguous()
+            slen = int(seq.numel())
+            if slen <= 0:
+                continue
+            # Ensure clean EOS terminator between concatenated docs when available
+            if eos_token_id is not None and int(seq[-1].item()) != int(eos_token_id) and slen < cap:
+                seq = torch.cat([seq, torch.tensor([int(eos_token_id)], dtype=seq.dtype)])
+                slen += 1
+            placed = False
+            for idx, cur_len in enumerate(bin_lengths):
+                if cur_len + slen <= cap:
+                    bins[idx].append(seq)
+                    bin_lengths[idx] = cur_len + slen
+                    placed = True
+                    break
+            if not placed:
+                bins.append([seq])
+                bin_lengths.append(slen)
+
+        if not bins:
+            return []
+
+        # Build packed 1D tensors per bin (keeps single-doc bins lightweight)
+        packed_entries: List[Tuple[Any, Any, Any, Any, bool]] = []
+        for docs, total_len in zip(bins, bin_lengths):
+            ids = torch.cat(docs, dim=0).contiguous()
+            labels = ids.clone()
+            pos_parts: List[Any] = []
+            doc_id_parts: List[Any] = []
+            offset = 0
+            for doc_idx, doc in enumerate(docs, start=1):
+                dlen = int(doc.numel())
+                # Do not penalize predicting doc k's opening token from doc k-1's EOS token
+                if doc_idx > 1 and offset < total_len:
+                    labels[offset] = -100
+                pos_parts.append(torch.arange(dlen, dtype=torch.long))
+                doc_id_parts.append(torch.full((dlen,), doc_idx, dtype=torch.long))
+                offset += dlen
+            pos_ids = torch.cat(pos_parts, dim=0)
+            doc_ids = torch.cat(doc_id_parts, dim=0)
+            packed_entries.append((ids, labels, pos_ids, doc_ids, len(docs) > 1))
+
+        # Group similarly filled packed bins into micro-batches
+        paired = sorted(packed_entries, key=lambda item: int(item[0].numel()))
+        batch_sz = max(1, int(micro_batch_size or 1))
+        collated: List[Tuple[Any, Any, Optional[Any], Optional[Any]]] = []
+
+        for start in range(0, len(paired), batch_sz):
+            chunk = paired[start : start + batch_sz]
+            max_len = max(int(item[0].numel()) for item in chunk)
+            min_len = min(int(item[0].numel()) for item in chunk)
+            any_multi_doc = any(item[4] for item in chunk)
+            bsz = len(chunk)
+
+            if bsz == 1 and not any_multi_doc:
+                ids_t = chunk[0][0].unsqueeze(0).contiguous()
+                labels_t = chunk[0][1].unsqueeze(0).contiguous()
+                attn_t = None
+                pos_t = None
+            elif not any_multi_doc and min_len == max_len:
+                ids_t = torch.stack([item[0] for item in chunk], dim=0).contiguous()
+                labels_t = torch.stack([item[1] for item in chunk], dim=0).contiguous()
+                attn_t = None
+                pos_t = None
+            elif not any_multi_doc:
+                ids_t = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long)
+                labels_t = torch.full((bsz, max_len), -100, dtype=torch.long)
+                attn_t = torch.zeros((bsz, max_len), dtype=torch.long)
+                pos_t = None
+                for row_i, (s_ids, s_lbl, _, _, _) in enumerate(chunk):
+                    slen = int(s_ids.numel())
+                    ids_t[row_i, :slen] = s_ids
+                    labels_t[row_i, :slen] = s_lbl
+                    attn_t[row_i, :slen] = 1
+            else:
+                ids_t = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long)
+                labels_t = torch.full((bsz, max_len), -100, dtype=torch.long)
+                pos_t = torch.zeros((bsz, max_len), dtype=torch.long)
+                doc_ids_t = torch.zeros((bsz, max_len), dtype=torch.long)
+                for row_i, (s_ids, s_lbl, s_pos, s_doc, _) in enumerate(chunk):
+                    slen = int(s_ids.numel())
+                    ids_t[row_i, :slen] = s_ids
+                    labels_t[row_i, :slen] = s_lbl
+                    pos_t[row_i, :slen] = s_pos
+                    doc_ids_t[row_i, :slen] = s_doc
+                attn_t = cls._build_packed_block_causal_mask(doc_ids_t)
+
+            if pin_memory:
+                try:
+                    ids_t = ids_t.pin_memory()
+                    labels_t = labels_t.pin_memory()
+                    if attn_t is not None:
+                        attn_t = attn_t.pin_memory()
+                    if pos_t is not None:
+                        pos_t = pos_t.pin_memory()
+                except Exception:
+                    pass
+
+            collated.append((ids_t, labels_t, attn_t, pos_t))
+
+        return collated
+
+    @staticmethod
     def _collate_micro_batches(
         sequences: List[Any],
         micro_batch_size: int,
@@ -1799,16 +2119,13 @@ class _WorkerGpuRuntime:
             collated.append((ids, labels, attn_mask))
         return collated
 
-    def _build_collated_training_batches(
-        self,
+    @staticmethod
+    def _tokenize_training_records(
         records: List[Dict[str, str]],
         tokenizer: Any,
-        first_device: Any,
         max_seq_length: int,
-        micro_batch_size: int,
-        dev: str,
-    ) -> Tuple[List[Tuple[Any, Any, Optional[Any]]], List[Tuple[Any, Any, Optional[Any]]]]:
-        """Tokenize training records cleanly on host RAM and build length-bucketed train/val micro-batches."""
+    ) -> Tuple[List[Any], List[Any]]:
+        """Tokenize instruction/response records onto host CPU RAM and split train/validation sets."""
         sequences = []
         for r in records:
             formatted = (
@@ -1822,19 +2139,68 @@ class _WorkerGpuRuntime:
 
         if len(sequences) >= 5:
             split_idx = max(1, int(len(sequences) * 0.9))
-            train_seqs = sequences[:split_idx]
-            val_seqs = sequences[split_idx:]
+            return sequences[:split_idx], sequences[split_idx:]
+        return sequences, sequences[:1]
+
+    def _build_collated_training_batches(
+        self,
+        records: List[Dict[str, str]],
+        tokenizer: Any,
+        first_device: Any,
+        max_seq_length: int,
+        micro_batch_size: int,
+        dev: str,
+        packing: bool = False,
+        pin_memory: Optional[bool] = None,
+        pre_tokenized: Optional[Tuple[List[Any], List[Any]]] = None,
+    ) -> Tuple[List[Any], List[Any]]:
+        """Build packed or length-bucketed train/val micro-batches on host RAM."""
+        if pre_tokenized is not None:
+            train_seqs, val_seqs = pre_tokenized
         else:
-            train_seqs = sequences
-            val_seqs = sequences[:1]
+            train_seqs, val_seqs = self._tokenize_training_records(records, tokenizer, max_seq_length)
 
         pad_id = getattr(tokenizer, "pad_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
         if pad_id is None:
-            pad_id = getattr(tokenizer, "eos_token_id", None)
+            pad_id = eos_id
         if pad_id is None:
             pad_id = 0
 
-        pin_mem = dev == "cuda" and getattr(first_device, "type", "") == "cuda"
+        if pin_memory is None:
+            pin_mem, _ = self._resolve_dataloader_config(dev)
+            pin_mem = bool(pin_mem and getattr(first_device, "type", "") in {"cuda", "xpu"})
+        else:
+            pin_mem = bool(pin_memory and getattr(first_device, "type", "") in {"cuda", "xpu"})
+
+        if packing and len(train_seqs) > 1:
+            train_batches = self._pack_sequences_ffd(
+                train_seqs,
+                max_seq_length=max_seq_length,
+                micro_batch_size=micro_batch_size,
+                pad_token_id=int(pad_id),
+                pin_memory=pin_mem,
+                eos_token_id=int(eos_id) if eos_id is not None else None,
+            )
+            if len(val_seqs) > 1:
+                val_batches = self._pack_sequences_ffd(
+                    val_seqs,
+                    max_seq_length=max_seq_length,
+                    micro_batch_size=micro_batch_size,
+                    pad_token_id=int(pad_id),
+                    pin_memory=pin_mem,
+                    eos_token_id=int(eos_id) if eos_id is not None else None,
+                )
+            else:
+                val_batches = self._collate_micro_batches(
+                    val_seqs,
+                    micro_batch_size=micro_batch_size,
+                    pad_token_id=int(pad_id),
+                    pin_memory=pin_mem,
+                    sort_by_length=True,
+                )
+            return train_batches, val_batches
+
         train_batches = self._collate_micro_batches(
             train_seqs, micro_batch_size=micro_batch_size, pad_token_id=int(pad_id), pin_memory=pin_mem, sort_by_length=True
         )
@@ -1842,6 +2208,62 @@ class _WorkerGpuRuntime:
             val_seqs, micro_batch_size=micro_batch_size, pad_token_id=int(pad_id), pin_memory=pin_mem, sort_by_length=True
         )
         return train_batches, val_batches
+
+    @staticmethod
+    def _unpack_batch_tuple(batch: Any) -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
+        """Normalize 3-tuple collated batches and 4-tuple packed batches into a 4-tuple."""
+        if len(batch) == 4:
+            return batch[0], batch[1], batch[2], batch[3]
+        return batch[0], batch[1], batch[2], None
+
+    @staticmethod
+    def _split_batch_tuple(
+        batch: Tuple[Any, Any, Optional[Any], Optional[Any]],
+        max_rows: int,
+    ) -> List[Tuple[Any, Any, Optional[Any], Optional[Any]]]:
+        """Split a collated or packed batch along dim 0 for OOM micro-batch backoff."""
+        ids, labels, attn_mask, pos_ids = batch
+        bsz = int(ids.shape[0])
+        if bsz <= max_rows:
+            return [batch]
+        slices: List[Tuple[Any, Any, Optional[Any], Optional[Any]]] = []
+        for s in range(0, bsz, max_rows):
+            e = s + max_rows
+            slices.append(
+                (
+                    ids[s:e],
+                    labels[s:e],
+                    attn_mask[s:e] if attn_mask is not None else None,
+                    pos_ids[s:e] if pos_ids is not None else None,
+                )
+            )
+        return slices
+
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        """Return True if an exception represents GPU/MPS out-of-memory exhaustion."""
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "outofmemory" in type(exc).__name__.lower()
+            or "mpsalloc" in msg
+            or "insufficient memory" in msg
+        )
+
+    @staticmethod
+    def _clear_device_cache(dev: str) -> None:
+        """Release cached allocator blocks only when recovering from an OOM event."""
+        try:
+            import gc
+            import torch
+
+            gc.collect()
+            if dev == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+        except Exception:
+            pass
 
     @staticmethod
     def _create_lora_optimizer(peft_model: Any, lr: float, dev: str) -> Tuple[Any, List[Any]]:
@@ -1981,6 +2403,8 @@ class _WorkerGpuRuntime:
         micro_batch_size = max(1, int(job_payload.get("batch_size") or 4))
         grad_accum_steps = max(1, int(job_payload.get("gradient_accumulation_steps") or 1))
         max_seq_length = int(job_payload.get("max_seq_length") or job_payload.get("max_length") or 512)
+        packing_cfg = job_payload.get("packing", "auto")
+        auto_batch = bool(job_payload.get("auto_batch", True))
         records = job_payload.get("records")
 
         # Direct BYOS S3/R2 download flow (0 B on coordinator SSD/MinIO)
@@ -2067,7 +2491,43 @@ class _WorkerGpuRuntime:
             optimizer, trainable_params = self._create_lora_optimizer(peft_model, lr=lr, dev=dev)
 
             first_device = next(peft_model.parameters()).device
-            non_blocking_xfer = getattr(first_device, "type", "") == "cuda"
+            first_device_type = getattr(first_device, "type", "")
+            non_blocking_xfer = first_device_type in {"cuda", "xpu"}
+
+            train_seqs, val_seqs = self._tokenize_training_records(records, tokenizer, max_seq_length)
+            model_cfg = getattr(base_model, "config", None)
+            is_real_lm_cfg = bool(
+                model_cfg is not None
+                and getattr(model_cfg, "model_type", "custom") != "custom"
+                and any(hasattr(model_cfg, a) for a in ("hidden_size", "n_embd", "d_model"))
+            )
+            if isinstance(packing_cfg, bool):
+                packing_enabled = packing_cfg
+            elif isinstance(packing_cfg, str) and packing_cfg.strip().lower() in {"true", "1", "yes"}:
+                packing_enabled = True
+            elif isinstance(packing_cfg, str) and packing_cfg.strip().lower() in {"false", "0", "no"}:
+                packing_enabled = False
+            else:
+                packing_enabled = is_real_lm_cfg and len(train_seqs) > 1
+
+            if packing_enabled and train_seqs:
+                observed_seq_len = min(max_seq_length, max(int(s.numel()) for s in train_seqs) * 2)
+            elif train_seqs:
+                observed_seq_len = max(int(s.numel()) for s in train_seqs)
+            else:
+                observed_seq_len = max_seq_length
+
+            batch_plan = self._resolve_execution_batch_plan(
+                dev=dev,
+                model=peft_model,
+                requested_batch_size=micro_batch_size,
+                requested_grad_accum=grad_accum_steps,
+                effective_seq_len=max(64, int(observed_seq_len)),
+                train_type=train_type,
+                auto_batch=auto_batch,
+            )
+            micro_batch_size = int(batch_plan["micro_batch_size"])
+            grad_accum_steps = int(batch_plan["grad_accum_steps"])
 
             train_batches, val_batches = self._build_collated_training_batches(
                 records=records,
@@ -2076,19 +2536,24 @@ class _WorkerGpuRuntime:
                 max_seq_length=max_seq_length,
                 micro_batch_size=micro_batch_size,
                 dev=dev,
+                packing=packing_enabled,
+                pin_memory=bool(batch_plan["pin_memory"]),
+                pre_tokenized=(train_seqs, val_seqs),
             )
 
             print(
                 f"[GPU_WORKER] Training REAL {train_type.upper()} job {job_id[:8]} on {first_device} | "
                 f"model={base_model_id} | targets={discovered_targets} | "
                 f"micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | "
+                f"packing={packing_enabled} | vram_pct={batch_plan['vram_pct']}% | "
                 f"batches={len(train_batches)} train / {len(val_batches)} val | epochs={total_epochs}"
             )
 
             import contextlib
+            import inspect
             from concurrent.futures import ThreadPoolExecutor
 
-            use_cuda_amp = dev == "cuda" and getattr(first_device, "type", "") == "cuda"
+            use_cuda_amp = dev == "cuda" and first_device_type == "cuda"
             amp_dtype = None
             scaler = None
             if use_cuda_amp:
@@ -2098,6 +2563,19 @@ class _WorkerGpuRuntime:
                         scaler = torch.amp.GradScaler("cuda")
                     except Exception:
                         scaler = None
+
+            model_float_dtype = next(
+                (p.dtype for p in peft_model.parameters() if p.is_floating_point()),
+                torch.float32,
+            )
+            active_compute_dtype = amp_dtype if (use_cuda_amp and amp_dtype is not None) else model_float_dtype
+            try:
+                fwd_params = inspect.signature(peft_model.forward).parameters
+                supports_position_ids = "position_ids" in fwd_params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in fwd_params.values()
+                )
+            except Exception:
+                supports_position_ids = True
 
             loss_history = []
             final_adapter_url = None
@@ -2117,6 +2595,82 @@ class _WorkerGpuRuntime:
             init_util, init_vram = _sample_live_device_telemetry(dev)
             if init_vram > 0.0:
                 record_active_gpu_telemetry(init_util, init_vram)
+
+            runtime_max_bs = micro_batch_size
+
+            def _build_fwd_kwargs(
+                b_ids: Any, b_labels: Any, b_mask: Optional[Any], b_pos: Optional[Any]
+            ) -> Dict[str, Any]:
+                kw: Dict[str, Any] = {
+                    "input_ids": b_ids.to(first_device, non_blocking=non_blocking_xfer),
+                    "labels": b_labels.to(first_device, non_blocking=non_blocking_xfer),
+                }
+                if b_mask is not None:
+                    mask_t = b_mask.to(first_device, non_blocking=non_blocking_xfer)
+                    if mask_t.dim() == 4 and torch.is_floating_point(mask_t):
+                        mask_t = mask_t.to(dtype=active_compute_dtype)
+                    kw["attention_mask"] = mask_t
+                if b_pos is not None and supports_position_ids:
+                    kw["position_ids"] = b_pos.to(first_device, non_blocking=non_blocking_xfer)
+                return kw
+
+            def _backward_batch_with_oom_backoff(
+                batch_4: Tuple[Any, Any, Optional[Any], Optional[Any]],
+                loss_denom: float,
+                cur_limit_bs: int,
+            ) -> Tuple[Any, int, int]:
+                b_ids, b_labels, b_mask, b_pos = batch_4
+                cur_bs = int(b_ids.shape[0])
+                if cur_bs > cur_limit_bs:
+                    sub_batches = self._split_batch_tuple(batch_4, cur_limit_bs)
+                    sub_loss = torch.zeros((), device=first_device, dtype=torch.float32)
+                    sub_cnt = 0
+                    updated_limit = cur_limit_bs
+                    for sb in sub_batches:
+                        sl, sc, updated_limit = _backward_batch_with_oom_backoff(
+                            sb, loss_denom * float(len(sub_batches)), updated_limit
+                        )
+                        sub_loss = sub_loss + sl
+                        sub_cnt += sc
+                    return sub_loss, sub_cnt, updated_limit
+
+                try:
+                    fwd_kw = _build_fwd_kwargs(b_ids, b_labels, b_mask, b_pos)
+                    amp_ctx = (
+                        torch.amp.autocast("cuda", dtype=amp_dtype)
+                        if (use_cuda_amp and amp_dtype is not None)
+                        else contextlib.nullcontext()
+                    )
+                    with amp_ctx:
+                        outputs = peft_model(**fwd_kw)
+                        loss = outputs.loss
+                    scaled_loss = loss / float(max(1.0, loss_denom))
+                    if scaler is not None:
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+                    return loss.detach().float(), 1, cur_limit_bs
+                except RuntimeError as exc:
+                    if cur_bs > 1 and self._is_oom_error(exc):
+                        new_bs = max(1, cur_bs // 2)
+                        print(
+                            f"[GPU_WORKER] OOM backoff triggered on batch_size={cur_bs}; "
+                            f"reducing micro-batch ceiling to {new_bs}."
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        self._clear_device_cache(dev)
+                        sub_batches = self._split_batch_tuple(batch_4, new_bs)
+                        sub_loss = torch.zeros((), device=first_device, dtype=torch.float32)
+                        sub_cnt = 0
+                        updated_limit = new_bs
+                        for sb in sub_batches:
+                            sl, sc, updated_limit = _backward_batch_with_oom_backoff(
+                                sb, loss_denom * float(len(sub_batches)), updated_limit
+                            )
+                            sub_loss = sub_loss + sl
+                            sub_cnt += sc
+                        return sub_loss, sub_cnt, updated_limit
+                    raise
 
             ckpt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nebula-ckpt-up")
             pending_upload_future = None
@@ -2148,7 +2702,7 @@ class _WorkerGpuRuntime:
                     num_train_batches = len(train_batches)
                     optimizer.zero_grad(set_to_none=True)
 
-                    for step_idx, (input_ids, labels, attn_mask) in enumerate(train_batches):
+                    for step_idx, raw_batch in enumerate(train_batches):
                         if cancel_event is not None and cancel_event.is_set():
                             print(f"[GPU_WORKER] Mid-epoch abort triggered for cancelled job {job_id[:8]}.")
                             return {
@@ -2158,33 +2712,14 @@ class _WorkerGpuRuntime:
                                 "final_adapter_url": final_adapter_url,
                             }
 
-                        input_ids = input_ids.to(first_device, non_blocking=non_blocking_xfer)
-                        labels = labels.to(first_device, non_blocking=non_blocking_xfer)
-                        forward_kwargs: Dict[str, Any] = {"input_ids": input_ids, "labels": labels}
-                        if attn_mask is not None:
-                            forward_kwargs["attention_mask"] = attn_mask.to(first_device, non_blocking=non_blocking_xfer)
-
-                        # Keep per-step command queue completely asynchronous (no per-step synchronize/.item)
-                        amp_ctx = (
-                            torch.amp.autocast("cuda", dtype=amp_dtype)
-                            if (use_cuda_amp and amp_dtype is not None)
-                            else contextlib.nullcontext()
-                        )
-                        with amp_ctx:
-                            outputs = peft_model(**forward_kwargs)
-                            loss = outputs.loss
-
-                        ep_loss_sum = ep_loss_sum + loss.detach().float()
-                        ep_loss_count += 1
-
                         win_start = (step_idx // grad_accum_steps) * grad_accum_steps
                         actual_accum = min(grad_accum_steps, num_train_batches - win_start)
-                        scaled_loss = loss / float(max(1, actual_accum))
-
-                        if scaler is not None:
-                            scaler.scale(scaled_loss).backward()
-                        else:
-                            scaled_loss.backward()
+                        batch_4 = self._unpack_batch_tuple(raw_batch)
+                        b_loss_sum, b_loss_cnt, runtime_max_bs = _backward_batch_with_oom_backoff(
+                            batch_4, float(max(1, actual_accum)), runtime_max_bs
+                        )
+                        ep_loss_sum = ep_loss_sum + b_loss_sum
+                        ep_loss_count += b_loss_cnt
 
                         is_step_boundary = ((step_idx + 1) % grad_accum_steps == 0) or (step_idx == num_train_batches - 1)
                         if is_step_boundary:
@@ -2241,22 +2776,19 @@ class _WorkerGpuRuntime:
                         val_loss_sum = torch.zeros((), device=first_device, dtype=torch.float32)
                         val_count = 0
                         with torch.inference_mode():
-                            for val_ids, val_labels, val_mask in val_batches:
-                                val_kwargs: Dict[str, Any] = {
-                                    "input_ids": val_ids.to(first_device, non_blocking=non_blocking_xfer),
-                                    "labels": val_labels.to(first_device, non_blocking=non_blocking_xfer),
-                                }
-                                if val_mask is not None:
-                                    val_kwargs["attention_mask"] = val_mask.to(first_device, non_blocking=non_blocking_xfer)
-                                amp_ctx = (
-                                    torch.amp.autocast("cuda", dtype=amp_dtype)
-                                    if (use_cuda_amp and amp_dtype is not None)
-                                    else contextlib.nullcontext()
-                                )
-                                with amp_ctx:
-                                    val_out = peft_model(**val_kwargs)
-                                val_loss_sum = val_loss_sum + val_out.loss.detach().float()
-                                val_count += 1
+                            for raw_val in val_batches:
+                                v_ids, v_labels, v_mask, v_pos = self._unpack_batch_tuple(raw_val)
+                                for v_sub in self._split_batch_tuple((v_ids, v_labels, v_mask, v_pos), runtime_max_bs):
+                                    val_kwargs = _build_fwd_kwargs(*v_sub)
+                                    amp_ctx = (
+                                        torch.amp.autocast("cuda", dtype=amp_dtype)
+                                        if (use_cuda_amp and amp_dtype is not None)
+                                        else contextlib.nullcontext()
+                                    )
+                                    with amp_ctx:
+                                        val_out = peft_model(**val_kwargs)
+                                    val_loss_sum = val_loss_sum + val_out.loss.detach().float()
+                                    val_count += 1
                         if val_count > 0:
                             val_loss = round(float(val_loss_sum.item()) / val_count, 4)
                         peft_model.train()
