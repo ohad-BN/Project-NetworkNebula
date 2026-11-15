@@ -142,10 +142,33 @@ class DistributedTrainingEngine:
 
         return worker_ids[:num_gpus]
 
-    def compute_worker_weights(self, worker_ids: List[str]) -> Dict[str, float]:
-        """Compute relative compute capacity weights for participating workers."""
+    def compute_worker_weights(
+        self,
+        worker_ids: List[str],
+        measured_tps: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        """
+        Compute relative compute capacity weights for participating workers.
+        When empirical `tokens_per_sec` telemetry is available for the participating
+        fleet, weights calibrate directly to measured throughput (clamped to <=12x skew)
+        so faster accelerators receive proportionally larger shards and epoch barrier
+        idle tail latency is minimized.
+        """
+        from app.cluster_worker_router import get_worker_throughput_tps
         from app.database import SessionLocal
         from app.models import Worker
+
+        tps_map = measured_tps if measured_tps is not None else get_worker_throughput_tps(worker_ids)
+        positive_tps = [float(tps_map[wid]) for wid in worker_ids if float(tps_map.get(wid, 0.0) or 0.0) > 0.0]
+
+        if worker_ids and len(positive_tps) == len(worker_ids):
+            min_tps = max(1e-3, min(positive_tps))
+            calibrated: Dict[str, float] = {}
+            for wid in worker_ids:
+                ratio = min(12.0, max(1.0, float(tps_map[wid]) / min_tps))
+                calibrated[wid] = round(ratio * 4.0, 2)
+            return calibrated
+
         db = SessionLocal()
         weights = {}
         try:
@@ -180,9 +203,9 @@ class DistributedTrainingEngine:
                     or "xpu" in gpu_name
                 )
                 if is_cuda:
-                    base_weight = max(3.0, tot_vram * alloc_pct)
+                    base_weight = max(4.0, tot_vram * alloc_pct * 1.5)
                 elif is_mps:
-                    base_weight = max(2.5, tot_vram * alloc_pct * 0.85)
+                    base_weight = max(2.0, tot_vram * alloc_pct * 0.60)
                 elif is_xpu:
                     base_weight = max(2.0, tot_vram * alloc_pct * 0.70)
                 else:

@@ -124,11 +124,16 @@ _ACTIVE_COMPUTE_TELEMETRY: Dict[str, float] = {
     "ts": 0.0,
     "util_pct": 0.0,
     "vram_used_gb": 0.0,
+    "tokens_per_sec": 0.0,
 }
 _NVML_STATE: Dict[str, Any] = {"initialized": False, "lib": None}
 
 
-def record_active_gpu_telemetry(util_pct: float, vram_used_gb: Optional[float] = None) -> None:
+def record_active_gpu_telemetry(
+    util_pct: float,
+    vram_used_gb: Optional[float] = None,
+    tokens_per_sec: Optional[float] = None,
+) -> None:
     """Record live measured GPU compute utilization and VRAM usage during active execution."""
     now = time.monotonic()
     clamped_util = round(min(100.0, max(0.0, float(util_pct or 0.0))), 1)
@@ -147,7 +152,16 @@ def record_active_gpu_telemetry(util_pct: float, vram_used_gb: Optional[float] =
                 _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"] = max(v_gb, _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"])
             else:
                 _ACTIVE_COMPUTE_TELEMETRY["vram_used_gb"] = v_gb
+        if tokens_per_sec is not None and float(tokens_per_sec) > 0.0:
+            _ACTIVE_COMPUTE_TELEMETRY["tokens_per_sec"] = round(float(tokens_per_sec), 1)
         _ACTIVE_COMPUTE_TELEMETRY["ts"] = now
+
+
+def get_active_worker_tps() -> Optional[float]:
+    """Return latest measured tokens/sec during active/recent compute, or None."""
+    with _ACTIVE_COMPUTE_LOCK:
+        tps = float(_ACTIVE_COMPUTE_TELEMETRY.get("tokens_per_sec", 0.0) or 0.0)
+        return tps if tps > 0.0 else None
 
 
 def clear_active_gpu_telemetry() -> None:
@@ -2489,6 +2503,22 @@ class _WorkerGpuRuntime:
         return train_batches, val_batches
 
     @staticmethod
+    def _count_batch_tokens(batches: List[Any]) -> List[int]:
+        """Precompute supervised (labels != -100) token counts per batch on host CPU with zero GPU sync."""
+        counts: List[int] = []
+        for batch in batches:
+            try:
+                labels = batch[1]
+                cnt = int((labels != -100).sum().item())
+            except Exception:
+                try:
+                    cnt = int(batch[0].numel())
+                except Exception:
+                    cnt = 0
+            counts.append(max(0, cnt))
+        return counts
+
+    @staticmethod
     def _unpack_batch_tuple(batch: Any) -> Tuple[Any, Any, Optional[Any], Optional[Any]]:
         """Normalize 3-tuple collated batches and 4-tuple packed batches into a 4-tuple."""
         if len(batch) == 4:
@@ -3041,6 +3071,10 @@ class _WorkerGpuRuntime:
                         return sub_loss, sub_cnt, updated_limit
                     raise
 
+            batch_tok_counts = self._count_batch_tokens(train_batches)
+            measured_tps_avg = 0.0
+            total_tps_samples = 0
+
             ckpt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nebula-ckpt-up")
             pending_upload_future = None
 
@@ -3068,6 +3102,10 @@ class _WorkerGpuRuntime:
                     ep_peak_util = init_util
                     ep_peak_vram = init_vram
                     last_status_emit = time.monotonic()
+                    ep_start_mono = last_status_emit
+                    ep_tokens_done = 0
+                    ep_tokens_since_cal = 0
+                    cal_t0 = ep_start_mono
                     num_train_batches = len(train_batches)
                     optimizer.zero_grad(set_to_none=True)
 
@@ -3101,6 +3139,13 @@ class _WorkerGpuRuntime:
                         )
                         ep_loss_sum = ep_loss_sum + b_loss_sum
                         ep_loss_count += b_loss_cnt
+                        step_toks = batch_tok_counts[step_idx] if step_idx < len(batch_tok_counts) else 0
+                        ep_tokens_done += step_toks
+                        if step_idx > 0 or num_train_batches < 4:
+                            ep_tokens_since_cal += step_toks
+                        if step_idx == 0 and num_train_batches >= 4:
+                            # Reset benchmark clock after step 0 JIT/allocator warmup
+                            cal_t0 = time.monotonic()
 
                         is_step_boundary = ((step_idx + 1) % grad_accum_steps == 0) or (step_idx == num_train_batches - 1)
                         if is_step_boundary:
@@ -3125,12 +3170,15 @@ class _WorkerGpuRuntime:
                                 step_window_t0 = time.monotonic()
 
                         now_mono = time.monotonic()
-                        if step_idx == 0 or step_idx == num_train_batches - 1 or (now_mono - last_status_emit) >= 1.5:
+                        is_cal_step = step_idx == min(3, max(0, num_train_batches - 1))
+                        if is_cal_step or step_idx == num_train_batches - 1 or (now_mono - last_status_emit) >= 1.5:
+                            cal_elapsed = max(0.001, now_mono - cal_t0)
+                            live_tps = round(float(ep_tokens_since_cal or ep_tokens_done) / cal_elapsed, 1)
                             hw_u, hw_v = _sample_live_device_telemetry(dev)
                             ep_peak_util = max(ep_peak_util, hw_u)
                             ep_peak_vram = max(ep_peak_vram, hw_v)
-                            record_active_gpu_telemetry(ep_peak_util, ep_peak_vram)
-                            if on_status is not None and (step_idx == 0 or (now_mono - last_status_emit) >= 1.5):
+                            record_active_gpu_telemetry(ep_peak_util, ep_peak_vram, tokens_per_sec=live_tps)
+                            if on_status is not None and (is_cal_step or step_idx == 0 or (now_mono - last_status_emit) >= 1.5):
                                 last_status_emit = now_mono
                                 step_prog = round(
                                     ((epoch - 1 + ((step_idx + 1) / max(1, num_train_batches))) / max(1, total_epochs)) * 100.0,
@@ -3138,7 +3186,7 @@ class _WorkerGpuRuntime:
                                 )
                                 on_status(
                                     "training",
-                                    f"{dev.upper()} active — running epoch {epoch} / {total_epochs}",
+                                    f"{dev.upper()} active — running epoch {epoch} / {total_epochs} ({live_tps:.0f} tok/s)",
                                     step_prog,
                                     None,
                                     None,
@@ -3154,6 +3202,15 @@ class _WorkerGpuRuntime:
 
                     # Single clean device barrier at epoch boundary before validation & CPU weight snapshot
                     self._synchronize_device(dev)
+                    ep_total_sec = max(0.001, time.monotonic() - ep_start_mono)
+                    ep_tps = round(float(ep_tokens_done) / ep_total_sec, 1) if ep_tokens_done > 0 else 0.0
+                    if ep_tps > 0.0:
+                        total_tps_samples += 1
+                        measured_tps_avg = round(
+                            ep_tps if total_tps_samples == 1 else ((measured_tps_avg * (total_tps_samples - 1) + ep_tps) / total_tps_samples),
+                            1,
+                        )
+                        record_active_gpu_telemetry(ep_peak_util, ep_peak_vram, tokens_per_sec=measured_tps_avg)
 
                     avg_loss = round(float(ep_loss_sum.item()) / max(1, ep_loss_count), 4)
 
@@ -3213,6 +3270,7 @@ class _WorkerGpuRuntime:
                     "total_epochs": total_epochs,
                     "final_loss": loss_history[-1]["loss"] if loss_history else 0.0,
                     "final_adapter_url": final_adapter_url,
+                    "tokens_per_sec": measured_tps_avg,
                 }
             finally:
                 ckpt_executor.shutdown(wait=True)
@@ -3682,6 +3740,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                             "total_mb": total_mb,
                                             "vram_used_gb": hw_snap["vram_used_gb"],
                                             "gpu_utilization_pct": hw_snap["gpu_utilization_pct"],
+                                            "tokens_per_sec": get_active_worker_tps(),
                                         })
 
                                     def _on_epoch(ep_num: int, avg_loss: float, val_loss: float, ckpt_url: str, size_bytes: int):

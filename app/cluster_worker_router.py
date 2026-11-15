@@ -108,6 +108,62 @@ def is_worker_tunnel_v2_online_anywhere(worker_id: str) -> bool:
 
 
 _TRAINING_PHASE_RAM_CACHE: Dict[str, Dict[str, Any]] = {}
+_WORKER_TPS_RAM_CACHE: Dict[str, float] = {}
+
+
+def record_worker_throughput_tps(worker_id: Optional[str], tokens_per_sec: Any) -> Optional[float]:
+    """Persist exponential moving average of measured training tokens/sec per worker in Redis/RAM."""
+    clean_id = str(worker_id or "").strip()
+    if not clean_id or tokens_per_sec is None:
+        return None
+    try:
+        sample = float(tokens_per_sec)
+    except (TypeError, ValueError):
+        return None
+    if sample <= 0.0:
+        return None
+
+    prev = _WORKER_TPS_RAM_CACHE.get(clean_id)
+    r = _get_redis_client()
+    if prev is None and r is not None:
+        try:
+            raw_prev = r.get(f"nebula:worker_tps:{clean_id}")
+            if raw_prev is not None:
+                prev = float(raw_prev)
+        except Exception:
+            prev = None
+
+    smoothed = round(sample if not prev or prev <= 0.0 else (0.7 * sample + 0.3 * prev), 2)
+    _WORKER_TPS_RAM_CACHE[clean_id] = smoothed
+    if r is not None:
+        try:
+            r.set(f"nebula:worker_tps:{clean_id}", str(smoothed), ex=7 * 86400)
+        except Exception:
+            pass
+    return smoothed
+
+
+def get_worker_throughput_tps(worker_ids: List[str]) -> Dict[str, float]:
+    """Return latest measured training tokens/sec keyed by worker_id (0.0 if unknown)."""
+    out: Dict[str, float] = {}
+    r = _get_redis_client()
+    for wid in worker_ids:
+        clean_id = str(wid or "").strip()
+        if not clean_id:
+            continue
+        val = 0.0
+        if r is not None:
+            try:
+                raw = r.get(f"nebula:worker_tps:{clean_id}")
+                if raw is not None:
+                    val = float(raw)
+            except Exception:
+                val = 0.0
+        if val <= 0.0:
+            val = float(_WORKER_TPS_RAM_CACHE.get(clean_id, 0.0) or 0.0)
+        if val > 0.0:
+            out[clean_id] = val
+    return out
 
 
 def set_training_job_phase(job_id: Optional[str], phase_data: Dict[str, Any]) -> None:
@@ -2203,6 +2259,8 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
             elif msg_type == "training_status":
                 worker_tunnel_manager.mark_v2_capable(worker_id)
                 t_job_id = data.get("job_id")
+                if "tokens_per_sec" in data:
+                    record_worker_throughput_tps(worker_id, data.get("tokens_per_sec"))
                 job_is_terminal = False
                 terminal_status = None
                 db_st = SessionLocal()
@@ -2341,6 +2399,8 @@ async def websocket_worker_tunnel(websocket: WebSocket, worker_id: str, api_key:
                 worker_tunnel_manager.mark_v2_capable(worker_id)
                 t_job_id = data.get("job_id")
                 clear_training_job_phase(t_job_id)
+                if msg_type == "training_result" and "tokens_per_sec" in data:
+                    record_worker_throughput_tps(worker_id, data.get("tokens_per_sec"))
                 err_text = str(data.get("error") or "")
                 missing_pkg_err = (
                     msg_type == "training_error"
