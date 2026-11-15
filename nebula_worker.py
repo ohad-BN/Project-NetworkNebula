@@ -18,6 +18,7 @@ Usage Examples (PowerShell):
 """
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -27,6 +28,10 @@ import socket
 import sys
 import time
 from typing import Any, Dict, Optional, List, Tuple, Union
+
+# Reduce allocator fragmentation on Linux CUDA/ROCm before torch initializes its caching pool
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ and sys.platform.startswith("linux"):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Ensure project root and worker directories are in sys.path
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -258,29 +263,60 @@ def _probe_macos_gpu_live_standalone(total_ram_gb: float = 16.0, mps_available: 
 
 
 def _sample_live_device_telemetry(dev: str, fallback_total_gb: float = 12.0) -> Tuple[float, float]:
-    """Fast live sample of (gpu_utilization_pct, vram_used_gb) on the active compute device."""
+    """Fast live sample of (gpu_utilization_pct, vram_used_gb) across NVIDIA CUDA, AMD ROCm, Intel XPU, and Apple MPS."""
     dev_norm = str(dev or "").lower()
-    if "cuda" in dev_norm:
+    if "cuda" in dev_norm or "rocm" in dev_norm:
         util_pct = 0.0
         used_gb = 0.0
-        nvml_res = _probe_nvml_fast(0)
-        if nvml_res is not None:
-            util_pct, used_gb = nvml_res
-        else:
+        is_rocm = "rocm" in dev_norm
+        try:
+            import torch
+
+            if getattr(getattr(torch, "version", None), "hip", None):
+                is_rocm = True
+        except Exception:
+            pass
+
+        if is_rocm:
             try:
                 import subprocess
-                nv_out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+
+                rocm_out = subprocess.check_output(
+                    ["rocm-smi", "--showuse", "--showmemuse", "--json"],
                     timeout=1.2,
                     stderr=subprocess.DEVNULL,
-                ).decode("utf-8", errors="ignore").strip().splitlines()
-                if nv_out:
-                    parts = [p.strip() for p in nv_out[0].split(",")]
-                    if len(parts) >= 2:
-                        util_pct = round(float(parts[0]), 1)
-                        used_gb = round(float(parts[1]) / 1024.0, 2)
+                ).decode("utf-8", errors="ignore")
+                rocm_data = json.loads(rocm_out)
+                for _card, info in (rocm_data or {}).items():
+                    if isinstance(info, dict):
+                        for key, val in info.items():
+                            kl = key.lower()
+                            if "gpu use" in kl:
+                                util_pct = max(util_pct, float(str(val).replace("%", "").strip() or 0.0))
+                            elif "vram" in kl and "used" in kl and "gb" in kl:
+                                used_gb = max(used_gb, float(str(val).strip() or 0.0))
+                        break
             except Exception:
                 pass
+        else:
+            nvml_res = _probe_nvml_fast(0)
+            if nvml_res is not None:
+                util_pct, used_gb = nvml_res
+            else:
+                try:
+                    import subprocess
+                    nv_out = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                        timeout=1.2,
+                        stderr=subprocess.DEVNULL,
+                    ).decode("utf-8", errors="ignore").strip().splitlines()
+                    if nv_out:
+                        parts = [p.strip() for p in nv_out[0].split(",")]
+                        if len(parts) >= 2:
+                            util_pct = round(float(parts[0]), 1)
+                            used_gb = round(float(parts[1]) / 1024.0, 2)
+                except Exception:
+                    pass
         try:
             import torch
             if torch.cuda.is_available():
@@ -288,6 +324,23 @@ def _sample_live_device_telemetry(dev: str, fallback_total_gb: float = 12.0) -> 
                 res_gb = torch.cuda.memory_reserved(0) / (1024**3)
                 peak_gb = torch.cuda.max_memory_allocated(0) / (1024**3)
                 used_gb = round(max(used_gb, alloc_gb, res_gb, peak_gb), 2)
+        except Exception:
+            pass
+        return util_pct, used_gb
+
+    if "xpu" in dev_norm:
+        util_pct = 0.0
+        used_gb = 0.0
+        try:
+            import torch
+
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                alloc_gb = torch.xpu.memory_allocated(0) / (1024**3)
+                res_gb = getattr(torch.xpu, "memory_reserved", lambda *_: 0)(0) / (1024**3)
+                peak_gb = getattr(torch.xpu, "max_memory_allocated", lambda *_: 0)(0) / (1024**3)
+                used_gb = round(max(alloc_gb, res_gb, peak_gb), 2)
+                if used_gb > 0.05:
+                    util_pct = round(min(100.0, max(util_pct, 50.0)), 1)
         except Exception:
             pass
         return util_pct, used_gb
@@ -621,6 +674,202 @@ _CURRENT_VRAM_ALLOCATION_PCT = max(
 def get_current_vram_allocation_pct() -> int:
     """Return the worker's currently active VRAM contribution percentage (10-100)."""
     return _CURRENT_VRAM_ALLOCATION_PCT
+
+
+@dataclass(frozen=True)
+class ArchitectureProfile:
+    """Normalized execution capabilities and safety flags per hardware backend."""
+
+    arch_id: str  # cuda | amd_rocm | apple_mps | intel_xpu | directml | cpu
+    device_str: str  # cuda | mps | xpu | directml | cpu
+    target_device: Any  # string device or torch_directml.device() object
+    autocast_device_type: Optional[str]  # cuda | mps | xpu | cpu | None
+    dtype_name: str  # bfloat16 | float16 | float32
+    supports_sdpa: bool
+    supports_bitsandbytes: bool
+    supports_fused_adamw: bool
+    pin_memory: bool
+    num_workers: int
+    supports_non_blocking: bool
+    matmul_precision: Optional[str]
+
+
+def _check_mps_bf16_supported(torch_mod: Any) -> bool:
+    """Return True if Apple MPS runtime reliably supports bfloat16 tensors (macOS Sonoma+ / newer torch)."""
+    try:
+        mps_backend = getattr(getattr(torch_mod, "backends", None), "mps", None)
+        if mps_backend is None or not mps_backend.is_available():
+            return False
+        if not hasattr(torch_mod, "bfloat16"):
+            return False
+        is_newer = getattr(mps_backend, "is_macos_or_newer", None)
+        if callable(is_newer) and not is_newer(14, 0):
+            return False
+        # Verify real Metal kernel allocation cleanly (safe no-op fallback if mocked)
+        probe = torch_mod.zeros((2, 2), dtype=torch_mod.bfloat16, device="mps")
+        return bool(probe.dtype == torch_mod.bfloat16)
+    except Exception:
+        return False
+
+
+def _check_cpu_bf16_fast(torch_mod: Any) -> bool:
+    """Return True if host CPU accelerates bfloat16 natively (AVX-512-BF16 / AMX)."""
+    try:
+        cpu_ns = getattr(torch_mod, "cpu", None)
+        if cpu_ns is not None and callable(getattr(cpu_ns, "_is_avx512_bf16_supported", None)):
+            if cpu_ns._is_avx512_bf16_supported():
+                return True
+        if cpu_ns is not None and callable(getattr(cpu_ns, "_is_amx_tile_supported", None)):
+            if cpu_ns._is_amx_tile_supported():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def resolve_architecture_profile(
+    dev: Optional[str] = None,
+    torch_mod: Optional[Any] = None,
+    directml_mod: Optional[Any] = None,
+    platform_name: Optional[str] = None,
+) -> ArchitectureProfile:
+    """
+    Resolve canonical `ArchitectureProfile` for NVIDIA CUDA, AMD ROCm, Apple MPS,
+    Intel XPU, DirectML, or CPU without crashing on missing backend APIs.
+    """
+    if torch_mod is None:
+        import torch as torch_mod  # type: ignore[no-redef]
+
+    plat = (platform_name or sys.platform).strip().lower()
+    is_linux = plat.startswith("linux")
+
+    dev_norm = (dev or "").strip().lower()
+    if not dev_norm:
+        if getattr(torch_mod, "cuda", None) and torch_mod.cuda.is_available():
+            dev_norm = "cuda"
+        elif getattr(torch_mod, "xpu", None) and torch_mod.xpu.is_available():
+            dev_norm = "xpu"
+        elif (
+            getattr(torch_mod, "backends", None)
+            and getattr(torch_mod.backends, "mps", None)
+            and torch_mod.backends.mps.is_available()
+        ):
+            dev_norm = "mps"
+        else:
+            dml_candidate = directml_mod
+            if dml_candidate is None:
+                try:
+                    import torch_directml as dml_candidate  # type: ignore[no-redef]
+                except Exception:
+                    dml_candidate = None
+            if dml_candidate is not None and getattr(dml_candidate, "is_available", lambda: False)():
+                dev_norm = "directml"
+                directml_mod = dml_candidate
+            else:
+                dev_norm = "cpu"
+
+    if dev_norm in {"cuda", "nvidia_cuda", "amd_rocm", "rocm"}:
+        hip_ver = getattr(getattr(torch_mod, "version", None), "hip", None)
+        is_rocm = dev_norm in {"amd_rocm", "rocm"} or bool(hip_ver)
+        try:
+            bf16_ok = bool(torch_mod.cuda.is_bf16_supported())
+        except Exception:
+            bf16_ok = False
+        return ArchitectureProfile(
+            arch_id="amd_rocm" if is_rocm else "cuda",
+            device_str="cuda",
+            target_device="cuda",
+            autocast_device_type="cuda",
+            dtype_name="bfloat16" if bf16_ok else "float16",
+            supports_sdpa=True,
+            supports_bitsandbytes=not is_rocm,
+            supports_fused_adamw=True,
+            pin_memory=True,
+            num_workers=2 if is_linux else 0,
+            supports_non_blocking=True,
+            matmul_precision="high",
+        )
+
+    if dev_norm in {"xpu", "intel_xpu"}:
+        try:
+            xpu_ns = getattr(torch_mod, "xpu", None)
+            bf16_ok = bool(getattr(xpu_ns, "is_bf16_supported", lambda: True)())
+        except Exception:
+            bf16_ok = True
+        return ArchitectureProfile(
+            arch_id="intel_xpu",
+            device_str="xpu",
+            target_device="xpu",
+            autocast_device_type="xpu",
+            dtype_name="bfloat16" if bf16_ok else "float16",
+            supports_sdpa=True,
+            supports_bitsandbytes=False,
+            supports_fused_adamw=True,
+            pin_memory=True,
+            num_workers=2 if is_linux else 0,
+            supports_non_blocking=True,
+            matmul_precision="high",
+        )
+
+    if dev_norm in {"mps", "apple_mps"}:
+        bf16_ok = _check_mps_bf16_supported(torch_mod)
+        return ArchitectureProfile(
+            arch_id="apple_mps",
+            device_str="mps",
+            target_device="mps",
+            autocast_device_type="mps",
+            dtype_name="bfloat16" if bf16_ok else "float16",
+            supports_sdpa=True,
+            supports_bitsandbytes=False,
+            supports_fused_adamw=False,
+            pin_memory=False,
+            num_workers=0,
+            supports_non_blocking=False,
+            matmul_precision=None,
+        )
+
+    if dev_norm in {"directml", "dml"}:
+        dml_obj = "privateuseone:0"
+        if directml_mod is None:
+            try:
+                import torch_directml as directml_mod  # type: ignore[no-redef]
+            except Exception:
+                directml_mod = None
+        if directml_mod is not None and callable(getattr(directml_mod, "device", None)):
+            try:
+                dml_obj = directml_mod.device()
+            except Exception:
+                pass
+        return ArchitectureProfile(
+            arch_id="directml",
+            device_str="directml",
+            target_device=dml_obj,
+            autocast_device_type=None,
+            dtype_name="float32",
+            supports_sdpa=False,
+            supports_bitsandbytes=False,
+            supports_fused_adamw=False,
+            pin_memory=False,
+            num_workers=0,
+            supports_non_blocking=False,
+            matmul_precision=None,
+        )
+
+    cpu_bf16 = _check_cpu_bf16_fast(torch_mod)
+    return ArchitectureProfile(
+        arch_id="cpu",
+        device_str="cpu",
+        target_device="cpu",
+        autocast_device_type="cpu" if cpu_bf16 else None,
+        dtype_name="bfloat16" if cpu_bf16 else "float32",
+        supports_sdpa=True,
+        supports_bitsandbytes=False,
+        supports_fused_adamw=False,
+        pin_memory=False,
+        num_workers=0,
+        supports_non_blocking=False,
+        matmul_precision=None,
+    )
 
 
 def apply_vram_limit(vram_pct: int) -> Dict[str, Any]:
@@ -1358,8 +1607,16 @@ class _WorkerGpuRuntime:
         import torch
         if torch.cuda.is_available():
             return "cuda"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
         if hasattr(torch, "backends") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
+        try:
+            import torch_directml  # type: ignore[import-not-found]
+            if torch_directml.is_available():
+                return "directml"
+        except Exception:
+            pass
         return "cpu"
 
     def unload(self) -> None:
@@ -1376,6 +1633,11 @@ class _WorkerGpuRuntime:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "empty_cache"):
+            try:
+                torch.xpu.empty_cache()
+            except Exception:
+                pass
 
     def prefetch_model_with_progress(
         self,
@@ -1503,15 +1765,11 @@ class _WorkerGpuRuntime:
             ) from exc
 
         dev = self._get_device()
-        if dev == "cuda":
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        elif dev == "mps":
-            dtype = torch.float16
-        else:
-            dtype = torch.bfloat16
+        profile = resolve_architecture_profile(dev=dev, torch_mod=torch)
+        dtype = getattr(torch, profile.dtype_name, torch.float32)
 
         is_qlora = (train_type or "").strip().lower() == "qlora"
-        dtype_key = f"{dev}:{dtype}:{train_type if for_training else 'infer'}"
+        dtype_key = f"{profile.arch_id}:{dtype}:{train_type if for_training else 'infer'}"
 
         if (
             self.model is not None
@@ -1524,7 +1782,10 @@ class _WorkerGpuRuntime:
         self.unload()
         # Direct HuggingFace CDN pull using RAM-held unsealed token (never set os.environ["HF_TOKEN"])
         active_token = hf_token if hf_token is not None else os.environ.get("HF_TOKEN")
-        print(f"[GPU_WORKER] Loading REAL weights for '{model_id}' on {dev.upper()} ({dtype}, train_type={train_type})...")
+        print(
+            f"[GPU_WORKER] Loading REAL weights for '{model_id}' on {dev.upper()} "
+            f"(arch={profile.arch_id}, dtype={dtype}, train_type={train_type})..."
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=active_token, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -1536,12 +1797,24 @@ class _WorkerGpuRuntime:
             "dtype": dtype,
         }
 
-        # Multi-GPU and Device Mapping
-        if dev == "cuda":
+        if profile.matmul_precision == "high":
             try:
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
+        elif profile.arch_id == "cpu":
+            try:
+                import psutil as _ps
+                phys_cores = _ps.cpu_count(logical=False) or max(1, (os.cpu_count() or 2) // 2)
+            except Exception:
+                phys_cores = max(1, (os.cpu_count() or 2) // 2)
+            try:
+                torch.set_num_threads(max(1, int(phys_cores)))
+            except Exception:
+                pass
+
+        # Multi-GPU and Device Mapping
+        if dev == "cuda":
             dev_count = torch.cuda.device_count()
             if dev_count > 1:
                 alloc_pct = float(os.environ.get("NEBULA_VRAM_ALLOCATION_PCT", "80")) / 100.0
@@ -1557,39 +1830,48 @@ class _WorkerGpuRuntime:
                 load_kwargs["max_memory"] = max_memory
             else:
                 load_kwargs["device_map"] = "cuda"
+        elif profile.arch_id == "directml":
+            # DirectML devices aren't accepted as string device_map in transformers; move after load
+            pass
         else:
             load_kwargs["device_map"] = dev
 
         # Request SDPA (Flash / Memory-Efficient Scaled Dot-Product Attention) when supported
-        if dev in ("cuda", "mps", "xpu"):
+        if profile.supports_sdpa and dev in ("cuda", "mps", "xpu"):
             load_kwargs["attn_implementation"] = "sdpa"
+        elif profile.arch_id == "directml":
+            load_kwargs["attn_implementation"] = "eager"
 
-        # 4-bit NF4 QLoRA Quantization
+        # 4-bit NF4 QLoRA Quantization (NVIDIA CUDA only)
         if is_qlora:
-            if dev == "cuda":
+            if profile.supports_bitsandbytes:
                 try:
                     from transformers import BitsAndBytesConfig
-                    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                     bnb_config = BitsAndBytesConfig(
                         load_in_4bit=True,
                         bnb_4bit_quant_type="nf4",
                         bnb_4bit_use_double_quant=True,
-                        bnb_4bit_compute_dtype=compute_dtype,
+                        bnb_4bit_compute_dtype=dtype,
                     )
                     load_kwargs["quantization_config"] = bnb_config
                 except ImportError:
                     print("[GPU_WORKER] WARNING: bitsandbytes not available, falling back to 16-bit LoRA.")
             else:
-                print("[GPU_WORKER] WARNING: QLoRA requested on non-CUDA device, falling back to standard precision.")
+                print(
+                    f"[GPU_WORKER] WARNING: QLoRA 4-bit bitsandbytes not supported on {profile.arch_id}; "
+                    f"falling back cleanly to {profile.dtype_name} LoRA."
+                )
 
         try:
             model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         except (TypeError, ValueError) as exc:
-            if "attn_implementation" in load_kwargs and ("attn_implementation" in str(exc) or "sdpa" in str(exc).lower()):
+            if "attn_implementation" in load_kwargs and ("attn_implementation" in str(exc) or "sdpa" in str(exc).lower() or "eager" in str(exc).lower()):
                 load_kwargs.pop("attn_implementation", None)
                 model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             else:
                 raise
+        if profile.arch_id == "directml" and profile.target_device is not None:
+            model = model.to(profile.target_device)
         self.model = model
         self.tokenizer = tokenizer
         self.active_model_id = model_id
@@ -1764,16 +2046,8 @@ class _WorkerGpuRuntime:
         platform_name: Optional[str] = None,
     ) -> Tuple[bool, int]:
         """Resolve architecture-safe pin_memory and DataLoader worker count."""
-        arch = (arch_type or dev or "cpu").strip().lower()
-        plat = (platform_name or sys.platform).strip().lower()
-        is_discrete_gpu = arch in {"cuda", "nvidia_cuda", "amd_rocm", "rocm", "intel_xpu", "xpu"}
-        pin_memory = bool(is_discrete_gpu)
-        # Keep num_workers=0 on Windows, macOS, and UMA/CPU to avoid multiprocessing fork/spawn deadlocks
-        if is_discrete_gpu and plat.startswith("linux"):
-            num_workers = 2
-        else:
-            num_workers = 0
-        return pin_memory, num_workers
+        profile = resolve_architecture_profile(dev=(arch_type or dev or "cpu"), platform_name=platform_name)
+        return profile.pin_memory, profile.num_workers
 
     @staticmethod
     def _estimate_model_param_bytes(model: Any) -> int:
@@ -1804,7 +2078,7 @@ class _WorkerGpuRuntime:
     ) -> Dict[str, Any]:
         """
         Compute VRAM-aware micro_batch_size, gradient_accumulation_steps, and transfer settings
-        bounded by the contributor's active --vram-pct budget.
+        bounded by the contributor's active --vram-pct budget across all GPU architectures.
         """
         req_bs = max(1, int(requested_batch_size or 1))
         req_accum = max(1, int(requested_grad_accum or 1))
@@ -1820,7 +2094,8 @@ class _WorkerGpuRuntime:
         )
         target_effective_batch = req_bs * req_accum
 
-        if dev not in {"cuda", "mps", "rocm", "xpu"} or not auto_batch:
+        dev_low = (arch_type or dev or "cpu").strip().lower()
+        if dev_low not in {"cuda", "nvidia_cuda", "amd_rocm", "rocm", "mps", "apple_mps", "xpu", "intel_xpu", "directml", "dml"} or not auto_batch:
             return {
                 "micro_batch_size": req_bs,
                 "grad_accum_steps": req_accum,
@@ -1850,12 +2125,16 @@ class _WorkerGpuRuntime:
             if total_vram_gb is None:
                 if dev == "cuda" and torch.cuda.is_available():
                     total_vram_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024.0 ** 3)
+                elif dev == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+                    total_vram_gb = float(torch.xpu.get_device_properties(0).total_memory) / (1024.0 ** 3)
                 else:
                     hw = discover_hardware()
                     total_vram_gb = float(hw.get("vram_total_gb", 0.0) or 0.0)
             if allocated_vram_gb is None:
                 if dev == "cuda" and torch.cuda.is_available():
                     allocated_vram_gb = float(torch.cuda.memory_allocated(0)) / (1024.0 ** 3)
+                elif dev == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+                    allocated_vram_gb = float(torch.xpu.memory_allocated(0)) / (1024.0 ** 3)
                 elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
                     allocated_vram_gb = float(torch.mps.current_allocated_memory()) / (1024.0 ** 3)
                 else:
@@ -2258,16 +2537,38 @@ class _WorkerGpuRuntime:
             import torch
 
             gc.collect()
-            if dev == "cuda" and torch.cuda.is_available():
+            if dev in {"cuda", "amd_rocm", "rocm"} and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            elif dev in {"xpu", "intel_xpu"} and hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+            elif dev in {"mps", "apple_mps"} and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
                 torch.mps.empty_cache()
         except Exception:
             pass
 
     @staticmethod
-    def _create_lora_optimizer(peft_model: Any, lr: float, dev: str) -> Tuple[Any, List[Any]]:
-        """Instantiate fused/foreach AdamW over trainable parameters only."""
+    def _synchronize_device(dev: str) -> None:
+        """Execute clean backend synchronization at epoch barriers."""
+        try:
+            import torch
+
+            if dev in {"cuda", "amd_rocm", "rocm"} and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif dev in {"xpu", "intel_xpu"} and hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.synchronize()
+            elif dev in {"mps", "apple_mps"} and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _create_lora_optimizer(
+        peft_model: Any,
+        lr: float,
+        dev: str,
+        arch_profile: Optional[ArchitectureProfile] = None,
+    ) -> Tuple[Any, List[Any]]:
+        """Instantiate fused/foreach AdamW over trainable parameters cleanly per architecture."""
         import torch
 
         all_params = list(peft_model.parameters())
@@ -2275,20 +2576,26 @@ class _WorkerGpuRuntime:
         if not trainable_params:
             trainable_params = all_params
 
-        all_cuda_float = (
-            dev == "cuda"
-            and bool(trainable_params)
-            and all(getattr(p, "is_cuda", False) and p.is_floating_point() for p in trainable_params)
+        if arch_profile is None:
+            arch_profile = resolve_architecture_profile(dev=dev, torch_mod=torch)
+
+        all_accel_float = bool(trainable_params) and all(
+            getattr(p, "device", None) is not None
+            and getattr(p.device, "type", "cpu") in {"cuda", "xpu"}
+            and p.is_floating_point()
+            for p in trainable_params
         )
-        if all_cuda_float:
+        if arch_profile.supports_fused_adamw and all_accel_float:
             try:
                 return torch.optim.AdamW(trainable_params, lr=lr, fused=True), trainable_params
             except Exception:
                 pass
-        try:
-            return torch.optim.AdamW(trainable_params, lr=lr, foreach=True), trainable_params
-        except Exception:
-            return torch.optim.AdamW(trainable_params, lr=lr), trainable_params
+        if arch_profile.arch_id != "directml":
+            try:
+                return torch.optim.AdamW(trainable_params, lr=lr, foreach=True), trainable_params
+            except Exception:
+                pass
+        return torch.optim.AdamW(trainable_params, lr=lr), trainable_params
 
     @staticmethod
     def _upload_epoch_checkpoint(
@@ -2488,11 +2795,14 @@ class _WorkerGpuRuntime:
             )
             peft_model = peft.get_peft_model(base_model, lora_cfg)
             peft_model.train()
-            optimizer, trainable_params = self._create_lora_optimizer(peft_model, lr=lr, dev=dev)
+            arch_profile = resolve_architecture_profile(dev=dev, torch_mod=torch)
+            optimizer, trainable_params = self._create_lora_optimizer(
+                peft_model, lr=lr, dev=dev, arch_profile=arch_profile
+            )
 
             first_device = next(peft_model.parameters()).device
             first_device_type = getattr(first_device, "type", "")
-            non_blocking_xfer = first_device_type in {"cuda", "xpu"}
+            non_blocking_xfer = bool(arch_profile.supports_non_blocking and first_device_type in {"cuda", "xpu"})
 
             train_seqs, val_seqs = self._tokenize_training_records(records, tokenizer, max_seq_length)
             model_cfg = getattr(base_model, "config", None)
@@ -2553,22 +2863,31 @@ class _WorkerGpuRuntime:
             import inspect
             from concurrent.futures import ThreadPoolExecutor
 
-            use_cuda_amp = dev == "cuda" and first_device_type == "cuda"
-            amp_dtype = None
+            amp_device_type = arch_profile.autocast_device_type
+            use_amp = bool(amp_device_type and first_device_type == amp_device_type)
+            amp_dtype = getattr(torch, arch_profile.dtype_name, None) if use_amp else None
             scaler = None
-            if use_cuda_amp:
-                amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                if amp_dtype == torch.float16 and all(p.dtype == torch.float32 for p in trainable_params):
-                    try:
-                        scaler = torch.amp.GradScaler("cuda")
-                    except Exception:
-                        scaler = None
+            if (
+                use_amp
+                and amp_device_type in {"cuda", "xpu"}
+                and amp_dtype == torch.float16
+                and all(p.dtype == torch.float32 for p in trainable_params)
+            ):
+                try:
+                    scaler = torch.amp.GradScaler(amp_device_type)
+                except Exception:
+                    scaler = None
+
+            def _amp_ctx():
+                if use_amp and amp_device_type is not None and amp_dtype is not None:
+                    return torch.amp.autocast(amp_device_type, dtype=amp_dtype)
+                return contextlib.nullcontext()
 
             model_float_dtype = next(
                 (p.dtype for p in peft_model.parameters() if p.is_floating_point()),
                 torch.float32,
             )
-            active_compute_dtype = amp_dtype if (use_cuda_amp and amp_dtype is not None) else model_float_dtype
+            active_compute_dtype = amp_dtype if (use_amp and amp_dtype is not None) else model_float_dtype
             try:
                 fwd_params = inspect.signature(peft_model.forward).parameters
                 supports_position_ids = "position_ids" in fwd_params or any(
@@ -2636,12 +2955,7 @@ class _WorkerGpuRuntime:
 
                 try:
                     fwd_kw = _build_fwd_kwargs(b_ids, b_labels, b_mask, b_pos)
-                    amp_ctx = (
-                        torch.amp.autocast("cuda", dtype=amp_dtype)
-                        if (use_cuda_amp and amp_dtype is not None)
-                        else contextlib.nullcontext()
-                    )
-                    with amp_ctx:
+                    with _amp_ctx():
                         outputs = peft_model(**fwd_kw)
                         loss = outputs.loss
                     scaled_loss = loss / float(max(1.0, loss_denom))
@@ -2759,13 +3073,7 @@ class _WorkerGpuRuntime:
                         }
 
                     # Single clean device barrier at epoch boundary before validation & CPU weight snapshot
-                    if dev == "cuda":
-                        torch.cuda.synchronize()
-                    elif dev == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
-                        try:
-                            torch.mps.synchronize()
-                        except Exception:
-                            pass
+                    self._synchronize_device(dev)
 
                     avg_loss = round(float(ep_loss_sum.item()) / max(1, ep_loss_count), 4)
 
@@ -2780,12 +3088,7 @@ class _WorkerGpuRuntime:
                                 v_ids, v_labels, v_mask, v_pos = self._unpack_batch_tuple(raw_val)
                                 for v_sub in self._split_batch_tuple((v_ids, v_labels, v_mask, v_pos), runtime_max_bs):
                                     val_kwargs = _build_fwd_kwargs(*v_sub)
-                                    amp_ctx = (
-                                        torch.amp.autocast("cuda", dtype=amp_dtype)
-                                        if (use_cuda_amp and amp_dtype is not None)
-                                        else contextlib.nullcontext()
-                                    )
-                                    with amp_ctx:
+                                    with _amp_ctx():
                                         val_out = peft_model(**val_kwargs)
                                     val_loss_sum = val_loss_sum + val_out.loss.detach().float()
                                     val_count += 1
