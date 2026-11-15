@@ -150,6 +150,11 @@ class SilentThermalGovernor:
                     freed_bytes = max(0, reserved_before - reserved_after)
                 except Exception:
                     pass
+            elif hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "empty_cache"):
+                try:
+                    torch.xpu.empty_cache()
+                except Exception:
+                    pass
             elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
                 try:
                     torch.mps.empty_cache()
@@ -219,9 +224,10 @@ class SilentThermalGovernor:
         state = presence_state or self.sensor.evaluate_presence_state()
         temp_c = self.sensor.get_gpu_temperature()
 
-        # If we just entered stealth_regulated or restricted_pause from unleashed, reclaim VRAM
+        # Only flush PyTorch's caching allocator pool when entering restricted_pause (e.g. 3D game launched),
+        # never on stealth_regulated yield slices so the GPU allocator pool stays warm.
         freed_mb = 0.0
-        if state in ("stealth_regulated", "restricted_pause") and self._last_state == "unleashed":
+        if state == "restricted_pause" and self._last_state != "restricted_pause":
             reclaim_res = self.reclaim_vram_headroom()
             freed_mb = reclaim_res.get("freed_mb", 0.0)
         self._last_state = state

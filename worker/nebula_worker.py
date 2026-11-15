@@ -2598,6 +2598,53 @@ class _WorkerGpuRuntime:
         return torch.optim.AdamW(trainable_params, lr=lr), trainable_params
 
     @staticmethod
+    def _maybe_compile_model(
+        peft_model: Any,
+        *,
+        arch_profile: ArchitectureProfile,
+        total_steps: int,
+        is_real_lm: bool = True,
+        env_mode: Optional[str] = None,
+        platform_name: Optional[str] = None,
+    ) -> Tuple[Any, bool]:
+        """
+        Optionally apply torch.compile(model, dynamic=True) for long training runs on
+        supported Linux accelerators (or when NEBULA_TORCH_COMPILE=1), falling back cleanly to eager.
+        """
+        import torch
+
+        mode = (env_mode if env_mode is not None else os.environ.get("NEBULA_TORCH_COMPILE", "auto")).strip().lower()
+        if mode in {"0", "false", "off", "no"}:
+            return peft_model, False
+
+        compile_fn = getattr(torch, "compile", None)
+        if not callable(compile_fn):
+            return peft_model, False
+
+        plat = (platform_name or sys.platform).strip().lower()
+        forced = mode in {"1", "true", "on", "yes", "force"}
+        auto_eligible = (
+            mode == "auto"
+            and plat.startswith("linux")
+            and arch_profile.arch_id in {"cuda", "amd_rocm", "intel_xpu"}
+            and is_real_lm
+            and int(total_steps) >= 20
+        )
+        if not (forced or auto_eligible):
+            return peft_model, False
+
+        try:
+            compiled = compile_fn(peft_model, dynamic=True)
+            print(
+                f"[GPU_WORKER] Enabled torch.compile(dynamic=True) "
+                f"(arch={arch_profile.arch_id}, total_steps={total_steps})."
+            )
+            return compiled, True
+        except Exception as exc:
+            print(f"[GPU_WORKER] torch.compile skipped (using eager): {exc}")
+            return peft_model, False
+
+    @staticmethod
     def _upload_epoch_checkpoint(
         *,
         epoch: int,
@@ -2659,6 +2706,7 @@ class _WorkerGpuRuntime:
         on_epoch=None,
         cancel_event=None,
         on_status=None,
+        silent_governor: Optional[Any] = None,
     ) -> Dict[str, Any]:
         import gc
         import torch
@@ -2851,11 +2899,18 @@ class _WorkerGpuRuntime:
                 pre_tokenized=(train_seqs, val_seqs),
             )
 
+            exec_model, is_compiled = self._maybe_compile_model(
+                peft_model,
+                arch_profile=arch_profile,
+                total_steps=len(train_batches) * total_epochs,
+                is_real_lm=is_real_lm_cfg,
+            )
+
             print(
                 f"[GPU_WORKER] Training REAL {train_type.upper()} job {job_id[:8]} on {first_device} | "
                 f"model={base_model_id} | targets={discovered_targets} | "
                 f"micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | "
-                f"packing={packing_enabled} | vram_pct={batch_plan['vram_pct']}% | "
+                f"packing={packing_enabled} | compiled={is_compiled} | vram_pct={batch_plan['vram_pct']}% | "
                 f"batches={len(train_batches)} train / {len(val_batches)} val | epochs={total_epochs}"
             )
 
@@ -2956,7 +3011,7 @@ class _WorkerGpuRuntime:
                 try:
                     fwd_kw = _build_fwd_kwargs(b_ids, b_labels, b_mask, b_pos)
                     with _amp_ctx():
-                        outputs = peft_model(**fwd_kw)
+                        outputs = exec_model(**fwd_kw)
                         loss = outputs.loss
                     scaled_loss = loss / float(max(1.0, loss_denom))
                     if scaler is not None:
@@ -3016,6 +3071,7 @@ class _WorkerGpuRuntime:
                     num_train_batches = len(train_batches)
                     optimizer.zero_grad(set_to_none=True)
 
+                    step_window_t0 = time.monotonic()
                     for step_idx, raw_batch in enumerate(train_batches):
                         if cancel_event is not None and cancel_event.is_set():
                             print(f"[GPU_WORKER] Mid-epoch abort triggered for cancelled job {job_id[:8]}.")
@@ -3025,6 +3081,17 @@ class _WorkerGpuRuntime:
                                 "total_epochs": epoch - 1,
                                 "final_adapter_url": final_adapter_url,
                             }
+
+                        if silent_governor is not None and getattr(silent_governor, "sensor", None) is not None:
+                            while silent_governor.sensor.evaluate_presence_state() == "restricted_pause":
+                                silent_governor.yield_gpu_queue(0.0, presence_state="restricted_pause", force_sync=False)
+                                if cancel_event is not None and cancel_event.is_set():
+                                    return {
+                                        "status": "cancelled",
+                                        "job_id": job_id,
+                                        "total_epochs": epoch - 1,
+                                        "final_adapter_url": final_adapter_url,
+                                    }
 
                         win_start = (step_idx // grad_accum_steps) * grad_accum_steps
                         actual_accum = min(grad_accum_steps, num_train_batches - win_start)
@@ -3043,6 +3110,19 @@ class _WorkerGpuRuntime:
                             else:
                                 optimizer.step()
                             optimizer.zero_grad(set_to_none=True)
+
+                            if silent_governor is not None and getattr(silent_governor, "sensor", None) is not None:
+                                cur_p_state = silent_governor.sensor.evaluate_presence_state()
+                                if cur_p_state != "unleashed":
+                                    window_compute_sec = max(0.01, time.monotonic() - step_window_t0)
+                                    silent_governor.yield_gpu_queue(
+                                        window_compute_sec,
+                                        presence_state=cur_p_state,
+                                        force_sync=False,
+                                    )
+                                else:
+                                    silent_governor._last_state = "unleashed"
+                                step_window_t0 = time.monotonic()
 
                         now_mono = time.monotonic()
                         if step_idx == 0 or step_idx == num_train_batches - 1 or (now_mono - last_status_emit) >= 1.5:
@@ -3089,7 +3169,7 @@ class _WorkerGpuRuntime:
                                 for v_sub in self._split_batch_tuple((v_ids, v_labels, v_mask, v_pos), runtime_max_bs):
                                     val_kwargs = _build_fwd_kwargs(*v_sub)
                                     with _amp_ctx():
-                                        val_out = peft_model(**val_kwargs)
+                                        val_out = exec_model(**val_kwargs)
                                     val_loss_sum = val_loss_sum + val_out.loss.detach().float()
                                     val_count += 1
                         if val_count > 0:
@@ -3641,6 +3721,7 @@ def cmd_join(args: argparse.Namespace) -> int:
                                                     on_epoch=_on_epoch,
                                                     cancel_event=cancel_ev,
                                                     on_status=_on_status,
+                                                    silent_governor=governor if always_silent else None,
                                                 )
                                             finally:
                                                 loop.call_soon_threadsafe(ev_q.put_nowait, None)
